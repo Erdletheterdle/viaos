@@ -52,6 +52,13 @@
         aarch64 = self.nixosConfigurations.viaos-aarch64.config.system.build.image;
       };
 
+      # `nix build .#updates.x86_64` -> the files a device updates itself from
+      updates = {
+        x86_64 = self.nixosConfigurations.viaos-x86_64.config.system.build.update;
+        x86_64-debug = self.nixosConfigurations.viaos-x86_64-debug.config.system.build.update;
+        aarch64 = self.nixosConfigurations.viaos-aarch64.config.system.build.update;
+      };
+
       devShells = forAll (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [

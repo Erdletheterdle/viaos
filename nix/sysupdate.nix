@@ -9,8 +9,8 @@
 # partition UUID systemd expects (derived from the verity root hash):
 #
 #   viaos_<v>.efi
-#   viaos_<v>_<uuid>.store.raw
-#   viaos_<v>_<uuid>.verity.raw
+#   viaos_<v>_<uuid>.store.raw.zst
+#   viaos_<v>_<uuid>.verity.raw.zst
 { config, ... }:
 let
   source = "/var/lib/via/os-update";
@@ -28,7 +28,7 @@ in
         Source = {
           Type = "regular-file";
           Path = source;
-          MatchPattern = "viaos_@v_@u.verity.raw";
+          MatchPattern = "viaos_@v_@u.verity.raw.zst";
         };
         Target = {
           Type = "partition";
@@ -43,7 +43,7 @@ in
         Source = {
           Type = "regular-file";
           Path = source;
-          MatchPattern = "viaos_@v_@u.store.raw";
+          MatchPattern = "viaos_@v_@u.store.raw.zst";
         };
         Target = {
           Type = "partition";

@@ -22,7 +22,7 @@
 }:
 let
   cfg = config.viaos;
-  version = lib.fileContents ../VERSION;
+  inherit (cfg) version;
   efiArch = pkgs.stdenv.hostPlatform.efiArch;
   agent = self.packages.${pkgs.stdenv.hostPlatform.system}.via-agent;
 
@@ -54,8 +54,8 @@ in
     debug = lib.mkEnableOption "a passwordless root shell on the serial console";
     version = lib.mkOption {
       type = lib.types.str;
-      default = version;
-      readOnly = true;
+      default = lib.fileContents ../VERSION;
+      description = "OS version. Updates install only versions that sort higher.";
     };
   };
 
@@ -241,6 +241,14 @@ in
       };
     };
 
+    # The files an update to this version is made of; see update.nix.
+    system.build.update = pkgs.callPackage ./update.nix {
+      inherit version;
+      image = config.system.build.image;
+      uki = "${config.system.build.uki}/${config.system.boot.loader.ukiFile}";
+      arch = pkgs.stdenv.hostPlatform.uname.processor;
+    };
+
     # ---- the agent ----
 
     environment.systemPackages = [
@@ -266,7 +274,10 @@ in
         RestartSec = 5;
         StateDirectory = "via";
       };
-      environment.VIA_CONFIG = "/boot/viaos.toml";
+      environment = {
+        VIA_CONFIG = "/boot/viaos.toml";
+        VIA_SYSUPDATE = "${config.systemd.package}/lib/systemd/systemd-sysupdate";
+      };
     };
 
     # The device is good once the agent and Docker are up. Reaching this

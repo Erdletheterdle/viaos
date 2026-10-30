@@ -8,12 +8,14 @@
 //! - `POST /v1/enroll`        a device spends its enrollment token
 //! - `GET  /v1/connect`       a device's management connection (WebSocket)
 //! - `GET  /v1/images/{id}`   download a provisioning image
+//! - `GET  /v1/os/{arch}/{version}/{file}`  OS update files, for devices
 //! - `/mcp`                   fleet MCP, Streamable HTTP, bearer token
 
 mod db;
 mod hub;
 mod image;
 mod mcp;
+mod os;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -46,6 +48,9 @@ struct Cli {
     /// Base viaos images, named `viaos-<arch>.raw`.
     #[arg(long, env = "VIA_IMAGES_DIR")]
     images_dir: Option<PathBuf>,
+    /// OS updates, as `<arch>/<version>/` holding `nix build .#updates.<arch>`.
+    #[arg(long, env = "VIA_OS_DIR")]
+    os_dir: Option<PathBuf>,
     /// The address devices and people use to reach this server, e.g.
     /// `https://via.example.com`. Written into provisioning images.
     #[arg(long, env = "VIA_PUBLIC_URL")]
@@ -60,6 +65,7 @@ pub struct State {
     pub hub: Hub,
     pub data_dir: PathBuf,
     pub images_dir: PathBuf,
+    pub os_dir: PathBuf,
     pub public_url: String,
     /// `public_url` with its scheme switched to WebSocket.
     pub device_url: String,
@@ -95,6 +101,7 @@ async fn main() -> Result<()> {
         db: Db::open(&cli.data_dir.join("via.db"))?,
         hub: Hub::default(),
         images_dir: cli.images_dir.unwrap_or_else(|| cli.data_dir.join("base")),
+        os_dir: cli.os_dir.unwrap_or_else(|| cli.data_dir.join("os")),
         data_dir: cli.data_dir,
         public_url,
         device_url,
@@ -108,6 +115,7 @@ async fn main() -> Result<()> {
         .route("/v1/enroll", post(enroll))
         .route("/v1/connect", get(connect))
         .route("/v1/images/{id}", get(download))
+        .route("/v1/os/{arch}/{version}/{file}", get(os_file))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state.clone())
         .merge(mcp);
@@ -163,27 +171,50 @@ async fn connect(
     })
 }
 
-/// The id is 96 random bits and the only way to name the file, so the link
-/// itself is the credential. It is shown to whoever asked for the image.
-async fn download(AxState(s): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
-    if id.len() != 24 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return StatusCode::NOT_FOUND.into_response();
+/// Update files are served to enrolled devices only. Names are checked
+/// against the version's manifest, so no path from a request reaches the
+/// filesystem unvetted.
+async fn os_file(
+    AxState(s): AxState<Arc<State>>,
+    headers: HeaderMap,
+    Path((arch, version, file)): Path<(String, String, String)>,
+) -> Response {
+    if !matches!(bearer(&headers).map(|c| s.db.authenticate(c)), Some(Ok(Some(_)))) {
+        return (StatusCode::UNAUTHORIZED, "unknown device credential").into_response();
     }
-    let path = s.out_dir().join(format!("{id}.raw.zst"));
-    let Ok(file) = tokio::fs::File::open(&path).await else {
+    let Ok(release) = os::find(&s.os_dir, &arch, &version) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let name = std::fs::read_to_string(s.out_dir().join(format!("{id}.name")))
-        .unwrap_or_else(|_| "viaos.raw.zst".into());
+    if file != "manifest.json" && !release.files.iter().any(|f| f == &file) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    serve_file(&release.dir.join(&file), &file, "application/octet-stream").await
+}
+
+async fn serve_file(path: &std::path::Path, name: &str, content_type: &str) -> Response {
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
     let body = Body::from_stream(tokio_util::io::ReaderStream::new(file));
     (
         [
-            (header::CONTENT_TYPE, "application/zstd".to_string()),
+            (header::CONTENT_TYPE, content_type.to_string()),
             (header::CONTENT_LENGTH, len.to_string()),
             (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
         ],
         body,
     )
         .into_response()
+}
+
+/// The id is 96 random bits and the only way to name the file, so the link
+/// itself is the credential. It is shown to whoever asked for the image.
+async fn download(AxState(s): AxState<Arc<State>>, Path(id): Path<String>) -> Response {
+    if id.len() != 24 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let name = std::fs::read_to_string(s.out_dir().join(format!("{id}.name")))
+        .unwrap_or_else(|_| "viaos.raw.zst".into());
+    serve_file(&s.out_dir().join(format!("{id}.raw.zst")), &name, "application/zstd").await
 }

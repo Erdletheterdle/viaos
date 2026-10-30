@@ -7,6 +7,7 @@
 mod config;
 mod host;
 mod link;
+mod os;
 mod tools;
 
 use std::path::PathBuf;

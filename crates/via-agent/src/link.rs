@@ -46,6 +46,12 @@ fn identity_path(data_dir: &Path) -> PathBuf {
     data_dir.join("identity.json")
 }
 
+/// The device's control-plane credential, once enrolled.
+pub fn credential(data_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(identity_path(data_dir)).ok()?;
+    Some(serde_json::from_str::<Identity>(&text).ok()?.credential)
+}
+
 /// Stay connected to the control plane for as long as the agent runs.
 pub async fn run(control: Control, data_dir: PathBuf, device: Device) {
     let identity = loop {
