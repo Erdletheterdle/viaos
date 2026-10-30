@@ -1,0 +1,25 @@
+[package]
+name = "via-bundle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
+hex.workspace = true
+rand.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+via-core.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tar.workspace = true
+tempfile.workspace = true

@@ -1,0 +1,17 @@
+/bin/
+**/*.rs.bk
+.env
+*.bundle.zst
+/scratch/
+/examples/*/via-data*/
+*.key
+*.key.pub
+
+# belt and braces; the web scaffold carries its own ignore file too
+node_modules/
+web/dist/
+web/screenshots/
+web/.playwright-mcp/
+/.playwright-mcp/
+/target/
+/result*
