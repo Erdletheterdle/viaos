@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS enrollment_tokens (
     hostname    TEXT,
     created_at  INTEGER NOT NULL,
     expires_at  INTEGER NOT NULL,
-    used_by     TEXT
+    used_by     TEXT,
+    image_id    TEXT
 );
 CREATE TABLE IF NOT EXISTS audit (
     id     INTEGER PRIMARY KEY,
@@ -120,36 +121,43 @@ impl Db {
 
     /// Mint a single-use token for `fleet`. The caller must put the token
     /// where the device will find it and nowhere else.
-    pub fn mint_token(&self, fleet: &str, hostname: Option<&str>, ttl_secs: i64) -> Result<String> {
+    pub fn mint_token(
+        &self,
+        fleet: &str,
+        hostname: Option<&str>,
+        ttl_secs: i64,
+        image_id: Option<&str>,
+    ) -> Result<String> {
         let c = self.conn.lock().unwrap();
         let fleet_id = fleet_id(&c, fleet)?;
         let token = random_secret();
         c.execute(
-            "INSERT INTO enrollment_tokens (token_hash, fleet_id, hostname, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![hash(&token), fleet_id, hostname, now(), now() + ttl_secs],
+            "INSERT INTO enrollment_tokens (token_hash, fleet_id, hostname, created_at, expires_at, image_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![hash(&token), fleet_id, hostname, now(), now() + ttl_secs, image_id],
         )?;
         Ok(token)
     }
 
-    /// Spend an enrollment token and register the device. Returns the device
-    /// and its long-lived credential.
+    /// Spend an enrollment token and register the device. Returns the device,
+    /// its long-lived credential, and the provisioning image the token was
+    /// written into, which has now served its purpose.
     ///
     /// A token is single-use, so the same image written to two cards enrolls
     /// one device. The second is refused, rather than silently becoming the
     /// first.
-    pub fn enroll(&self, e: &Enrollment) -> Result<(Device, String)> {
+    pub fn enroll(&self, e: &Enrollment) -> Result<(Device, String, Option<String>)> {
         let mut c = self.conn.lock().unwrap();
         let tx = c.transaction()?;
-        let row: Option<(i64, Option<String>, i64, Option<String>)> = tx
+        let row: Option<(i64, Option<String>, i64, Option<String>, Option<String>)> = tx
             .query_row(
-                "SELECT fleet_id, hostname, expires_at, used_by FROM enrollment_tokens
+                "SELECT fleet_id, hostname, expires_at, used_by, image_id FROM enrollment_tokens
                  WHERE token_hash = ?1",
                 [hash(&e.token)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((fleet_id, name, expires_at, used_by)) = row else { bail!("unknown token") };
+        let Some((fleet_id, name, expires_at, used_by, image_id)) = row else { bail!("unknown token") };
         if used_by.is_some() {
             bail!("token already used");
         }
@@ -171,7 +179,7 @@ impl Db {
         )?;
         tx.commit()?;
         drop(c);
-        Ok((self.device(&id)?.expect("just inserted"), credential))
+        Ok((self.device(&id)?.expect("just inserted"), credential, image_id))
     }
 
     pub fn authenticate(&self, credential: &str) -> Result<Option<String>> {
@@ -290,8 +298,9 @@ mod tests {
     fn token_enrolls_once() {
         let (_d, db) = db();
         db.create_fleet("line").unwrap();
-        let token = db.mint_token("line", Some("line-07"), 3600).unwrap();
-        let (device, cred) = db.enroll(&enrollment(&token)).unwrap();
+        let token = db.mint_token("line", Some("line-07"), 3600, Some("img")).unwrap();
+        let (device, cred, image) = db.enroll(&enrollment(&token)).unwrap();
+        assert_eq!(image.as_deref(), Some("img"));
         assert_eq!(device.name, "line-07");
         assert_eq!(device.fleet, "line");
         assert_eq!(db.authenticate(&cred).unwrap(), Some(device.id.clone()));
@@ -303,7 +312,7 @@ mod tests {
     fn expired_and_unknown_tokens_are_refused() {
         let (_d, db) = db();
         db.create_fleet("line").unwrap();
-        let token = db.mint_token("line", None, -1).unwrap();
+        let token = db.mint_token("line", None, -1, None).unwrap();
         assert!(db.enroll(&enrollment(&token)).is_err());
         assert!(db.enroll(&enrollment("nope")).is_err());
     }
@@ -313,7 +322,7 @@ mod tests {
         let (_d, db) = db();
         db.create_fleet("line").unwrap();
         for _ in 0..2 {
-            let t = db.mint_token("line", Some("dup"), 60).unwrap();
+            let t = db.mint_token("line", Some("dup"), 60, None).unwrap();
             db.enroll(&enrollment(&t)).unwrap();
         }
         assert!(db.resolve("dup").is_err());

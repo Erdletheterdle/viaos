@@ -148,8 +148,14 @@ async fn require_admin(AxState(s): AxState<Arc<State>>, req: Request, next: Next
 
 async fn enroll(AxState(s): AxState<Arc<State>>, Json(e): Json<db::Enrollment>) -> Response {
     match s.db.enroll(&e) {
-        Ok((device, credential)) => {
+        Ok((device, credential, image)) => {
             tracing::info!(device = %device.id, name = %device.name, fleet = %device.fleet, "enrolled");
+            // The image held a token that is now spent; it can enroll nothing
+            // else, and it is gigabytes.
+            if let Some(id) = image {
+                let _ = std::fs::remove_file(s.out_dir().join(format!("{id}.raw.zst")));
+                let _ = std::fs::remove_file(s.out_dir().join(format!("{id}.name")));
+            }
             Json(json!({ "device": device, "credential": credential })).into_response()
         }
         Err(err) => (StatusCode::FORBIDDEN, err.to_string()).into_response(),

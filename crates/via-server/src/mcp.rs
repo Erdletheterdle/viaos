@@ -318,7 +318,8 @@ impl Fleet {
         s.db.create_fleet(&a.fleet)?;
         // The token goes into the image and nowhere else: not into this
         // result, the audit log, or the server's own log.
-        let token = s.db.mint_token(&a.fleet, a.hostname.as_deref(), 30 * 24 * 3600)?;
+        let id = crate::db::random_secret()[..24].to_string();
+        let token = s.db.mint_token(&a.fleet, a.hostname.as_deref(), 30 * 24 * 3600, Some(&id))?;
         let mut toml = String::new();
         if let Some(h) = &a.hostname {
             toml += &format!("hostname = {}\n", toml_str(h));
@@ -329,7 +330,6 @@ impl Fleet {
             toml += &format!("\n[ssh]\nauthorized_keys = [{}]\n", keys.join(", "));
         }
 
-        let id = crate::db::random_secret()[..24].to_string();
         let name = format!(
             "viaos-{}-{}-{}.raw.zst",
             a.fleet,
@@ -348,6 +348,7 @@ impl Fleet {
             "fleet": a.fleet,
             "arch": a.arch,
             "single_use": true,
+            "deleted_after": "the device enrolls",
             "next": "Write it to the device's disk or SD card (it is zstd-compressed; \
                      Raspberry Pi Imager and `zstdcat file | dd` both take it), then power \
                      the device on. It appears in `list_devices` once it has booted.",
