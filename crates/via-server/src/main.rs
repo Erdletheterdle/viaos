@@ -9,6 +9,8 @@
 //! - `GET  /v1/connect`       a device's management connection (WebSocket)
 //! - `GET  /v1/images/{id}`   download a provisioning image
 //! - `GET  /v1/os/{arch}/{version}/{file}`  OS update files, for devices
+//! - `PUT  /v1/releases/{app}/{release}/{arch}`  upload a bundle (admin)
+//! - `GET  /v1/releases/{app}/{release}/{arch}`  fetch a bundle (devices)
 //! - `/mcp`                   fleet MCP, Streamable HTTP, bearer token
 
 mod db;
@@ -16,6 +18,7 @@ mod hub;
 mod image;
 mod mcp;
 mod os;
+mod releases;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -76,6 +79,10 @@ impl State {
     pub fn out_dir(&self) -> PathBuf {
         self.data_dir.join("images")
     }
+
+    pub fn releases_dir(&self) -> PathBuf {
+        self.data_dir.join("releases")
+    }
 }
 
 #[tokio::main]
@@ -108,17 +115,20 @@ async fn main() -> Result<()> {
         admin_token_hash: db::hash(&cli.admin_token),
     });
 
-    let mcp = Router::new()
+    let admin = Router::new()
         .nest_service("/mcp", mcp::service(state.clone()))
+        .route("/v1/releases/{app}/{release}/{arch}", axum::routing::put(upload_release))
+        .with_state(state.clone())
         .layer(middleware::from_fn_with_state(state.clone(), require_admin));
     let app = Router::new()
         .route("/v1/enroll", post(enroll))
         .route("/v1/connect", get(connect))
         .route("/v1/images/{id}", get(download))
         .route("/v1/os/{arch}/{version}/{file}", get(os_file))
+        .route("/v1/releases/{app}/{release}/{arch}", get(release_bundle))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state.clone())
-        .merge(mcp);
+        .merge(admin);
 
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
     tracing::info!("listening on {} as {}", cli.listen, state.public_url);
@@ -189,6 +199,60 @@ async fn os_file(
         return StatusCode::NOT_FOUND.into_response();
     }
     serve_file(&release.dir.join(&file), &file, "application/octet-stream").await
+}
+
+/// Stream an uploaded bundle to disk, hashing it on the way, and only then
+/// make it visible: a half-uploaded bundle is never offered to a device.
+async fn upload_release(
+    AxState(s): AxState<Arc<State>>,
+    Path((app, release, arch)): Path<(String, u64, String)>,
+    body: Body,
+) -> Response {
+    use futures_util::StreamExt;
+    use sha2::Digest;
+    use tokio::io::AsyncWriteExt;
+
+    let result = async {
+        let path = releases::bundle_path(&s.releases_dir(), &app, release, &arch)?;
+        anyhow::ensure!(!path.exists(), "{app} release {release} for {arch} already exists; releases are immutable");
+        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
+        let tmp = path.with_extension("part");
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        let mut hash = sha2::Sha256::new();
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            hash.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        file.sync_all().await?;
+        let digest = hex::encode(hash.finalize());
+        tokio::fs::write(path.with_extension("sha256"), &digest).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok::<_, anyhow::Error>(digest)
+    }
+    .await;
+    match result {
+        Ok(digest) => {
+            tracing::info!(%app, release, %arch, "release uploaded");
+            Json(json!({ "app": app, "release": release, "arch": arch, "sha256": digest })).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+async fn release_bundle(
+    AxState(s): AxState<Arc<State>>,
+    headers: HeaderMap,
+    Path((app, release, arch)): Path<(String, u64, String)>,
+) -> Response {
+    if !matches!(bearer(&headers).map(|c| s.db.authenticate(c)), Some(Ok(Some(_)))) {
+        return (StatusCode::UNAUTHORIZED, "unknown device credential").into_response();
+    }
+    match releases::bundle_path(&s.releases_dir(), &app, release, &arch) {
+        Ok(p) => serve_file(&p, &format!("{app}-{release}-{arch}.bundle"), "application/octet-stream").await,
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn serve_file(path: &std::path::Path, name: &str, content_type: &str) -> Response {

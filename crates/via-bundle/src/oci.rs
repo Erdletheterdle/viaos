@@ -260,6 +260,29 @@ pub fn blob_path(dir: &Path, digest: &Digest) -> PathBuf {
     dir.join(digest.to_path_segment())
 }
 
+/// `nginx:1.29` as `docker.io/library/nginx:1.29`.
+///
+/// Docker's containerd image store keys images by their fully qualified name
+/// and stores whatever `io.containerd.image.name` says verbatim. Given the
+/// short form, it creates an image that no lookup by name ever finds, so the
+/// annotation must carry the name the way Docker itself would spell it.
+fn qualified_reference(reference: &str) -> String {
+    let (first, _) = reference.split_once('/').unwrap_or(("", reference));
+    let has_domain = first.contains('.') || first.contains(':') || first == "localhost";
+    let mut name = if has_domain {
+        reference.to_string()
+    } else if reference.contains('/') {
+        format!("docker.io/{reference}")
+    } else {
+        format!("docker.io/library/{reference}")
+    };
+    let last = name.rsplit('/').next().unwrap_or_default();
+    if !last.contains(':') && !last.contains('@') {
+        name.push_str(":latest");
+    }
+    name
+}
+
 /// Legacy `manifest.json` entry, which Docker's classic image store requires.
 #[derive(Debug, Serialize)]
 struct LegacyManifestEntry {
@@ -305,7 +328,7 @@ pub fn write_docker_load_archive<W: Write>(
         let size = std::fs::metadata(&manifest_path).map_err(|e| Error::io(&manifest_path, e))?.len();
 
         let mut annotations = BTreeMap::new();
-        annotations.insert(ANNOTATION_IMAGE_NAME.to_string(), image.reference.to_string());
+        annotations.insert(ANNOTATION_IMAGE_NAME.to_string(), qualified_reference(image.reference));
         if let Some(tag) = image.reference.rsplit_once(':').map(|(_, t)| t) {
             annotations.insert("org.opencontainers.image.ref.name".to_string(), tag.to_string());
         }
@@ -367,4 +390,20 @@ fn append_bytes<W: Write>(builder: &mut tar::Builder<W>, name: &str, data: &[u8]
     header.set_mtime(0);
     header.set_cksum();
     builder.append_data(&mut header, name, data).map_err(Error::tar)
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::qualified_reference;
+
+    #[test]
+    fn short_names_are_qualified_the_way_docker_spells_them() {
+        assert_eq!(qualified_reference("nginx:1.29-alpine"), "docker.io/library/nginx:1.29-alpine");
+        assert_eq!(qualified_reference("nginx"), "docker.io/library/nginx:latest");
+        assert_eq!(qualified_reference("grafana/grafana:11"), "docker.io/grafana/grafana:11");
+        assert_eq!(qualified_reference("ghcr.io/acme/app:1"), "ghcr.io/acme/app:1");
+        assert_eq!(qualified_reference("localhost:5000/app"), "localhost:5000/app:latest");
+        assert_eq!(qualified_reference("localhost/app:2"), "localhost/app:2");
+        assert_eq!(qualified_reference("redis@sha256:abc"), "docker.io/library/redis@sha256:abc");
+    }
 }

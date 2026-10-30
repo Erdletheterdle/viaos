@@ -5,6 +5,7 @@
 //! connection with no control plane involved.
 
 mod config;
+mod deploy;
 mod host;
 mod link;
 mod os;
@@ -59,6 +60,7 @@ async fn main() -> Result<()> {
         Command::Run => {
             let cfg = config::Config::load(&cli.config)?;
             cfg.apply(&cli.data_dir);
+            deploy::recover(&cli.data_dir).await;
             tracing::info!(hostname = ?cfg.hostname, control = cfg.control.is_some(), "configured");
             match cfg.control {
                 Some(control) => link::run(control, cli.data_dir, device).await,

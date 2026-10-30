@@ -11,7 +11,7 @@ These are the acceptance tests. A tool exists because one of these needs it.
 | --- | --- | --- |
 | "How's line-07 doing?" | `list_devices`, `device_health`, `logs`, `journal` | works |
 | "Update all of fleet X to version Y" (OS) | `list_os_versions`, `update_os` (dry_run first) | works |
-| "Update all of fleet X to version Y" (apps) | `deploy` | not yet |
+| "Update all of fleet X to version Y" (apps) | local `release_app`, then `list_releases`, `deploy` (dry_run first) | works, including rollback on a failed health gate |
 | "Provision the attached device" | `create_provisioning_image`, then local `list_disks`, `flash_image` | works; not yet tried on a real card |
 | "Make a provisioning image for a Pi and an x86 box on fleet X" | `create_provisioning_image` x2 | x86 works; Pi image builds, not yet booted on hardware |
 
@@ -19,9 +19,9 @@ These are the acceptance tests. A tool exists because one of these needs it.
 
 | Server | Where | Tools |
 | --- | --- | --- |
-| device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `os_update` |
-| fleet | `via-server` at `/mcp` (HTTP, bearer token) | `list_fleets`, `create_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `list_os_versions`, `update_os`, `create_provisioning_image` |
-| local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status` |
+| device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `os_update`, `deploy` |
+| fleet | `via-server` at `/mcp` (HTTP, bearer token) | `list_fleets`, `create_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `list_os_versions`, `update_os`, `list_releases`, `deploy`, `create_provisioning_image` |
+| local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status`, `release_app` |
 
 The fleet server forwards device tools over each device's outbound
 connection, adding only a `device` argument, so a tool behaves the same

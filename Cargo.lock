@@ -2722,6 +2722,10 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "via-bundle",
+ "via-compose",
+ "via-core",
+ "via-deploy",
  "zstd",
 ]
 

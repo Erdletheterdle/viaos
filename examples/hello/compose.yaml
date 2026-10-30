@@ -1,0 +1,13 @@
+# A minimal app: a web server with a healthcheck, so the deploy's health
+# gate has something real to wait for.
+services:
+  web:
+    image: nginx:1.29-alpine
+    ports:
+      - "80:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
