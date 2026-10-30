@@ -29,13 +29,16 @@ through the control plane as over `ssh device via-agent mcp`.
 
 ## Rules
 
-1. Every tool is tagged `read` or `mutate`. Mutating tools take `dry_run` and
-   return the plan when it is set.
-2. Long work returns a job id; `job_status` polls it.
+1. Every tool carries MCP's read-only or destructive hint. Tools that change
+   many devices take `dry_run` and return the plan when it is set.
+2. Long work returns at once and reports progress where the caller already
+   looks: an OS update under `os.update` in `device_health`, a flash in
+   `flash_status`.
 3. No tool returns a secret. Enrollment tokens are written straight into an
    image or onto a device; the tool returns a path or a device id, never the
    token.
-4. Every call is written to the audit log with caller, args, and result.
+4. Every fleet call is written to the audit log with its arguments and
+   whether it succeeded.
 
 ## Provisioning without a rebuild
 
