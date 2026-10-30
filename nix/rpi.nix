@@ -45,8 +45,28 @@ let
     "bcm2711-rpi-400.dtb"
     "bcm2711-rpi-cm4.dtb"
   ] (f: lib.nameValuePair "/${f}" "${fw}/${f}");
+  # The image builder runs `unshare --map-root-user fakeroot systemd-repart`.
+  # Building aarch64 on an x86 host goes through qemu-user, which is
+  # multithreaded, so the kernel refuses it a user namespace. fakeroot alone
+  # gives the build the root view it needs; this `unshare` runs its command
+  # without the namespace. It comes first on PATH because the image builder
+  # puts this package first.
+  repartPackage = pkgs.symlinkJoin {
+    name = "systemd-repart-no-userns";
+    paths = [ pkgs.buildPackages.systemd ];
+    postBuild = ''
+      cat > $out/bin/unshare <<'SH'
+      #!${pkgs.buildPackages.runtimeShell}
+      while [ "''${1#-}" != "$1" ]; do shift; done
+      exec "$@"
+      SH
+      chmod +x $out/bin/unshare
+    '';
+  };
 in
 lib.mkIf pkgs.stdenv.hostPlatform.isAarch64 {
+  image.repart.package = repartPackage;
+
   image.repart.partitions."00-esp".contents = lib.mapAttrs (_: source: { inherit source; }) files;
 
   boot.initrd.availableKernelModules = [

@@ -13,7 +13,7 @@ These are the acceptance tests. A tool exists because one of these needs it.
 | "Update all of fleet X to version Y" (OS) | `list_os_versions`, `update_os` (dry_run first) | works |
 | "Update all of fleet X to version Y" (apps) | local `release_app`, then `list_releases`, `deploy` (dry_run first) | works, including rollback on a failed health gate |
 | "Provision the attached device" | `create_provisioning_image`, then local `list_disks`, `flash_image` | works; not yet tried on a real card |
-| "Make a provisioning image for a Pi and an x86 box on fleet X" | `create_provisioning_image` x2 | x86 works; Pi image builds, not yet booted on hardware |
+| "Make a provisioning image for a Pi and an x86 box on fleet X" | `create_provisioning_image` x2 | works: both enrolled into one fleet (Pi image booted in emulated arm64 UEFI; not yet on a real Pi) |
 
 ## Servers
 
