@@ -1,0 +1,13 @@
+# viaos device configuration. Edit this file on the boot partition after
+# writing the image; it is read on every boot.
+
+# hostname = "line-07"
+
+# Join a control plane. Provisioning images come with these filled in.
+# [control]
+# url = "wss://via.example.com"
+# token = "..."
+
+# Keys allowed to `ssh root@<device>`.
+# [ssh]
+# authorized_keys = ["ssh-ed25519 AAAA... you@laptop"]

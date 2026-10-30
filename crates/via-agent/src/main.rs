@@ -4,7 +4,9 @@
 //! tools over stdio, so `ssh device via-agent mcp` is a complete management
 //! connection with no control plane involved.
 
+mod config;
 mod host;
+mod link;
 mod tools;
 
 use std::path::PathBuf;
@@ -22,12 +24,18 @@ struct Cli {
     #[arg(long, env = "VIA_DATA_DIR", default_value = "/var/lib/via")]
     data_dir: PathBuf,
 
+    /// The device configuration file.
+    #[arg(long, env = "VIA_CONFIG", default_value = "/boot/viaos.toml")]
+    config: PathBuf,
+
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run as the device daemon: apply viaos.toml, then stay up.
+    Run,
     /// Serve this device's MCP tools on stdin/stdout.
     Mcp,
     /// Print device health as JSON.
@@ -39,12 +47,25 @@ async fn main() -> Result<()> {
     // Logs go to stderr: on `mcp`, stdout is the protocol.
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,rmcp=warn".into()),
+        )
         .init();
 
     let cli = Cli::parse();
-    let device = Device::new(cli.data_dir);
+    let device = Device::new(cli.data_dir.clone());
     match cli.command {
+        Command::Run => {
+            let cfg = config::Config::load(&cli.config)?;
+            cfg.apply(&cli.data_dir);
+            tracing::info!(hostname = ?cfg.hostname, control = cfg.control.is_some(), "configured");
+            match cfg.control {
+                Some(control) => link::run(control, cli.data_dir, device).await,
+                // No control plane: the device runs its containers and
+                // answers MCP over SSH. Nothing else to do but stay up.
+                None => std::future::pending::<()>().await,
+            }
+        }
         Command::Mcp => {
             device.serve(rmcp::transport::stdio()).await?.waiting().await?;
         }

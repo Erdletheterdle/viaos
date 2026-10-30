@@ -12,15 +12,20 @@ repository = "https://github.com/beigesys/viaos"
 [workspace.dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"
+axum = "0.8.9"
 bollard = "0.21.1"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 ed25519-dalek = "3.0.0"
+fatfs = "0.3.6"
 futures = "0.3.34"
+futures-util = "0.3.34"
 hex = "0.4.3"
 indexmap = "2.14.0"
 libc = "0.2.189"
 rand = "0.10.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 rmcp = { version = "3.5.1", features = ["server", "macros", "transport-io"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 schemars = "1.1.0"
 serde = "1.0.229"
 serde_json = "1.0.151"
@@ -30,13 +35,16 @@ tar = "0.4.46"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = "1.53.1"
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 tokio-util = "0.7.19"
+toml = "0.9"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 via-bundle = { path = "crates/via-bundle", version = "0.0.1" }
 via-compose = { path = "crates/via-compose", version = "0.0.1" }
 via-core = { path = "crates/via-core", version = "0.0.1" }
 via-deploy = { path = "crates/via-deploy", version = "0.0.1" }
+via-link = { path = "crates/via-link", version = "0.0.1" }
 via-runtime = { path = "crates/via-runtime", version = "0.0.1" }
 zstd = "0.13.3"
 

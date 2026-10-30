@@ -1,0 +1,31 @@
+[package]
+name = "via-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = { workspace = true, features = ["ws"] }
+clap.workspace = true
+fatfs.workspace = true
+hex.workspace = true
+rand.workspace = true
+rmcp = { workspace = true, features = ["client", "transport-streamable-http-server"] }
+rusqlite.workspace = true
+schemars.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["io"] }
+futures-util.workspace = true
+zstd = { workspace = true, features = ["zstdmt"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+via-link.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
