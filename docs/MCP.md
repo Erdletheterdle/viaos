@@ -7,19 +7,25 @@ function first; MCP tools, the CLI, and any later UI call the same functions.
 
 These are the acceptance tests. A tool exists because one of these needs it.
 
-| Prompt | Tools |
-| --- | --- |
-| "How's line-07 doing?" | `device_health`, `containers`, `logs` |
-| "Update all of fleet X to version Y" | `fleet_status`, `deploy_fleet` (dry_run first) |
-| "Provision the attached device" | `discover_devices`, `provision_device` |
-| "Make a provisioning image for a Pi and an x86 box on fleet X" | `build_provisioning_image` |
+| Prompt | Tools | Status |
+| --- | --- | --- |
+| "How's line-07 doing?" | `list_devices`, `device_health`, `logs`, `journal` | works |
+| "Update all of fleet X to version Y" (OS) | `list_os_versions`, `update_os` (dry_run first) | works |
+| "Update all of fleet X to version Y" (apps) | `deploy` | not yet |
+| "Provision the attached device" | `create_provisioning_image`, then local `list_disks`, `flash_image` | works; not yet tried on a real card |
+| "Make a provisioning image for a Pi and an x86 box on fleet X" | `create_provisioning_image` x2 | x86 works; Pi image builds, not yet booted on hardware |
 
-## Two servers, one tool set
+## Servers
 
-- **Device** (`via-agent mcp`): stdio, reached by `ssh host via-agent mcp` or
-  the local socket. Works with no control plane.
-- **Fleet** (`via-server`): the device tools plus a `device` argument,
-  forwarded over each device's outbound connection, plus fleet-only tools.
+| Server | Where | Tools |
+| --- | --- | --- |
+| device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `os_update` |
+| fleet | `via-server` at `/mcp` (HTTP, bearer token) | `list_fleets`, `create_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `list_os_versions`, `update_os`, `create_provisioning_image` |
+| local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status` |
+
+The fleet server forwards device tools over each device's outbound
+connection, adding only a `device` argument, so a tool behaves the same
+through the control plane as over `ssh device via-agent mcp`.
 
 ## Rules
 
@@ -34,6 +40,7 @@ These are the acceptance tests. A tool exists because one of these needs it.
 ## Provisioning without a rebuild
 
 One generic image per architecture (`x86_64`, `aarch64`). Provisioning writes
-`viaos.toml` (fleet URL, enrollment token, hostname) onto the image's FAT boot
-partition. `build_provisioning_image` is "copy base image, write one file";
-it needs no Nix on the server and takes seconds.
+`viaos.toml` (control plane URL, single-use enrollment token, hostname) onto
+the image's FAT boot partition. `create_provisioning_image` copies the base
+image, writes that one file and compresses the result: about 7 seconds, no
+Nix on the server.

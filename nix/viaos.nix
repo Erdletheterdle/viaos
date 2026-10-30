@@ -48,6 +48,7 @@ in
     "${modulesPath}/image/repart.nix"
     "${modulesPath}/profiles/minimal.nix"
     ./sysupdate.nix
+    ./rpi.nix
   ];
 
   options.viaos = {
