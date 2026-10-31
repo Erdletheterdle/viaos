@@ -44,12 +44,16 @@ A device without a control plane is still fully manageable:
 | --- | --- |
 | `nix/viaos.nix` | The OS: verity-protected A/B `/nix/store`, tmpfs `/`, `/var` grown on first boot |
 | `nix/sysupdate.nix`, `nix/update.nix` | OS update files and how sysupdate installs them |
+| `nix/firmware.nix` | The firmware shipped: common Ethernet, Wi-Fi and Bluetooth chips; `viaos.firmware` adds more |
 | `nix/rpi.nix` | Raspberry Pi 4 / 400 / CM4 boot chain (firmware → U-Boot → systemd-boot) |
 | `crates/via-agent` | Device daemon: applies `viaos.toml`, holds the control-plane link, serves device MCP |
 | `crates/via-server` | Control plane: registry, enrollment, provisioning images, OS updates, fleet MCP |
 | `crates/via-link` | Byte streams multiplexed over the device's one WebSocket |
 | `crates/via-cli` | `via mcp` on the operator's machine: write images to SD cards and USB disks |
 | `crates/via-{core,compose,bundle,runtime,deploy}` | App releases, from [beigesys/via](https://github.com/beigesys/via) |
+
+The OS is about 1.1 GB installed. An OS update downloads about 610 MB, and
+the raw image is 4.7 GB (two 2 GB store slots), so it needs an 8 GB disk.
 
 `viaos.toml` on the boot partition configures a device (hostname, control
 plane, SSH keys); see `nix/viaos.example.toml`. `docs/MCP.md` lists the tools.

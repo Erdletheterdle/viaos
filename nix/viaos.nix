@@ -28,8 +28,12 @@ let
 
   # Store slots are sized for growth: a later version must fit in the slot
   # the current one does not occupy.
-  storeSize = "3G";
-  veritySize = "256M";
+  storeSize = "2G";
+  veritySize = "64M";
+  verityBlocks = {
+    VerityDataBlockSizeBytes = 4096;
+    VerityHashBlockSizeBytes = 4096;
+  };
 
   # repart finds its disk through `/`, which is tmpfs here. The ESP is on
   # the boot disk whatever the hardware names it (vda, nvme0n1, mmcblk0),
@@ -47,6 +51,8 @@ in
   imports = [
     "${modulesPath}/image/repart.nix"
     "${modulesPath}/profiles/minimal.nix"
+    "${modulesPath}/profiles/perlless.nix"
+    ./firmware.nix
     ./sysupdate.nix
     ./rpi.nix
   ];
@@ -91,7 +97,6 @@ in
       "mmc_block"
       "sdhci_pci"
     ];
-    hardware.enableRedistributableFirmware = true;
 
     # The UKI file name carries the version and the boot-counting suffix, so
     # a fresh install gets the same three tries a fresh update does.
@@ -128,13 +133,15 @@ in
             SizeMaxBytes = "512M";
           };
         };
-        "10-store-verity".repartConfig = {
+        # 4K verity blocks, not the 512-byte sectors: the hash tree is an
+        # eighth the size and there is less of it to check at boot.
+        "10-store-verity".repartConfig = verityBlocks // {
           Label = "viaos_${version}_v";
           Minimize = lib.mkForce "off";
           SizeMinBytes = veritySize;
           SizeMaxBytes = veritySize;
         };
-        "20-store".repartConfig = {
+        "20-store".repartConfig = verityBlocks // {
           Label = "viaos_${version}";
           Minimize = lib.mkForce "off";
           SizeMinBytes = storeSize;
@@ -235,6 +242,15 @@ in
 
     virtualisation.docker = {
       enable = true;
+      # Devices run images, they do not build them: no buildx, and no git
+      # for building from a repository URL. xfsprogs brings Python for one
+      # script; Docker only needs it for XFS-backed storage, which viaos
+      # does not use.
+      package = pkgs.docker.override {
+        buildxSupport = false;
+        gitMinimal = pkgs.emptyDirectory;
+        xfsprogs = pkgs.emptyDirectory;
+      };
       daemon.settings = {
         log-driver = "local";
         log-opts.max-size = "10m";
@@ -252,10 +268,8 @@ in
 
     # ---- the agent ----
 
-    environment.systemPackages = [
-      agent
-      pkgs.docker-compose
-    ];
+    # `docker compose` comes with the docker package.
+    environment.systemPackages = [ agent ];
 
     systemd.services.via-agent = {
       description = "viaos device agent";
