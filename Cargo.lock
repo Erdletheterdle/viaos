@@ -2683,6 +2683,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "via-bundle",
  "via-core",
  "via-deploy",
  "via-link",
@@ -2712,6 +2713,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "futures",
  "libc",
  "reqwest",
  "rmcp",
@@ -2720,6 +2722,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tracing",
  "tracing-subscriber",
  "via-bundle",
@@ -2819,6 +2822,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "via-bundle",
  "via-link",
  "zstd",
 ]

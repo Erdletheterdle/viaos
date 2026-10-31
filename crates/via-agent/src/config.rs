@@ -16,6 +16,19 @@ pub struct Config {
     pub control: Option<Control>,
     #[serde(default)]
     pub ssh: Ssh,
+    #[serde(default)]
+    pub trust: Trust,
+}
+
+/// Who the device takes OS updates and app releases from.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Trust {
+    /// Public keys, hex, from `via keygen`. With any listed, an update or
+    /// release must be signed by one of them; with none, signatures are not
+    /// checked and the sha256 the control plane sends is all that is.
+    #[serde(default)]
+    pub keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +57,19 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    pub fn trust_policy(&self) -> Result<via_bundle::TrustPolicy> {
+        if self.trust.keys.is_empty() {
+            return Ok(via_bundle::TrustPolicy::Insecure);
+        }
+        let keys = self
+            .trust
+            .keys
+            .iter()
+            .map(|k| via_bundle::PublicKey::from_hex(k).with_context(|| format!("[trust] key {k:?}")))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(via_bundle::TrustPolicy::from_keys(keys))
     }
 
     /// Make the host match the file. Each step is independent, so one bad
@@ -113,7 +139,17 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.control.unwrap().token.as_deref(), Some("abc"));
+        assert_eq!(cfg.control.as_ref().unwrap().token.as_deref(), Some("abc"));
         assert_eq!(cfg.ssh.authorized_keys.len(), 1);
+        assert!(!cfg.trust_policy().unwrap().requires_signature());
+    }
+
+    #[test]
+    fn trust_keys_require_signatures() {
+        let key = via_bundle::SigningKey::generate().public().to_hex();
+        let cfg: Config = toml::from_str(&format!("[trust]\nkeys = [\"{key}\"]\n")).unwrap();
+        assert!(cfg.trust_policy().unwrap().requires_signature());
+        let bad: Config = toml::from_str("[trust]\nkeys = [\"zz\"]\n").unwrap();
+        assert!(bad.trust_policy().is_err());
     }
 }

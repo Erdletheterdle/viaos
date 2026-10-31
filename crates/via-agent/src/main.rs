@@ -9,6 +9,7 @@ mod deploy;
 mod host;
 mod link;
 mod os;
+mod ready;
 mod tools;
 
 use std::path::PathBuf;
@@ -42,6 +43,13 @@ enum Command {
     Mcp,
     /// Print device health as JSON.
     Health,
+    /// Wait until this boot is good: Docker answers and, with a control
+    /// plane configured, the agent has reached it. Marks the boot entry
+    /// good or bad; see ready.rs.
+    Ready {
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+    },
 }
 
 #[tokio::main]
@@ -55,10 +63,10 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let device = Device::new(cli.data_dir.clone());
+    let cfg = config::Config::load(&cli.config)?;
+    let device = Device::new(cli.data_dir.clone(), cfg.trust_policy()?);
     match cli.command {
         Command::Run => {
-            let cfg = config::Config::load(&cli.config)?;
             cfg.apply(&cli.data_dir);
             deploy::recover(&cli.data_dir).await;
             tracing::info!(hostname = ?cfg.hostname, control = cfg.control.is_some(), "configured");
@@ -74,6 +82,9 @@ async fn main() -> Result<()> {
         }
         Command::Health => {
             println!("{}", serde_json::to_string_pretty(&device.health().await)?);
+        }
+        Command::Ready { timeout_secs } => {
+            ready::run(cfg.control.is_some(), std::time::Duration::from_secs(timeout_secs)).await?;
         }
     }
     Ok(())

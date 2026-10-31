@@ -1,4 +1,5 @@
-//! The registry: fleets, devices, enrollment tokens, and the audit log.
+//! The registry: fleets, devices, enrollment tokens, API tokens, and the
+//! audit log.
 //!
 //! One SQLite file, one connection behind a mutex. A control plane for a few
 //! thousand devices does a handful of writes a second at most; a pool would
@@ -44,7 +45,56 @@ CREATE TABLE IF NOT EXISTS audit (
     args   TEXT NOT NULL,
     ok     INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS api_tokens (
+    name        TEXT PRIMARY KEY,
+    role        TEXT NOT NULL,
+    token_hash  TEXT NOT NULL UNIQUE,
+    created_at  INTEGER NOT NULL,
+    last_used   INTEGER
+);
 ";
+
+/// What a person (or their Claude) may do through the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Everything: fleet changes, uploads, tunnels into devices.
+    Admin,
+    /// Read-only tools: health, logs, lists. Changes nothing.
+    Viewer,
+}
+
+impl Role {
+    fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Viewer => "viewer",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "admin" => Some(Role::Admin),
+            "viewer" => Some(Role::Viewer),
+            _ => None,
+        }
+    }
+}
+
+/// Whoever an API request authenticated as.
+#[derive(Debug, Clone)]
+pub struct Caller {
+    pub name: String,
+    pub role: Role,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiToken {
+    pub name: String,
+    pub role: Role,
+    pub created_at: i64,
+    pub last_used: Option<i64>,
+}
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -99,6 +149,13 @@ impl Db {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        // Added after the first release of the schema.
+        let has_actor: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('audit') WHERE name = 'actor'")?
+            .exists([])?;
+        if !has_actor {
+            conn.execute_batch("ALTER TABLE audit ADD COLUMN actor TEXT")?;
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -232,11 +289,61 @@ impl Db {
         }
     }
 
-    pub fn audit(&self, tool: &str, args: &serde_json::Value, ok: bool) {
+    /// Create an API token and return it. It is shown once, here, and
+    /// stored only as a hash.
+    pub fn create_api_token(&self, name: &str, role: Role) -> Result<String> {
+        valid_name(name)?;
+        let token = format!("via_{}", random_secret());
+        let c = self.conn.lock().unwrap();
+        let n = c.execute(
+            "INSERT INTO api_tokens (name, role, token_hash, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT DO NOTHING",
+            params![name, role.as_str(), hash(&token), now()],
+        )?;
+        anyhow::ensure!(n == 1, "a token named {name:?} exists; revoke it first");
+        Ok(token)
+    }
+
+    pub fn api_tokens(&self) -> Result<Vec<ApiToken>> {
+        let c = self.conn.lock().unwrap();
+        let mut q = c.prepare("SELECT name, role, created_at, last_used FROM api_tokens ORDER BY name")?;
+        let rows = q.query_map([], |r| {
+            let role: String = r.get(1)?;
+            Ok(ApiToken {
+                name: r.get(0)?,
+                role: Role::parse(&role).unwrap_or(Role::Viewer),
+                created_at: r.get(2)?,
+                last_used: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn revoke_api_token(&self, name: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        let n = c.execute("DELETE FROM api_tokens WHERE name = ?1", [name])?;
+        anyhow::ensure!(n == 1, "no token named {name:?}");
+        Ok(())
+    }
+
+    /// Who an API token belongs to, if anyone.
+    pub fn api_caller(&self, token: &str) -> Result<Option<Caller>> {
+        let c = self.conn.lock().unwrap();
+        let row: Option<(String, String)> = c
+            .query_row(
+                "UPDATE api_tokens SET last_used = ?2 WHERE token_hash = ?1 RETURNING name, role",
+                params![hash(token), now()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(name, role)| Some(Caller { name, role: Role::parse(&role)? })))
+    }
+
+    pub fn audit(&self, actor: &str, tool: &str, args: &serde_json::Value, ok: bool) {
         let c = self.conn.lock().unwrap();
         if let Err(e) = c.execute(
-            "INSERT INTO audit (at, tool, args, ok) VALUES (?1, ?2, ?3, ?4)",
-            params![now(), tool, args.to_string(), ok],
+            "INSERT INTO audit (at, actor, tool, args, ok) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![now(), actor, tool, args.to_string(), ok],
         ) {
             tracing::error!("audit write failed: {e}");
         }
@@ -326,5 +433,27 @@ mod tests {
             db.enroll(&enrollment(&t)).unwrap();
         }
         assert!(db.resolve("dup").is_err());
+    }
+
+    #[test]
+    fn api_tokens_authenticate_until_revoked() {
+        let (_d, db) = db();
+        let token = db.create_api_token("ana", Role::Viewer).unwrap();
+        assert!(db.create_api_token("ana", Role::Admin).is_err());
+        let caller = db.api_caller(&token).unwrap().unwrap();
+        assert_eq!((caller.name.as_str(), caller.role), ("ana", Role::Viewer));
+        assert!(db.api_tokens().unwrap()[0].last_used.is_some());
+        assert!(db.api_caller("via_nope").unwrap().is_none());
+        db.revoke_api_token("ana").unwrap();
+        assert!(db.api_caller(&token).unwrap().is_none());
+    }
+
+    #[test]
+    fn audit_records_the_actor() {
+        let (_d, db) = db();
+        db.audit("ana", "list_fleets", &serde_json::json!({}), true);
+        let c = db.conn.lock().unwrap();
+        let actor: String = c.query_row("SELECT actor FROM audit", [], |r| r.get(0)).unwrap();
+        assert_eq!(actor, "ana");
     }
 }

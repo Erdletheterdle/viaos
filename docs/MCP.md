@@ -9,7 +9,7 @@ These are the acceptance tests. A tool exists because one of these needs it.
 
 | Prompt | Tools | Status |
 | --- | --- | --- |
-| "How's line-07 doing?" | `list_devices`, `device_health`, `logs`, `journal` | works |
+| "How's line-07 doing?" | `list_devices`, `device_health`, `logs`, `journal`, `exec` | works |
 | "Update all of fleet X to version Y" (OS) | `list_os_versions`, `update_os` (dry_run first) | works |
 | "Update all of fleet X to version Y" (apps) | local `release_app`, then `list_releases`, `deploy` (dry_run first) | works, including rollback on a failed health gate |
 | "Provision the attached device" | `create_provisioning_image`, then local `list_disks`, `flash_image` | works; not yet tried on a real card |
@@ -19,8 +19,8 @@ These are the acceptance tests. A tool exists because one of these needs it.
 
 | Server | Where | Tools |
 | --- | --- | --- |
-| device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `os_update`, `deploy` |
-| fleet | `via-server` at `/mcp` (HTTP, bearer token) | `list_fleets`, `create_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `list_os_versions`, `update_os`, `list_releases`, `deploy`, `create_provisioning_image` |
+| device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `exec`, `os_update`, `deploy` |
+| fleet | `via-server` at `/mcp` (HTTP, API token) | `list_fleets`, `create_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `deploy`, `create_provisioning_image` |
 | local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status`, `release_app` |
 
 The fleet server forwards device tools over each device's outbound
@@ -37,8 +37,10 @@ through the control plane as over `ssh device via-agent mcp`.
 3. No tool returns a secret. Enrollment tokens are written straight into an
    image or onto a device; the tool returns a path or a device id, never the
    token.
-4. Every fleet call is written to the audit log with its arguments and
-   whether it succeeded.
+4. Every fleet call is written to the audit log with the token's name, its
+   arguments and whether it succeeded.
+5. A `viewer` token may call only the read-only tools; the rest answer with
+   an error naming the role needed.
 
 ## Provisioning without a rebuild
 

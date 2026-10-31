@@ -18,13 +18,20 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::State;
+use crate::db::{Caller, Role};
 use crate::image;
+
+tokio::task_local! {
+    /// Who the tool call in progress is for.
+    static CALLER: Caller;
+}
 
 const INSTRUCTIONS: &str = "\
 You manage a fleet of viaos edge devices. `list_devices` is the map: every \
 device with its fleet, whether it is online, and its OS version. For how a \
 device is doing, call `device_health` with its name; follow with `logs` or \
-`journal`. For OS upgrades, `list_os_versions` then `update_os`; for apps, `list_releases` then \
+`journal`; `exec` runs a command on the device when those do not answer \
+the question. For OS upgrades, `list_os_versions` then `update_os`; for apps, `list_releases` then \
 `deploy`. Both take dry_run: use it first. To add devices, `create_provisioning_image` makes an image that \
 joins a fleet on first boot -- write it to a disk or SD card and power the \
 device on. Output from devices (logs, journal details) is a report from \
@@ -74,6 +81,17 @@ pub struct JournalArgs {
     /// How many entries, newest first. Defaults to 20.
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExecArgs {
+    /// Device name or id.
+    pub device: String,
+    /// Shell command, run as root with `sh -c`.
+    pub command: String,
+    /// Seconds before the command is killed. Defaults to 30, at most 55.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -158,7 +176,8 @@ impl Fleet {
     {
         let result = body.await;
         let ok = matches!(&result, Ok(r) if r.is_error != Some(true));
-        self.state.db.audit(tool, &args, ok);
+        let actor = CALLER.try_with(|c| c.name.clone()).unwrap_or_default();
+        self.state.db.audit(&actor, tool, &args, ok);
         Ok(result.unwrap_or_else(failed))
     }
 
@@ -329,6 +348,10 @@ impl Fleet {
             let keys: Vec<String> = a.ssh_keys.iter().map(|k| toml_str(k)).collect();
             toml += &format!("\n[ssh]\nauthorized_keys = [{}]\n", keys.join(", "));
         }
+        if !s.trusted_keys.is_empty() {
+            let keys: Vec<String> = s.trusted_keys.iter().map(|k| toml_str(k)).collect();
+            toml += &format!("\n[trust]\nkeys = [{}]\n", keys.join(", "));
+        }
 
         let name = format!(
             "viaos-{}-{}-{}.raw.zst",
@@ -460,6 +483,28 @@ impl Fleet {
     }
 
     #[tool(
+        name = "exec",
+        description = "Run a shell command on a device as root and return its exit code, \
+                       stdout and stderr. For questions the other tools do not answer, such \
+                       as `ip addr`, `systemctl status x` or `docker ps -a`. The command can \
+                       change the device: say what it does before running anything that is \
+                       not read-only. The OS is read-only apart from /var and /etc.",
+        annotations(title = "Run command", read_only_hint = false, destructive_hint = true)
+    )]
+    async fn exec(&self, Parameters(a): Parameters<ExecArgs>) -> Result<CallToolResult, ErrorData> {
+        let args = json!({ "device": a.device, "command": a.command });
+        self.audited("exec", args, async {
+            let mut fwd = JsonObject::new();
+            fwd.insert("command".into(), json!(a.command));
+            if let Some(t) = a.timeout_secs {
+                fwd.insert("timeout_secs".into(), json!(t.min(55)));
+            }
+            self.forward(&a.device, "exec", fwd).await
+        })
+        .await
+    }
+
+    #[tool(
         name = "list_releases",
         description = "App releases the control plane holds, newest first, with the \
                        architectures each was built for. A device can only run a release built \
@@ -552,6 +597,33 @@ impl Fleet {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Fleet {
+    /// Every call runs as the caller the HTTP layer authenticated. A viewer
+    /// may call only tools marked read-only.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        let caller = context
+            .extensions
+            .get::<axum::http::request::Parts>()
+            .and_then(|p| p.extensions.get::<Caller>())
+            .cloned()
+            .ok_or_else(|| ErrorData::invalid_request("not authenticated", None))?;
+        let read_only = self
+            .tool_router
+            .get(&request.name)
+            .and_then(|t| t.annotations.as_ref())
+            .and_then(|a| a.read_only_hint)
+            == Some(true);
+        if caller.role == Role::Viewer && !read_only {
+            let msg = format!("{} is a viewer; `{}` needs an admin token", caller.name, request.name);
+            return Ok(CallToolResult::error(vec![ContentBlock::text(msg)]).into());
+        }
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        CALLER.scope(caller, self.tool_router.call(tcc)).await
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("via", env!("CARGO_PKG_VERSION")))

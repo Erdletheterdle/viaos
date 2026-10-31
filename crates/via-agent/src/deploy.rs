@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use via_bundle::TrustPolicy;
 use via_deploy::{Deployer, Store, SystemClock};
 use via_runtime::{ApplyContext, DockerRuntime};
 
@@ -23,6 +24,17 @@ pub struct DeployStatus {
     pub rolled_back_to: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// One release to deploy, and how to get and check it.
+pub struct Job {
+    pub app: String,
+    pub release: u64,
+    /// URL or file.
+    pub source: String,
+    pub sha256: String,
+    pub bearer: Option<String>,
+    pub trust: TrustPolicy,
 }
 
 #[derive(Clone, Default)]
@@ -51,25 +63,18 @@ impl Deploys {
         }
     }
 
-    /// Start deploying the bundle at `source` (URL or file). Returns at once.
-    pub fn start(
-        &self,
-        data_dir: PathBuf,
-        app: String,
-        release: u64,
-        source: String,
-        sha256: String,
-        bearer: Option<String>,
-    ) -> Result<()> {
+    /// Start deploying `job`. Returns at once.
+    pub fn start(&self, data_dir: PathBuf, job: Job) -> Result<()> {
         if let Some(s) = self.status() {
             if matches!(s.state.as_str(), "downloading" | "deploying") {
                 bail!("{} release {} is already {}", s.app, s.release, s.state);
             }
         }
-        self.set(&app, release, "downloading");
+        self.set(&job.app, job.release, "downloading");
         let this = self.clone();
         tokio::spawn(async move {
-            let result = this.run(&data_dir, &app, release, &source, &sha256, bearer.as_deref()).await;
+            let (app, release) = (job.app.clone(), job.release);
+            let result = this.run(&data_dir, job).await;
             match result {
                 Ok(rolled_back_to) => this.finish(|s| match rolled_back_to {
                     Some(prev) => {
@@ -92,28 +97,22 @@ impl Deploys {
     }
 
     /// Returns the release rolled back to, if the new one failed its gate.
-    async fn run(
-        &self,
-        data_dir: &Path,
-        app: &str,
-        release: u64,
-        source: &str,
-        sha256: &str,
-        bearer: Option<&str>,
-    ) -> Result<Option<String>> {
+    async fn run(&self, data_dir: &Path, job: Job) -> Result<Option<String>> {
+        let Job { app, release, source, sha256, bearer, trust } = job;
         let incoming = data_dir.join("incoming");
         tokio::fs::create_dir_all(&incoming).await?;
         let bundle = incoming.join(format!("{app}-{release}.bundle"));
-        let digest = fetch(source, &bundle, bearer).await.context("fetching the bundle")?;
+        let digest = fetch(&source, &bundle, bearer.as_deref()).await.context("fetching the bundle")?;
         if digest != sha256.trim_start_matches("sha256:") {
             let _ = tokio::fs::remove_file(&bundle).await;
             bail!("bundle is corrupt: sha256 {digest}, expected {sha256}");
         }
 
-        self.set(app, release, "deploying");
+        self.set(&app, release, "deploying");
         let store = Store::open(data_dir)?;
         let runtime = DockerRuntime::connect()?;
         let outcome = Deployer::new(&store, &runtime, &SystemClock)
+            .trusting(trust)
             .deploy(&bundle, &ApplyContext::default())
             .await;
         let _ = tokio::fs::remove_file(&bundle).await;

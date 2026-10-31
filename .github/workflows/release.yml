@@ -1,0 +1,44 @@
+# Push a tag `v<N>` where N is the number in VERSION: builds both
+# architectures, signs the OS updates, and publishes them and the base images
+# to your control plane. Needs repository secrets:
+#
+#   VIA_SERVER       https://via.example.com
+#   VIA_TOKEN        an admin token: `via-server token create ci`
+#   VIA_SIGNING_KEY  the contents of a key from `via keygen`
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches VERSION
+        run: test "${GITHUB_REF_NAME#v}" = "$(cat VERSION)"
+      # An image build needs more disk than a runner has free.
+      - uses: jlumbroso/free-disk-space@main
+      - uses: cachix/install-nix-action@v31
+      - run: nix build .#via -o via
+      - run: nix build .#images.${{ matrix.arch }} -o image
+      - run: nix build .#updates.${{ matrix.arch }} -o update
+      - name: Publish
+        env:
+          VIA_SERVER: ${{ secrets.VIA_SERVER }}
+          VIA_TOKEN: ${{ secrets.VIA_TOKEN }}
+          VIA_SIGNING_KEY_HEX: ${{ secrets.VIA_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$VIA_SIGNING_KEY_HEX" > "$RUNNER_TEMP/key"
+          via/bin/via os-release update --sign-key "$RUNNER_TEMP/key"
+          via/bin/via base-image image/viaos_$(cat VERSION).raw --arch ${{ matrix.arch }}
+          rm "$RUNNER_TEMP/key"

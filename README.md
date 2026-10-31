@@ -13,19 +13,22 @@ is the UI, through MCP.
 
 ## Try it
 
+`docs/deploy.md` covers running the control plane for real (NixOS module or
+container, TLS, tokens, signing). To try it on one machine:
+
 ```bash
-# 1. Build the images (x86_64 here; aarch64 for Raspberry Pi 4)
+# 1. Build an image (x86_64 here; aarch64 for Raspberry Pi 4)
 nix build .#images.x86_64 -o result-x86
 
-# 2. Run a control plane
+# 2. Run a control plane and make yourself a token
 mkdir -p data/base && ln -s $(readlink -f result-x86)/viaos_1.raw data/base/viaos-x86_64.raw
-VIA_ADMIN_TOKEN=$(openssl rand -hex 16) VIA_PUBLIC_URL=https://via.example.com \
-  VIA_DATA_DIR=data cargo run -p via-server
+export VIA_DATA_DIR=data VIA_SERVER=http://localhost:8080
+export VIA_TOKEN=$(cargo run -q -p via-server -- token create me)
+VIA_PUBLIC_URL=http://<this machine's LAN address>:8080 cargo run -p via-server &
 
 # 3. Point Claude at it
-claude mcp add --transport http via https://via.example.com/mcp \
-  --header "Authorization: Bearer $VIA_ADMIN_TOKEN"
-claude mcp add via-local -- sudo via mcp     # for flashing attached disks
+claude mcp add --transport http via $VIA_SERVER/mcp --header "Authorization: Bearer $VIA_TOKEN"
+claude mcp add via-local -- sudo -E via mcp     # for flashing attached disks
 ```
 
 Then ask:
@@ -34,6 +37,10 @@ Then ask:
 - "Flash it to the SD card I just plugged in."
 - "How's line-07 doing?"
 - "Update all of fleet `line` to version 2."
+- "What's using the disk on line-07?" (`exec`)
+
+`via ssh line-07` opens a shell on a device wherever it is, through its own
+outbound connection.
 
 A device without a control plane is still fully manageable:
 `claude mcp add line-07 -- ssh root@line-07 via-agent mcp`.
@@ -45,11 +52,12 @@ A device without a control plane is still fully manageable:
 | `nix/viaos.nix` | The OS: verity-protected A/B `/nix/store`, tmpfs `/`, `/var` grown on first boot |
 | `nix/sysupdate.nix`, `nix/update.nix` | OS update files and how sysupdate installs them |
 | `nix/firmware.nix` | The firmware shipped: common Ethernet, Wi-Fi and Bluetooth chips; `viaos.firmware` adds more |
+| `nix/server-module.nix` | `services.via-server` for NixOS, with Caddy for TLS; `nix/server-test.nix` boots it in a VM |
 | `nix/rpi.nix` | Raspberry Pi 4 / 400 / CM4 boot chain (firmware → U-Boot → systemd-boot) |
 | `crates/via-agent` | Device daemon: applies `viaos.toml`, holds the control-plane link, serves device MCP |
 | `crates/via-server` | Control plane: registry, enrollment, provisioning images, OS updates, fleet MCP |
 | `crates/via-link` | Byte streams multiplexed over the device's one WebSocket |
-| `crates/via-cli` | `via mcp` on the operator's machine: write images to SD cards and USB disks |
+| `crates/via-cli` | `via` on the operator's machine: flash SD cards, release apps and OS versions (signed), `ssh` and `forward` into devices |
 | `crates/via-{core,compose,bundle,runtime,deploy}` | App releases, from [beigesys/via](https://github.com/beigesys/via) |
 
 The OS is about 1.1 GB installed. An OS update downloads about 610 MB, and

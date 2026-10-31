@@ -3,14 +3,18 @@
 //! `via mcp` serves the tools that only make sense where the operator is:
 //! writing a provisioning image to an SD card or USB disk plugged in here,
 //! and building an app release from a compose file on this machine.
-//! Uploading needs `VIA_SERVER` and `VIA_ADMIN_TOKEN`.
+//! Anything that talks to the control plane needs `VIA_SERVER` and
+//! `VIA_TOKEN`; signing takes a key from `via keygen`.
 //! The fleet's tools live on the control plane; Claude uses both, e.g.
 //! `create_provisioning_image` there, then `flash_image` here.
 
 mod build;
 mod flash;
+mod remote;
 
-use anyhow::Result;
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -50,7 +54,41 @@ enum Command {
         /// Use images already present locally instead of `docker build`.
         #[arg(long)]
         no_build: bool,
+        /// Sign the release with this key (from `via keygen`).
+        #[arg(long, env = "VIA_SIGNING_KEY")]
+        sign_key: Option<PathBuf>,
     },
+    /// Make a signing key for OS updates and app releases.
+    Keygen {
+        /// Where to write it; the public key goes beside it as `<path>.pub`.
+        path: PathBuf,
+    },
+    /// Sign and upload an OS update: the output of `nix build .#updates.<arch>`.
+    OsRelease {
+        dir: PathBuf,
+        #[arg(long, env = "VIA_SIGNING_KEY")]
+        sign_key: Option<PathBuf>,
+    },
+    /// Upload a raw image (`nix build .#images.<arch>`) as the base that
+    /// provisioning images are made from.
+    BaseImage {
+        raw: PathBuf,
+        #[arg(long)]
+        arch: String,
+    },
+    /// Carry a TCP stream to a port on a device over stdin/stdout. For
+    /// `ssh -o ProxyCommand='via tunnel %n 22'`.
+    Tunnel { device: String, port: u16 },
+    /// SSH to a device through the control plane, wherever it is.
+    Ssh {
+        device: String,
+        /// Arguments passed to ssh after the destination, e.g. a command.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Listen on a local port and forward each connection to a port on a
+    /// device, e.g. `via forward line-07 8080 8080`.
+    Forward { device: String, port: u16, local_port: u16 },
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -73,9 +111,15 @@ struct ReleaseArgs {
 }
 
 /// Build a bundle per architecture and upload each to the control plane.
-fn release(file: std::path::PathBuf, app: Option<String>, number: u64, archs: Vec<String>, no_build: bool) -> Result<Value> {
-    let server = std::env::var("VIA_SERVER").map_err(|_| anyhow::anyhow!("set VIA_SERVER to the control plane URL"))?;
-    let token = std::env::var("VIA_ADMIN_TOKEN").map_err(|_| anyhow::anyhow!("set VIA_ADMIN_TOKEN"))?;
+fn release(
+    file: PathBuf,
+    app: Option<String>,
+    number: u64,
+    archs: Vec<String>,
+    no_build: bool,
+    sign_key: Option<PathBuf>,
+) -> Result<Value> {
+    let remote = remote::Remote::from_env()?;
     let archs = if archs.is_empty() { vec!["x86_64".to_string()] } else { archs };
     let out_dir = std::env::temp_dir().join(format!("via-release-{}", std::process::id()));
     std::fs::create_dir_all(&out_dir)?;
@@ -98,25 +142,17 @@ fn release(file: std::path::PathBuf, app: Option<String>, number: u64, archs: Ve
             strict: false,
             no_build,
             compression: 3,
-            sign_key: None,
+            sign_key: sign_key.clone(),
         })?;
-        let url = format!("{}/v1/releases/{}/{}/{arch}", server.trim_end_matches('/'), built.app, number);
-        let resp = reqwest::blocking::Client::builder()
-            .timeout(None)
-            .build()?
-            .put(&url)
-            .bearer_auth(&token)
-            .body(std::fs::File::open(&built.path)?)
-            .send()?;
-        let status = resp.status();
-        let text = resp.text().unwrap_or_default();
-        anyhow::ensure!(status.is_success(), "upload of {arch} failed: {status} {text}");
+        let uploaded = remote.put_file(&format!("/v1/releases/{}/{number}/{arch}", built.app), &built.path);
         let _ = std::fs::remove_file(&built.path);
+        uploaded.with_context(|| format!("uploading the {arch} build"))?;
         app_name = built.app.clone();
         results.push(json!({
             "arch": arch,
             "sha256": built.sha256,
             "size_mb": built.size_bytes / 1_048_576,
+            "signed": built.signed,
             "warnings": built.warnings,
         }));
     }
@@ -195,7 +231,8 @@ impl Local {
     )]
     async fn release_app(&self, Parameters(a): Parameters<ReleaseArgs>) -> Result<CallToolResult, ErrorData> {
         let r = tokio::task::spawn_blocking(move || {
-            release(a.compose_file.into(), a.app, a.release, a.archs, a.no_build)
+            let key = std::env::var_os("VIA_SIGNING_KEY").map(PathBuf::from);
+            release(a.compose_file.into(), a.app, a.release, a.archs, a.no_build, key)
         })
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -233,10 +270,60 @@ async fn main() -> Result<()> {
             local.serve(rmcp::transport::stdio()).await?.waiting().await?;
         }
         Command::Disks => println!("{}", serde_json::to_string_pretty(&flash::list()?)?),
-        Command::Release { file, app, release: number, arch, no_build } => {
-            let r = tokio::task::spawn_blocking(move || release(file, app, number, arch, no_build)).await??;
-            println!("{}", serde_json::to_string_pretty(&r)?);
+        Command::Release { file, app, release: number, arch, no_build, sign_key } => {
+            let r = tokio::task::spawn_blocking(move || release(file, app, number, arch, no_build, sign_key)).await??;
+            print_json(&r)?;
+        }
+        Command::Keygen { path } => print_json(&remote::keygen(&path)?)?,
+        Command::OsRelease { dir, sign_key } => {
+            let remote = remote::Remote::from_env()?;
+            let r = tokio::task::spawn_blocking(move || remote::os_release(&remote, &dir, sign_key.as_deref())).await??;
+            print_json(&r)?;
+        }
+        Command::BaseImage { raw, arch } => {
+            let remote = remote::Remote::from_env()?;
+            let r = tokio::task::spawn_blocking(move || remote::base_image(&remote, &raw, &arch)).await??;
+            print_json(&r)?;
+        }
+        Command::Tunnel { device, port } => {
+            let stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+            remote::Remote::from_env()?.tunnel(&device, port, stdio).await?;
+        }
+        Command::Ssh { device, args } => {
+            remote::Remote::from_env()?;
+            let me = std::env::current_exe()?;
+            // The host key is remembered under the device's name, not under
+            // whatever address the tunnel happens to go through.
+            let err = std::os::unix::process::CommandExt::exec(
+                std::process::Command::new("ssh")
+                    .arg("-o")
+                    .arg(format!("ProxyCommand={} tunnel {device} 22", me.display()))
+                    .arg("-o")
+                    .arg(format!("HostKeyAlias=via-{device}"))
+                    .arg(format!("root@{device}"))
+                    .args(args),
+            );
+            return Err(err).context("running ssh");
+        }
+        Command::Forward { device, port, local_port } => {
+            let remote = std::sync::Arc::new(remote::Remote::from_env()?);
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port)).await?;
+            eprintln!("forwarding 127.0.0.1:{local_port} to {device}:{port}");
+            loop {
+                let (conn, _) = listener.accept().await?;
+                let (remote, device) = (remote.clone(), device.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = remote.tunnel(&device, port, conn).await {
+                        eprintln!("{e:#}");
+                    }
+                });
+            }
         }
     }
+    Ok(())
+}
+
+fn print_json(v: &Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }

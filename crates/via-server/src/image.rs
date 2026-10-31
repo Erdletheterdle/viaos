@@ -72,6 +72,39 @@ fn compress(input: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Unpack a zstd-compressed image to `out`, leaving runs of zeros as holes:
+/// most of a base image is empty partitions.
+pub fn decompress(input: &Path, out: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let tmp = out.with_extension("unpack");
+    let mut dec = zstd::Decoder::new(File::open(input)?)?;
+    let mut dst = File::create(&tmp)?;
+    let mut buf = vec![0u8; 1 << 16];
+    let mut len = 0u64;
+    loop {
+        let mut n = 0;
+        while n < buf.len() {
+            match dec.read(&mut buf[n..])? {
+                0 => break,
+                k => n += k,
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        if buf[..n].iter().all(|&b| b == 0) {
+            dst.seek(SeekFrom::Current(n as i64))?;
+        } else {
+            dst.write_all(&buf[..n])?;
+        }
+        len += n as u64;
+    }
+    dst.set_len(len)?;
+    dst.sync_all()?;
+    std::fs::rename(tmp, out)?;
+    Ok(())
+}
+
 fn zstd_encoder(dst: File) -> Result<zstd::Encoder<'static, File>> {
     let mut enc = zstd::Encoder::new(dst, 3)?;
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);

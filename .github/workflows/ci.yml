@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Some tests drive the Docker that GitHub's runners already have.
+      - run: cargo test --workspace
+
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      - run: nix build .#via .#via-server .#via-agent .#via-server-image
+      # Boots the control plane's NixOS module in a VM: tokens, roles, MCP.
+      - run: nix flake check
+
+  # One image per architecture, each built natively.
+  images:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # An image build needs more disk than a runner has free.
+      - uses: jlumbroso/free-disk-space@main
+      - uses: cachix/install-nix-action@v31
+      - run: nix build .#images.${{ matrix.arch }} -o image
+      - run: nix build .#updates.${{ matrix.arch }} -o update
+      - run: du -sh --apparent-size image/*.raw && du -sh image/*.raw update/*

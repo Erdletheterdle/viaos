@@ -295,17 +295,35 @@ in
       };
     };
 
-    # The device is good once the agent and Docker are up. Reaching this
-    # marks the boot entry as good; failing it three times rolls back.
-    systemd.targets.boot-complete = {
-      requires = [
-        "via-agent.service"
-        "docker.service"
-      ];
+    # A boot is good once Docker answers and the agent has reached the
+    # control plane (see crates/via-agent/src/ready.rs). Reaching
+    # boot-complete.target marks the boot entry good; a trial boot of a new
+    # version that is not good in five minutes is marked bad and rebooted
+    # into the version before it.
+    systemd.services.viaos-ready = {
+      description = "Check this boot is good";
       after = [
-        "via-agent.service"
         "docker.service"
+        "via-agent.service"
       ];
+      wants = [
+        "docker.service"
+        "via-agent.service"
+      ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${lib.getExe agent} ready --timeout-secs 300";
+        TimeoutStartSec = "infinity";
+      };
+      environment = {
+        VIA_CONFIG = "/boot/viaos.toml";
+        VIA_BLESS_BOOT = "${config.systemd.package}/lib/systemd/systemd-bless-boot";
+      };
+    };
+    systemd.targets.boot-complete = {
+      requires = [ "viaos-ready.service" ];
+      after = [ "viaos-ready.service" ];
     };
 
     # ---- access ----

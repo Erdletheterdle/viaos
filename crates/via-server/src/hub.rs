@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::DuplexStream;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
 use via_link::{Mux, Side};
@@ -59,17 +60,18 @@ impl Hub {
         tracing::info!(%device, "disconnected");
     }
 
+    /// Open a stream to one of a device's services.
+    pub fn open(&self, device: &str, service: &str) -> Result<DuplexStream> {
+        let online = self.online.lock().unwrap();
+        let (_, mux) = online.get(device).context("device is offline")?;
+        Ok(mux.open(service))
+    }
+
     /// Call one of a device's own MCP tools.
     pub async fn call(&self, device: &str, tool: &str, args: JsonObject) -> Result<CallToolResult> {
-        let mux = self
-            .online
-            .lock()
-            .unwrap()
-            .get(device)
-            .map(|(_, m)| m.clone())
-            .context("device is offline")?;
+        let stream = self.open(device, "mcp")?;
         let call = async {
-            let client = ().serve(mux.open("mcp")).await.context("starting MCP session")?;
+            let client = ().serve(stream).await.context("starting MCP session")?;
             let result = client
                 .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args))
                 .await

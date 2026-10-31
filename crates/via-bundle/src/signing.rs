@@ -224,6 +224,7 @@ fn decode_key_hex(s: &str, kind: &'static str) -> Result<[u8; 32], Error> {
 }
 
 /// What a verifier requires of a bundle.
+#[derive(Clone)]
 pub enum TrustPolicy {
     /// Accept unsigned bundles and ignore any signature present.
     ///

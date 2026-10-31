@@ -9,9 +9,16 @@
 //! - `GET  /v1/connect`       a device's management connection (WebSocket)
 //! - `GET  /v1/images/{id}`   download a provisioning image
 //! - `GET  /v1/os/{arch}/{version}/{file}`  OS update files, for devices
+//! - `PUT  /v1/os/{arch}/{version}/{file}`  upload OS update files (admin)
+//! - `PUT  /v1/base/{arch}`   upload the base image provisioning starts from (admin)
 //! - `PUT  /v1/releases/{app}/{release}/{arch}`  upload a bundle (admin)
 //! - `GET  /v1/releases/{app}/{release}/{arch}`  fetch a bundle (devices)
+//! - `GET  /v1/devices/{device}/tunnel/{port}`  a TCP stream to a port on a
+//!   device, over its connection (WebSocket, admin)
 //! - `/mcp`                   fleet MCP, Streamable HTTP, bearer token
+//!
+//! People authenticate with API tokens made by `via-server token create`.
+//! Viewers get the read-only tools; admins get everything.
 
 mod db;
 mod hub;
@@ -28,7 +35,7 @@ use anyhow::{Context, Result};
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, Query, Request, State as AxState, WebSocketUpgrade};
+use axum::extract::{Extension, Path, Query, Request, State as AxState, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -43,11 +50,43 @@ use hub::Hub;
 #[derive(Parser)]
 #[command(name = "via-server", version, about = "viaos control plane")]
 struct Cli {
+    /// Database and generated images live here.
+    #[arg(long, env = "VIA_DATA_DIR", default_value = "/var/lib/via-server", global = true)]
+    data_dir: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[command(flatten)]
+    serve: Serve,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Run the control plane (the default).
+    Serve,
+    /// Manage the API tokens people and Claude use.
+    #[command(subcommand)]
+    Token(TokenCommand),
+}
+
+#[derive(clap::Subcommand)]
+enum TokenCommand {
+    /// Create a token and print it. It is shown only this once.
+    Create {
+        /// Who it is for, e.g. `ana` or `ci`.
+        name: String,
+        #[arg(long, value_enum, default_value = "admin")]
+        role: db::Role,
+    },
+    /// List tokens: name, role, and when each was last used.
+    List,
+    /// Revoke a token at once.
+    Revoke { name: String },
+}
+
+#[derive(clap::Args)]
+struct Serve {
     #[arg(long, env = "VIA_LISTEN", default_value = "0.0.0.0:8080")]
     listen: SocketAddr,
-    /// Database and generated images live here.
-    #[arg(long, env = "VIA_DATA_DIR", default_value = "/var/lib/via-server")]
-    data_dir: PathBuf,
     /// Base viaos images, named `viaos-<arch>.raw`.
     #[arg(long, env = "VIA_IMAGES_DIR")]
     images_dir: Option<PathBuf>,
@@ -57,10 +96,16 @@ struct Cli {
     /// The address devices and people use to reach this server, e.g.
     /// `https://via.example.com`. Written into provisioning images.
     #[arg(long, env = "VIA_PUBLIC_URL")]
-    public_url: String,
-    /// Bearer token for `/mcp`.
+    public_url: Option<String>,
+    /// An admin token that needs no database entry, for bootstrapping and
+    /// for deployments that keep the secret elsewhere. Audited as `admin`.
     #[arg(long, env = "VIA_ADMIN_TOKEN", hide_env_values = true)]
-    admin_token: String,
+    admin_token: Option<String>,
+    /// Public keys (hex, from `via keygen`) that devices require OS updates
+    /// and app releases to be signed by. Written into every provisioning
+    /// image. Comma-separated.
+    #[arg(long, env = "VIA_TRUSTED_KEYS", value_delimiter = ',')]
+    trusted_keys: Vec<String>,
 }
 
 pub struct State {
@@ -72,7 +117,8 @@ pub struct State {
     pub public_url: String,
     /// `public_url` with its scheme switched to WebSocket.
     pub device_url: String,
-    admin_token_hash: String,
+    pub trusted_keys: Vec<String>,
+    admin_token_hash: Option<String>,
 }
 
 impl State {
@@ -93,10 +139,33 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    anyhow::ensure!(cli.admin_token.len() >= 16, "VIA_ADMIN_TOKEN must be at least 16 characters");
     std::fs::create_dir_all(&cli.data_dir)?;
+    match cli.command.unwrap_or(Command::Serve) {
+        Command::Serve => serve(cli.serve, cli.data_dir).await,
+        Command::Token(t) => {
+            let db = Db::open(&cli.data_dir.join("via.db"))?;
+            match t {
+                TokenCommand::Create { name, role } => println!("{}", db.create_api_token(&name, role)?),
+                TokenCommand::List => println!("{}", serde_json::to_string_pretty(&db.api_tokens()?)?),
+                TokenCommand::Revoke { name } => db.revoke_api_token(&name)?,
+            }
+            Ok(())
+        }
+    }
+}
 
-    let public_url = cli.public_url.trim_end_matches('/').to_string();
+async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
+    if let Some(t) = &cli.admin_token {
+        anyhow::ensure!(t.len() >= 16, "VIA_ADMIN_TOKEN must be at least 16 characters");
+    }
+    for k in &cli.trusted_keys {
+        via_bundle::PublicKey::from_hex(k).with_context(|| format!("VIA_TRUSTED_KEYS: {k:?} is not a public key"))?;
+    }
+    let public_url = cli
+        .public_url
+        .context("VIA_PUBLIC_URL is required: the address devices reach this server at")?
+        .trim_end_matches('/')
+        .to_string();
     let device_url = if let Some(rest) = public_url.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = public_url.strip_prefix("http://") {
@@ -104,22 +173,35 @@ async fn main() -> Result<()> {
     } else {
         anyhow::bail!("VIA_PUBLIC_URL must start with http:// or https://");
     };
+    let db = Db::open(&data_dir.join("via.db"))?;
+    if cli.admin_token.is_none() && db.api_tokens()?.is_empty() {
+        tracing::warn!("no API tokens yet: create one with `via-server token create <name>`");
+    }
     let state = Arc::new(State {
-        db: Db::open(&cli.data_dir.join("via.db"))?,
+        db,
         hub: Hub::default(),
-        images_dir: cli.images_dir.unwrap_or_else(|| cli.data_dir.join("base")),
-        os_dir: cli.os_dir.unwrap_or_else(|| cli.data_dir.join("os")),
-        data_dir: cli.data_dir,
+        images_dir: cli.images_dir.unwrap_or_else(|| data_dir.join("base")),
+        os_dir: cli.os_dir.unwrap_or_else(|| data_dir.join("os")),
+        data_dir,
         public_url,
         device_url,
-        admin_token_hash: db::hash(&cli.admin_token),
+        trusted_keys: cli.trusted_keys,
+        admin_token_hash: cli.admin_token.as_deref().map(db::hash),
     });
 
-    let admin = Router::new()
+    // MCP checks roles per tool; everything else here is admin-only.
+    let people = Router::new()
         .nest_service("/mcp", mcp::service(state.clone()))
-        .route("/v1/releases/{app}/{release}/{arch}", axum::routing::put(upload_release))
         .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(state.clone(), require_admin));
+        .layer(middleware::from_fn_with_state(state.clone(), require_caller));
+    let admin = Router::new()
+        .route("/v1/releases/{app}/{release}/{arch}", axum::routing::put(upload_release))
+        .route("/v1/os/{arch}/{version}/{file}", axum::routing::put(upload_os_file))
+        .route("/v1/base/{arch}", axum::routing::put(upload_base))
+        .route("/v1/devices/{device}/tunnel/{port}", get(tunnel))
+        .with_state(state.clone())
+        .layer(middleware::from_fn(require_admin))
+        .layer(middleware::from_fn_with_state(state.clone(), require_caller));
     let app = Router::new()
         .route("/v1/enroll", post(enroll))
         .route("/v1/connect", get(connect))
@@ -128,6 +210,7 @@ async fn main() -> Result<()> {
         .route("/v1/releases/{app}/{release}/{arch}", get(release_bundle))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state.clone())
+        .merge(people)
         .merge(admin);
 
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
@@ -139,10 +222,29 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
 
-async fn require_admin(AxState(s): AxState<Arc<State>>, req: Request, next: Next) -> Response {
-    match bearer(req.headers()) {
-        Some(t) if db::hash(t) == s.admin_token_hash => next.run(req).await,
-        _ => (StatusCode::UNAUTHORIZED, "admin token required").into_response(),
+/// Authenticate an API token and attach the [`db::Caller`] to the request.
+async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next: Next) -> Response {
+    let Some(token) = bearer(req.headers()) else {
+        return (StatusCode::UNAUTHORIZED, "API token required").into_response();
+    };
+    let caller = if s.admin_token_hash.as_deref() == Some(db::hash(token).as_str()) {
+        Some(db::Caller { name: "admin".into(), role: db::Role::Admin })
+    } else {
+        s.db.api_caller(token).ok().flatten()
+    };
+    match caller {
+        Some(c) => {
+            req.extensions_mut().insert(c);
+            next.run(req).await
+        }
+        None => (StatusCode::UNAUTHORIZED, "unknown API token").into_response(),
+    }
+}
+
+async fn require_admin(req: Request, next: Next) -> Response {
+    match req.extensions().get::<db::Caller>() {
+        Some(c) if c.role == db::Role::Admin => next.run(req).await,
+        _ => (StatusCode::FORBIDDEN, "admin role required").into_response(),
     }
 }
 
@@ -201,50 +303,169 @@ async fn os_file(
     let Ok(release) = os::find(&s.os_dir, &arch, &version) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if file != "manifest.json" && !release.files.iter().any(|f| f == &file) {
+    let known = file == "manifest.json" || file == "manifest.json.sig" || release.files.iter().any(|f| f == &file);
+    if !known {
         return StatusCode::NOT_FOUND.into_response();
     }
     serve_file(&release.dir.join(&file), &file, "application/octet-stream").await
 }
 
-/// Stream an uploaded bundle to disk, hashing it on the way, and only then
-/// make it visible: a half-uploaded bundle is never offered to a device.
-async fn upload_release(
-    AxState(s): AxState<Arc<State>>,
-    Path((app, release, arch)): Path<(String, u64, String)>,
-    body: Body,
-) -> Response {
+/// Stream a request body to `path`, hashing it on the way, and only then
+/// make it visible: a half-uploaded file is never offered to anyone.
+async fn save_body(path: &std::path::Path, body: Body) -> Result<String> {
     use futures_util::StreamExt;
     use sha2::Digest;
     use tokio::io::AsyncWriteExt;
 
+    tokio::fs::create_dir_all(path.parent().context("no parent directory")?).await?;
+    let tmp = path.with_extension("part");
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut hash = sha2::Sha256::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        hash.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.sync_all().await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(hex::encode(hash.finalize()))
+}
+
+fn uploaded(result: Result<serde_json::Value>) -> Response {
+    match result {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+async fn upload_release(
+    AxState(s): AxState<Arc<State>>,
+    Extension(caller): Extension<db::Caller>,
+    Path((app, release, arch)): Path<(String, u64, String)>,
+    body: Body,
+) -> Response {
     let result = async {
         let path = releases::bundle_path(&s.releases_dir(), &app, release, &arch)?;
         anyhow::ensure!(!path.exists(), "{app} release {release} for {arch} already exists; releases are immutable");
-        tokio::fs::create_dir_all(path.parent().unwrap()).await?;
-        let tmp = path.with_extension("part");
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        let mut hash = sha2::Sha256::new();
-        let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            hash.update(&chunk);
-            file.write_all(&chunk).await?;
-        }
-        file.sync_all().await?;
-        let digest = hex::encode(hash.finalize());
+        let digest = save_body(&path.with_extension("upload"), body).await?;
         tokio::fs::write(path.with_extension("sha256"), &digest).await?;
-        tokio::fs::rename(&tmp, &path).await?;
-        Ok::<_, anyhow::Error>(digest)
+        tokio::fs::rename(path.with_extension("upload"), &path).await?;
+        Ok(json!({ "app": app, "release": release, "arch": arch, "sha256": digest }))
     }
     .await;
-    match result {
-        Ok(digest) => {
-            tracing::info!(%app, release, %arch, "release uploaded");
-            Json(json!({ "app": app, "release": release, "arch": arch, "sha256": digest })).into_response()
+    s.db.audit(&caller.name, "upload_release", &json!({ "app": app, "release": release, "arch": arch }), result.is_ok());
+    uploaded(result)
+}
+
+/// Upload one file of an OS version. `manifest.json` goes last: it is what
+/// makes the version exist, so it is accepted only once every file it names
+/// is present at the size it states.
+async fn upload_os_file(
+    AxState(s): AxState<Arc<State>>,
+    Extension(caller): Extension<db::Caller>,
+    Path((arch, version, file)): Path<(String, String, String)>,
+    body: Body,
+) -> Response {
+    let result = async {
+        let dir = os::upload_dir(&s.os_dir, &arch, &version, &file)?;
+        if file == "manifest.json" {
+            let staged = dir.join("manifest.json.upload");
+            save_body(&staged, body).await?;
+            if let Err(e) = os::check_complete(&dir, &staged, &arch, &version) {
+                let _ = tokio::fs::remove_file(&staged).await;
+                return Err(e);
+            }
+            tokio::fs::rename(&staged, dir.join("manifest.json")).await?;
+            Ok(json!({ "arch": arch, "version": version, "published": true }))
+        } else {
+            let digest = save_body(&dir.join(&file), body).await?;
+            Ok(json!({ "file": file, "sha256": digest }))
         }
-        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
+    .await;
+    if file == "manifest.json" {
+        s.db.audit(&caller.name, "upload_os", &json!({ "arch": arch, "version": version }), result.is_ok());
+    }
+    uploaded(result)
+}
+
+/// Replace the base image provisioning images are made from. The body is
+/// the zstd-compressed raw image, as `via base-image` sends it.
+async fn upload_base(
+    AxState(s): AxState<Arc<State>>,
+    Extension(caller): Extension<db::Caller>,
+    Path(arch): Path<String>,
+    body: Body,
+) -> Response {
+    let result = async {
+        anyhow::ensure!(matches!(arch.as_str(), "x86_64" | "aarch64"), "arch is x86_64 or aarch64");
+        let compressed = s.images_dir.join(format!("viaos-{arch}.raw.zst"));
+        let digest = save_body(&compressed, body).await?;
+        let raw = s.images_dir.join(format!("viaos-{arch}.raw"));
+        let c = compressed.clone();
+        tokio::task::spawn_blocking(move || image::decompress(&c, &raw)).await??;
+        let _ = tokio::fs::remove_file(&compressed).await;
+        Ok(json!({ "arch": arch, "sha256_compressed": digest }))
+    }
+    .await;
+    s.db.audit(&caller.name, "upload_base", &json!({ "arch": arch }), result.is_ok());
+    uploaded(result)
+}
+
+/// A TCP stream to `port` on a device, carried over the device's own
+/// connection: SSH to a device behind NAT is `ssh -o ProxyCommand='via
+/// tunnel %h 22'`. The WebSocket's binary messages are the stream's bytes.
+async fn tunnel(
+    AxState(s): AxState<Arc<State>>,
+    Extension(caller): Extension<db::Caller>,
+    Path((device, port)): Path<(String, u16)>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let opened = s.db.resolve(&device).and_then(|d| s.hub.open(&d.id, &format!("tcp:{port}")));
+    s.db.audit(&caller.name, "tunnel", &json!({ "device": device, "port": port }), opened.is_ok());
+    match opened {
+        Ok(stream) => ws.on_upgrade(move |socket| bridge(socket, stream)),
+        Err(e) => (StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
+    }
+}
+
+async fn bridge(socket: axum::extract::ws::WebSocket, stream: tokio::io::DuplexStream) {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (mut r, mut w) = tokio::io::split(stream);
+    let up = async {
+        while let Some(Ok(m)) = ws_rx.next().await {
+            match m {
+                Message::Binary(b) => {
+                    if w.write_all(&b).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        let _ = w.shutdown().await;
+    };
+    let down = async {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ws_tx.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = ws_tx.send(Message::Close(None)).await;
+    };
+    tokio::join!(up, down);
 }
 
 async fn release_bundle(

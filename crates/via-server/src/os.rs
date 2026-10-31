@@ -53,6 +53,38 @@ pub fn find(os_dir: &Path, arch: &str, version: &str) -> Result<Release> {
     })
 }
 
+/// Where an uploaded file of a not-yet-published version goes. A version
+/// with a manifest is published, and published versions do not change.
+pub fn upload_dir(os_dir: &Path, arch: &str, version: &str, file: &str) -> Result<PathBuf> {
+    if !safe(arch) || !safe(version) || !safe(file) {
+        bail!("bad arch, version or file name");
+    }
+    let dir = os_dir.join(arch).join(version);
+    if dir.join("manifest.json").exists() {
+        bail!("OS version {version} for {arch} is already published; versions are immutable");
+    }
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Check a staged manifest against the files uploaded beside it.
+pub fn check_complete(dir: &Path, manifest: &Path, arch: &str, version: &str) -> Result<()> {
+    let m: Manifest = serde_json::from_slice(&std::fs::read(manifest)?).context("manifest.json is not valid")?;
+    if m.version != version || m.arch != arch {
+        bail!("manifest is for {} on {}, uploaded as {version} on {arch}", m.version, m.arch);
+    }
+    for f in &m.files {
+        if !safe(&f.name) {
+            bail!("manifest names a bad file {:?}", f.name);
+        }
+        let size = std::fs::metadata(dir.join(&f.name)).map(|m| m.len()).ok();
+        if size != Some(f.size) {
+            bail!("{} is missing or the wrong size; upload it before the manifest", f.name);
+        }
+    }
+    Ok(())
+}
+
 pub fn list(os_dir: &Path) -> Vec<Release> {
     let mut out = Vec::new();
     for arch in read_names(os_dir) {

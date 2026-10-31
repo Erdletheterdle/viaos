@@ -31,10 +31,50 @@
         };
     in
     {
-      packages = forAll (pkgs: {
-        via-agent = pkgs.callPackage ./nix/via-agent.nix { };
-        default = self.packages.${pkgs.system}.via-agent;
-      });
+      packages = forAll (
+        pkgs:
+        let
+          via =
+            crate: bin: description:
+            pkgs.callPackage ./nix/via.nix { inherit crate bin description; };
+          via-server = via "via-server" "via-server" "viaos control plane";
+        in
+        {
+          via-agent = via "via-agent" "via-agent" "viaos device agent";
+          inherit via-server;
+          via = via "via-cli" "via" "viaos operator tools: flash, release, ssh";
+          default = self.packages.${pkgs.stdenv.hostPlatform.system}.via;
+
+          # `docker load < result`, then run with VIA_PUBLIC_URL set and a
+          # volume on /data. See docs/deploy.md.
+          via-server-image = pkgs.dockerTools.buildLayeredImage {
+            name = "via-server";
+            tag = "latest";
+            contents = [
+              pkgs.coreutils
+              pkgs.cacert
+            ];
+            extraCommands = "mkdir -p data tmp && chmod 1777 tmp";
+            config = {
+              Entrypoint = [ "${via-server}/bin/via-server" ];
+              Env = [
+                "VIA_DATA_DIR=/data"
+                "VIA_LISTEN=0.0.0.0:8080"
+              ];
+              ExposedPorts."8080/tcp" = { };
+              Volumes."/data" = { };
+            };
+          };
+        }
+      );
+
+      nixosModules.via-server = import ./nix/server-module.nix { inherit self; };
+
+      # `nix flake check`: the control plane's NixOS module, end to end.
+      checks.x86_64-linux.via-server = import ./nix/server-test.nix {
+        inherit self;
+        pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      };
 
       nixosConfigurations = {
         viaos-x86_64 = mkViaos { system = "x86_64-linux"; };

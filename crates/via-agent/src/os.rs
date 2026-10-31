@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use via_bundle::TrustPolicy;
 
 /// Where sysupdate's transfers look for sources; see nix/sysupdate.nix.
 const SOURCE_DIR: &str = "os-update";
@@ -74,6 +75,7 @@ impl Updater {
         version: String,
         bearer: Option<String>,
         reboot: bool,
+        trust: TrustPolicy,
     ) -> Result<()> {
         if let Some(s) = self.status() {
             if !matches!(s.state.as_str(), "failed" | "installed") {
@@ -86,7 +88,7 @@ impl Updater {
         self.set(&version, "downloading", Some(0), None);
         let this = self.clone();
         tokio::spawn(async move {
-            match this.run(&data_dir, &source, &version, bearer.as_deref()).await {
+            match this.run(&data_dir, &source, &version, bearer.as_deref(), &trust).await {
                 Ok(()) => {
                     if reboot {
                         this.set(&version, "rebooting", None, None);
@@ -107,15 +109,30 @@ impl Updater {
         Ok(())
     }
 
-    async fn run(&self, data_dir: &Path, source: &str, version: &str, bearer: Option<&str>) -> Result<()> {
+    async fn run(
+        &self,
+        data_dir: &Path,
+        source: &str,
+        version: &str,
+        bearer: Option<&str>,
+        trust: &TrustPolicy,
+    ) -> Result<()> {
         let dir = data_dir.join(SOURCE_DIR);
         // Only this version's files: sysupdate installs the newest it sees.
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await?;
 
         let fetch = Fetch::new(source, bearer)?;
-        let manifest: Manifest = serde_json::from_slice(&fetch.bytes("manifest.json").await?)
-            .context("reading manifest.json")?;
+        let manifest_bytes = fetch.bytes("manifest.json").await?;
+        // The manifest holds every file's sha256, so a signature over it
+        // covers the whole update, checked before anything is downloaded.
+        if trust.requires_signature() {
+            let sig = fetch.bytes("manifest.json.sig").await.context("the update is not signed")?;
+            let sig: via_bundle::BundleSignature =
+                serde_json::from_slice(&sig).context("reading manifest.json.sig")?;
+            trust.verify(&manifest_bytes, Some(&sig)).context("checking the update's signature")?;
+        }
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes).context("reading manifest.json")?;
         if manifest.version != version {
             bail!("source holds version {}, not {version}", manifest.version);
         }

@@ -42,6 +42,10 @@ struct EnrolledDevice {
     fleet: String,
 }
 
+/// Exists once this boot has connected to the control plane. On tmpfs, so
+/// every boot starts without it.
+pub const CONNECTED: &str = "/run/via/connected";
+
 fn identity_path(data_dir: &Path) -> PathBuf {
     data_dir.join("identity.json")
 }
@@ -131,6 +135,9 @@ async fn session(identity: &Identity, device: &Device) -> Result<()> {
         .insert("authorization", HeaderValue::from_str(&format!("Bearer {}", identity.credential))?);
     let (ws, _) = tokio_tungstenite::connect_async(req).await?;
     tracing::info!("connected to {}", identity.url);
+    // What `via-agent ready` waits for: this boot reached the control plane.
+    let _ = std::fs::create_dir_all(CONNECTED.rsplit_once('/').map_or("/run", |(d, _)| d));
+    let _ = std::fs::write(CONNECTED, b"");
 
     let (mux, mut outgoing, mut incoming) = Mux::new(Side::Device);
     let (mut tx, mut rx) = ws.split();
@@ -158,6 +165,15 @@ async fn session(identity: &Identity, device: &Device) -> Result<()> {
                             }
                         });
                     }
+                    // A TCP stream to a port on this device, for SSH and
+                    // other local services behind NAT. Only loopback: the
+                    // device is not a hop into the network it sits on.
+                    tcp if tcp.starts_with("tcp:") => match tcp[4..].parse::<u16>() {
+                        Ok(port) => {
+                            tokio::spawn(forward(port, stream));
+                        }
+                        Err(_) => tracing::warn!("refusing stream for bad port {tcp:?}"),
+                    },
                     // Dropping the stream closes it: unknown services are
                     // refused, not left hanging.
                     other => tracing::warn!("refusing stream for unknown service {other:?}"),
@@ -180,6 +196,17 @@ async fn session(identity: &Identity, device: &Device) -> Result<()> {
     send.abort();
     serve.abort();
     result
+}
+
+async fn forward(port: u16, mut stream: tokio::io::DuplexStream) {
+    match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(mut tcp) => {
+            tracing::info!(port, "tunnel opened");
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+            tracing::info!(port, "tunnel closed");
+        }
+        Err(e) => tracing::warn!(port, "tunnel refused: {e}"),
+    }
 }
 
 fn http_url(ws: &str) -> Result<String> {
