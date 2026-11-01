@@ -156,13 +156,18 @@ impl Db {
         if !has_actor {
             conn.execute_batch("ALTER TABLE audit ADD COLUMN actor TEXT")?;
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn create_fleet(&self, name: &str) -> Result<()> {
         valid_name(name)?;
         let c = self.conn.lock().unwrap();
-        c.execute("INSERT INTO fleets (name) VALUES (?1) ON CONFLICT DO NOTHING", [name])?;
+        c.execute(
+            "INSERT INTO fleets (name) VALUES (?1) ON CONFLICT DO NOTHING",
+            [name],
+        )?;
         Ok(())
     }
 
@@ -172,7 +177,12 @@ impl Db {
             "SELECT f.name, COUNT(d.id) FROM fleets f
              LEFT JOIN devices d ON d.fleet_id = f.id GROUP BY f.id ORDER BY f.name",
         )?;
-        let rows = q.query_map([], |r| Ok(Fleet { name: r.get(0)?, devices: r.get::<_, i64>(1)? as u64 }))?;
+        let rows = q.query_map([], |r| {
+            Ok(Fleet {
+                name: r.get(0)?,
+                devices: r.get::<_, i64>(1)? as u64,
+            })
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -214,7 +224,9 @@ impl Db {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((fleet_id, name, expires_at, used_by, image_id)) = row else { bail!("unknown token") };
+        let Some((fleet_id, name, expires_at, used_by, image_id)) = row else {
+            bail!("unknown token")
+        };
         if used_by.is_some() {
             bail!("token already used");
         }
@@ -228,7 +240,16 @@ impl Db {
             "INSERT INTO devices (id, name, fleet_id, credential_hash, arch, os_version,
                                   agent_version, enrolled_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, name, fleet_id, hash(&credential), e.arch, e.os_version, e.agent_version, now()],
+            params![
+                id,
+                name,
+                fleet_id,
+                hash(&credential),
+                e.arch,
+                e.os_version,
+                e.agent_version,
+                now()
+            ],
         )?;
         tx.execute(
             "UPDATE enrollment_tokens SET used_by = ?1 WHERE token_hash = ?2",
@@ -236,18 +257,29 @@ impl Db {
         )?;
         tx.commit()?;
         drop(c);
-        Ok((self.device(&id)?.expect("just inserted"), credential, image_id))
+        Ok((
+            self.device(&id)?.expect("just inserted"),
+            credential,
+            image_id,
+        ))
     }
 
     pub fn authenticate(&self, credential: &str) -> Result<Option<String>> {
         let c = self.conn.lock().unwrap();
-        Ok(c.query_row("SELECT id FROM devices WHERE credential_hash = ?1", [hash(credential)], |r| {
-            r.get(0)
-        })
+        Ok(c.query_row(
+            "SELECT id FROM devices WHERE credential_hash = ?1",
+            [hash(credential)],
+            |r| r.get(0),
+        )
         .optional()?)
     }
 
-    pub fn seen(&self, id: &str, os_version: Option<&str>, agent_version: Option<&str>) -> Result<()> {
+    pub fn seen(
+        &self,
+        id: &str,
+        os_version: Option<&str>,
+        agent_version: Option<&str>,
+    ) -> Result<()> {
         let c = self.conn.lock().unwrap();
         c.execute(
             "UPDATE devices SET last_seen = ?2,
@@ -270,7 +302,12 @@ impl Db {
 
     pub fn device(&self, id: &str) -> Result<Option<Device>> {
         let c = self.conn.lock().unwrap();
-        Ok(c.query_row(&format!("{DEVICE_SELECT} WHERE d.id = ?1"), [id], device_row).optional()?)
+        Ok(c.query_row(
+            &format!("{DEVICE_SELECT} WHERE d.id = ?1"),
+            [id],
+            device_row,
+        )
+        .optional()?)
     }
 
     /// Find a device by id or by name. A name shared by two devices is
@@ -306,7 +343,8 @@ impl Db {
 
     pub fn api_tokens(&self) -> Result<Vec<ApiToken>> {
         let c = self.conn.lock().unwrap();
-        let mut q = c.prepare("SELECT name, role, created_at, last_used FROM api_tokens ORDER BY name")?;
+        let mut q =
+            c.prepare("SELECT name, role, created_at, last_used FROM api_tokens ORDER BY name")?;
         let rows = q.query_map([], |r| {
             let role: String = r.get(1)?;
             Ok(ApiToken {
@@ -336,7 +374,12 @@ impl Db {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        Ok(row.and_then(|(name, role)| Some(Caller { name, role: Role::parse(&role)? })))
+        Ok(row.and_then(|(name, role)| {
+            Some(Caller {
+                name,
+                role: Role::parse(&role)?,
+            })
+        }))
     }
 
     pub fn audit(&self, actor: &str, tool: &str, args: &serde_json::Value, ok: bool) {
@@ -368,15 +411,19 @@ fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
 }
 
 fn fleet_id(c: &Connection, name: &str) -> Result<i64> {
-    c.query_row("SELECT id FROM fleets WHERE name = ?1", [name], |r| r.get(0))
-        .optional()?
-        .with_context(|| format!("no fleet named {name:?}; `list_fleets` shows them"))
+    c.query_row("SELECT id FROM fleets WHERE name = ?1", [name], |r| {
+        r.get(0)
+    })
+    .optional()?
+    .with_context(|| format!("no fleet named {name:?}; `list_fleets` shows them"))
 }
 
 fn valid_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 63
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
     anyhow::ensure!(ok, "names are 1-63 letters, digits, '-' or '_'");
     Ok(())
 }
@@ -405,7 +452,9 @@ mod tests {
     fn token_enrolls_once() {
         let (_d, db) = db();
         db.create_fleet("line").unwrap();
-        let token = db.mint_token("line", Some("line-07"), 3600, Some("img")).unwrap();
+        let token = db
+            .mint_token("line", Some("line-07"), 3600, Some("img"))
+            .unwrap();
         let (device, cred, image) = db.enroll(&enrollment(&token)).unwrap();
         assert_eq!(image.as_deref(), Some("img"));
         assert_eq!(device.name, "line-07");
@@ -453,7 +502,9 @@ mod tests {
         let (_d, db) = db();
         db.audit("ana", "list_fleets", &serde_json::json!({}), true);
         let c = db.conn.lock().unwrap();
-        let actor: String = c.query_row("SELECT actor FROM audit", [], |r| r.get(0)).unwrap();
+        let actor: String = c
+            .query_row("SELECT actor FROM audit", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(actor, "ana");
     }
 }

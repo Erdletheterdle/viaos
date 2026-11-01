@@ -99,7 +99,9 @@ fn disks() -> Vec<Disk> {
     let mut seen = Vec::new();
     let mut out = Vec::new();
     for mount in MOUNTS {
-        let Some((dev, total, free)) = statvfs(mount) else { continue };
+        let Some((dev, total, free)) = statvfs(mount) else {
+            continue;
+        };
         // A path that is not its own mount reports its parent's filesystem;
         // listing it twice would only make a full disk look like two.
         if seen.contains(&dev) {
@@ -123,11 +125,17 @@ fn statvfs(path: &str) -> Option<(u64, u64, u64)> {
         return None;
     }
     let frsize = st.f_frsize as u64;
-    Some((st.f_fsid as u64, st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
+    Some((
+        st.f_fsid as u64,
+        st.f_blocks as u64 * frsize,
+        st.f_bavail as u64 * frsize,
+    ))
 }
 
 fn temperatures() -> Vec<Temperature> {
-    let Ok(entries) = fs::read_dir("/sys/class/thermal") else { return Vec::new() };
+    let Ok(entries) = fs::read_dir("/sys/class/thermal") else {
+        return Vec::new();
+    };
     let mut out: Vec<Temperature> = entries
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("thermal_zone"))
@@ -135,7 +143,10 @@ fn temperatures() -> Vec<Temperature> {
             let p = e.path();
             let milli: f64 = read_trim(p.join("temp").to_str()?)?.parse().ok()?;
             let zone = read_trim(p.join("type").to_str()?).unwrap_or_default();
-            Some(Temperature { zone, celsius: milli / 1000.0 })
+            Some(Temperature {
+                zone,
+                celsius: milli / 1000.0,
+            })
         })
         .collect();
     out.sort_by(|a, b| a.zone.cmp(&b.zone));

@@ -9,7 +9,11 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid {kind} {value:?}: {reason}")]
-    InvalidId { kind: &'static str, value: String, reason: String },
+    InvalidId {
+        kind: &'static str,
+        value: String,
+        reason: String,
+    },
 
     #[error("invalid digest {value:?}: {reason}")]
     InvalidDigest { value: String, reason: String },
@@ -20,6 +24,9 @@ pub enum Error {
 
 impl Error {
     pub(crate) fn invalid_digest(value: impl Into<String>, reason: impl Into<String>) -> Self {
-        Error::InvalidDigest { value: value.into(), reason: reason.into() }
+        Error::InvalidDigest {
+            value: value.into(),
+            reason: reason.into(),
+        }
     }
 }

@@ -140,19 +140,29 @@ pub fn ingest_docker_archive(
 
         if name == "index.json" {
             let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).map_err(|e| Error::io(&path, e))?;
+            entry
+                .read_to_end(&mut buf)
+                .map_err(|e| Error::io(&path, e))?;
             index_bytes = Some(buf);
             continue;
         }
         // `blobs/sha256/<hex>`; the algorithm directory is the digest's.
-        let Some(rest) = name.strip_prefix("blobs/") else { continue };
-        let Some((algo, hex)) = rest.split_once('/') else { continue };
-        let Ok(digest) = Digest::parse(format!("{algo}:{hex}")) else { continue };
+        let Some(rest) = name.strip_prefix("blobs/") else {
+            continue;
+        };
+        let Some((algo, hex)) = rest.split_once('/') else {
+            continue;
+        };
+        let Ok(digest) = Digest::parse(format!("{algo}:{hex}")) else {
+            continue;
+        };
 
         let dest = blob_path(blob_dir, &digest);
         let size = if dest.exists() {
             // Already have it: content-addressed, so identical by definition.
-            std::fs::metadata(&dest).map_err(|e| Error::io(&dest, e))?.len()
+            std::fs::metadata(&dest)
+                .map_err(|e| Error::io(&dest, e))?
+                .len()
         } else {
             let mut out = std::fs::File::create(&dest).map_err(|e| Error::io(&dest, e))?;
             let n = std::io::copy(&mut entry, &mut out).map_err(|e| Error::io(&dest, e))?;
@@ -171,7 +181,9 @@ pub fn ingest_docker_archive(
     for desc in &index.manifests {
         let name = desc.image_name().map(|s| s.to_string());
         let resolved = resolve_descriptor(desc, blob_dir, target)?;
-        let Some((manifest_digest, manifest)) = resolved else { continue };
+        let Some((manifest_digest, manifest)) = resolved else {
+            continue;
+        };
 
         let mut record = |d: &Digest, media: &str| {
             if let Some(size) = present.get(d) {
@@ -179,7 +191,10 @@ pub fn ingest_docker_archive(
                 blobs.media_types.insert(d.clone(), media.to_string());
             }
         };
-        record(&manifest_digest, manifest.media_type.as_deref().unwrap_or(MEDIA_OCI_MANIFEST));
+        record(
+            &manifest_digest,
+            manifest.media_type.as_deref().unwrap_or(MEDIA_OCI_MANIFEST),
+        );
         record(&manifest.config.digest, &manifest.config.media_type);
         for layer in &manifest.layers {
             record(&layer.digest, &layer.media_type);
@@ -190,12 +205,17 @@ pub fn ingest_docker_archive(
             manifest_digest,
             config_digest: manifest.config.digest.clone(),
             layers: manifest.layers.iter().map(|l| l.digest.clone()).collect(),
-            media_type: manifest.media_type.clone().unwrap_or_else(|| MEDIA_OCI_MANIFEST.into()),
+            media_type: manifest
+                .media_type
+                .clone()
+                .unwrap_or_else(|| MEDIA_OCI_MANIFEST.into()),
         });
     }
 
     if images.is_empty() {
-        return Err(Error::NoMatchingPlatform { target: target.to_string() });
+        return Err(Error::NoMatchingPlatform {
+            target: target.to_string(),
+        });
     }
 
     // Drop blobs no selected image references: other architectures, and the
@@ -249,7 +269,10 @@ fn resolve_descriptor(
     }
 }
 
-fn read_json_blob<T: for<'de> Deserialize<'de>>(blob_dir: &Path, digest: &Digest) -> Result<T, Error> {
+fn read_json_blob<T: for<'de> Deserialize<'de>>(
+    blob_dir: &Path,
+    digest: &Digest,
+) -> Result<T, Error> {
     let path = blob_path(blob_dir, digest);
     let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
     serde_json::from_slice(&bytes).map_err(Error::json)
@@ -325,12 +348,20 @@ pub fn write_docker_load_archive<W: Write>(
 
     for image in images {
         let manifest_path = blob_path(blob_dir, image.manifest_digest);
-        let size = std::fs::metadata(&manifest_path).map_err(|e| Error::io(&manifest_path, e))?.len();
+        let size = std::fs::metadata(&manifest_path)
+            .map_err(|e| Error::io(&manifest_path, e))?
+            .len();
 
         let mut annotations = BTreeMap::new();
-        annotations.insert(ANNOTATION_IMAGE_NAME.to_string(), qualified_reference(image.reference));
+        annotations.insert(
+            ANNOTATION_IMAGE_NAME.to_string(),
+            qualified_reference(image.reference),
+        );
         if let Some(tag) = image.reference.rsplit_once(':').map(|(_, t)| t) {
-            annotations.insert("org.opencontainers.image.ref.name".to_string(), tag.to_string());
+            annotations.insert(
+                "org.opencontainers.image.ref.name".to_string(),
+                tag.to_string(),
+            );
         }
 
         index_manifests.push(OciDescriptor {
@@ -372,8 +403,16 @@ pub fn write_docker_load_archive<W: Write>(
         media_type: Some(MEDIA_OCI_INDEX.to_string()),
         manifests: index_manifests,
     };
-    append_bytes(&mut builder, "index.json", &serde_json::to_vec(&index).map_err(Error::json)?)?;
-    append_bytes(&mut builder, "manifest.json", &serde_json::to_vec(&legacy).map_err(Error::json)?)?;
+    append_bytes(
+        &mut builder,
+        "index.json",
+        &serde_json::to_vec(&index).map_err(Error::json)?,
+    )?;
+    append_bytes(
+        &mut builder,
+        "manifest.json",
+        &serde_json::to_vec(&legacy).map_err(Error::json)?,
+    )?;
 
     builder.into_inner().map_err(Error::tar)
 }
@@ -383,13 +422,19 @@ fn oci_blob_name(digest: &Digest) -> String {
     format!("blobs/{}/{}", digest.algorithm(), digest.hex())
 }
 
-fn append_bytes<W: Write>(builder: &mut tar::Builder<W>, name: &str, data: &[u8]) -> Result<(), Error> {
+fn append_bytes<W: Write>(
+    builder: &mut tar::Builder<W>,
+    name: &str,
+    data: &[u8],
+) -> Result<(), Error> {
     let mut header = tar::Header::new_gnu();
     header.set_size(data.len() as u64);
     header.set_mode(0o644);
     header.set_mtime(0);
     header.set_cksum();
-    builder.append_data(&mut header, name, data).map_err(Error::tar)
+    builder
+        .append_data(&mut header, name, data)
+        .map_err(Error::tar)
 }
 
 #[cfg(test)]
@@ -398,12 +443,30 @@ mod reference_tests {
 
     #[test]
     fn short_names_are_qualified_the_way_docker_spells_them() {
-        assert_eq!(qualified_reference("nginx:1.29-alpine"), "docker.io/library/nginx:1.29-alpine");
-        assert_eq!(qualified_reference("nginx"), "docker.io/library/nginx:latest");
-        assert_eq!(qualified_reference("grafana/grafana:11"), "docker.io/grafana/grafana:11");
-        assert_eq!(qualified_reference("ghcr.io/acme/app:1"), "ghcr.io/acme/app:1");
-        assert_eq!(qualified_reference("localhost:5000/app"), "localhost:5000/app:latest");
+        assert_eq!(
+            qualified_reference("nginx:1.29-alpine"),
+            "docker.io/library/nginx:1.29-alpine"
+        );
+        assert_eq!(
+            qualified_reference("nginx"),
+            "docker.io/library/nginx:latest"
+        );
+        assert_eq!(
+            qualified_reference("grafana/grafana:11"),
+            "docker.io/grafana/grafana:11"
+        );
+        assert_eq!(
+            qualified_reference("ghcr.io/acme/app:1"),
+            "ghcr.io/acme/app:1"
+        );
+        assert_eq!(
+            qualified_reference("localhost:5000/app"),
+            "localhost:5000/app:latest"
+        );
         assert_eq!(qualified_reference("localhost/app:2"), "localhost/app:2");
-        assert_eq!(qualified_reference("redis@sha256:abc"), "docker.io/library/redis@sha256:abc");
+        assert_eq!(
+            qualified_reference("redis@sha256:abc"),
+            "docker.io/library/redis@sha256:abc"
+        );
     }
 }

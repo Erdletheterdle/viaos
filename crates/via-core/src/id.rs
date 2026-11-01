@@ -16,10 +16,18 @@ use crate::Error;
 /// accepts for object names and what is safe in a path or URL.
 fn validate_slug(kind: &'static str, s: &str) -> Result<(), Error> {
     if s.is_empty() {
-        return Err(Error::InvalidId { kind, value: s.into(), reason: "must not be empty".into() });
+        return Err(Error::InvalidId {
+            kind,
+            value: s.into(),
+            reason: "must not be empty".into(),
+        });
     }
     if s.len() > 63 {
-        return Err(Error::InvalidId { kind, value: s.into(), reason: "must be 63 characters or fewer".into() });
+        return Err(Error::InvalidId {
+            kind,
+            value: s.into(),
+            reason: "must be 63 characters or fewer".into(),
+        });
     }
     let ok_char = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_';
     if let Some(bad) = s.chars().find(|c| !ok_char(*c)) {
@@ -135,7 +143,11 @@ impl FromStr for ReleaseId {
         s.trim_start_matches('#')
             .parse::<u64>()
             .map(ReleaseId)
-            .map_err(|e| Error::InvalidId { kind: "ReleaseId", value: s.into(), reason: e.to_string() })
+            .map_err(|e| Error::InvalidId {
+                kind: "ReleaseId",
+                value: s.into(),
+                reason: e.to_string(),
+            })
     }
 }
 

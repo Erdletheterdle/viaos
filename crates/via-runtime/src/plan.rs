@@ -88,7 +88,10 @@ pub fn object_labels(project: &str) -> BTreeMap<String, String> {
 
 /// Environment rendered as Docker's `KEY=value` list.
 pub fn env_list(service: &Service, ctx: &ApplyContext) -> Vec<String> {
-    ctx.effective_env(service).into_iter().map(|(k, v)| format!("{k}={v}")).collect()
+    ctx.effective_env(service)
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect()
 }
 
 /// Container name for a service.
@@ -103,7 +106,8 @@ mod tests {
 
     fn deployment() -> Deployment {
         let mut d = Deployment::new("demo-stack", Platform::new("linux", "arm64"));
-        d.services.insert("app".into(), Service::new("app", ImageRef::new("app:v1")));
+        d.services
+            .insert("app".into(), Service::new("app", ImageRef::new("app:v1")));
         d
     }
 
@@ -113,7 +117,10 @@ mod tests {
         let ctx = ApplyContext::default();
         let a = config_hash(&d, &d.services["app"], &ctx);
         let b = config_hash(&d, &d.services["app"], &ctx);
-        assert_eq!(a, b, "the hash must be stable or every apply would recreate everything");
+        assert_eq!(
+            a, b,
+            "the hash must be stable or every apply would recreate everything"
+        );
     }
 
     #[test]
@@ -170,8 +177,15 @@ mod tests {
         global.insert("SOMEONE_ELSES_TOKEN".to_string(), "value".to_string());
         let ctx = ApplyContext::default().with_global(global);
 
-        assert!(!ctx.effective_env(&d.services["app"]).contains_key("SOMEONE_ELSES_TOKEN"));
-        assert_eq!(plain, config_hash(&d, &d.services["app"], &ctx), "an unwanted value must not churn the container");
+        assert!(
+            !ctx.effective_env(&d.services["app"])
+                .contains_key("SOMEONE_ELSES_TOKEN")
+        );
+        assert_eq!(
+            plain,
+            config_hash(&d, &d.services["app"], &ctx),
+            "an unwanted value must not churn the container"
+        );
     }
 
     #[test]
@@ -181,9 +195,15 @@ mod tests {
         let mut global = BTreeMap::new();
         global.insert("TOKEN".to_string(), "fleet-wide".to_string());
         let mut ctx = ApplyContext::default().with_global(global);
-        ctx.environment.entry("app".into()).or_default().insert("TOKEN".into(), "just-this-service".into());
+        ctx.environment
+            .entry("app".into())
+            .or_default()
+            .insert("TOKEN".into(), "just-this-service".into());
 
-        assert_eq!(ctx.effective_env(&d.services["app"])["TOKEN"], "just-this-service");
+        assert_eq!(
+            ctx.effective_env(&d.services["app"])["TOKEN"],
+            "just-this-service"
+        );
     }
 
     #[test]
@@ -191,13 +211,20 @@ mod tests {
         // Otherwise rotating a credential would require rebuilding the bundle.
         // A key present in the baked-in environment counts as declared.
         let mut d = deployment();
-        d.services.get_mut("app").unwrap().environment.insert("TOKEN".into(), "baked-in".into());
+        d.services
+            .get_mut("app")
+            .unwrap()
+            .environment
+            .insert("TOKEN".into(), "baked-in".into());
 
         let mut global = BTreeMap::new();
         global.insert("TOKEN".to_string(), "from-the-control-plane".to_string());
         let ctx = ApplyContext::default().with_global(global);
 
-        assert_eq!(ctx.effective_env(&d.services["app"])["TOKEN"], "from-the-control-plane");
+        assert_eq!(
+            ctx.effective_env(&d.services["app"])["TOKEN"],
+            "from-the-control-plane"
+        );
     }
 
     #[test]
@@ -205,8 +232,16 @@ mod tests {
         // Otherwise every release would restart every service, including the
         // database, for no reason.
         let d = deployment();
-        let a = config_hash(&d, &d.services["app"], &ApplyContext::for_release(via_core::ReleaseId(44)));
-        let b = config_hash(&d, &d.services["app"], &ApplyContext::for_release(via_core::ReleaseId(45)));
+        let a = config_hash(
+            &d,
+            &d.services["app"],
+            &ApplyContext::for_release(via_core::ReleaseId(44)),
+        );
+        let b = config_hash(
+            &d,
+            &d.services["app"],
+            &ApplyContext::for_release(via_core::ReleaseId(45)),
+        );
         assert_eq!(a, b);
     }
 
@@ -216,6 +251,9 @@ mod tests {
         let mut other = d.clone();
         other.project = "other-app".into();
         let ctx = ApplyContext::default();
-        assert_ne!(config_hash(&d, &d.services["app"], &ctx), config_hash(&other, &other.services["app"], &ctx));
+        assert_ne!(
+            config_hash(&d, &d.services["app"], &ctx),
+            config_hash(&other, &other.services["app"], &ctx)
+        );
     }
 }

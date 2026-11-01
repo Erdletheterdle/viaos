@@ -58,7 +58,12 @@ struct Dev {
 
 pub fn list() -> Result<Vec<Disk>> {
     let out = std::process::Command::new("lsblk")
-        .args(["-J", "-b", "-o", "PATH,SIZE,RM,TRAN,MODEL,SERIAL,TYPE,MOUNTPOINTS"])
+        .args([
+            "-J",
+            "-b",
+            "-o",
+            "PATH,SIZE,RM,TRAN,MODEL,SERIAL,TYPE,MOUNTPOINTS",
+        ])
         .output()
         .context("running lsblk")?;
     anyhow::ensure!(out.status.success(), "lsblk failed");
@@ -142,7 +147,9 @@ impl Flasher {
         let target = list()?
             .into_iter()
             .find(|d| d.path == disk)
-            .with_context(|| format!("{disk} is not a disk on this machine; `list_disks` shows them"))?;
+            .with_context(|| {
+                format!("{disk} is not a disk on this machine; `list_disks` shows them")
+            })?;
         if let Some(why) = &target.why_not {
             bail!("refusing {disk}: {why}");
         }
@@ -167,7 +174,9 @@ impl Flasher {
         std::thread::spawn(move || {
             let result = open_source(&source).and_then(|src| {
                 let dst = std::fs::OpenOptions::new().write(true).open(&disk)?;
-                copy(src, dst, target.size_bytes, |n| this.update(|j| j.written_mb = n / 1_048_576))
+                copy(src, dst, target.size_bytes, |n| {
+                    this.update(|j| j.written_mb = n / 1_048_576)
+                })
             });
             this.update(|j| match result {
                 Ok(()) => j.state = "done".into(),
@@ -183,14 +192,17 @@ impl Flasher {
 
 /// The image as a byte stream, decompressed if it is zstd.
 fn open_source(source: &str) -> Result<Box<dyn Read + Send>> {
-    let raw: Box<dyn Read + Send> = if source.starts_with("http://") || source.starts_with("https://") {
-        let resp = reqwest::blocking::get(source)?.error_for_status()?;
-        Box::new(resp)
-    } else {
-        Box::new(std::fs::File::open(source).with_context(|| format!("opening {source}"))?)
-    };
+    let raw: Box<dyn Read + Send> =
+        if source.starts_with("http://") || source.starts_with("https://") {
+            let resp = reqwest::blocking::get(source)?.error_for_status()?;
+            Box::new(resp)
+        } else {
+            Box::new(std::fs::File::open(source).with_context(|| format!("opening {source}"))?)
+        };
     let mut peek = std::io::BufReader::new(raw);
-    let magic = std::io::BufRead::fill_buf(&mut peek)?.get(..4).map(<[u8]>::to_vec);
+    let magic = std::io::BufRead::fill_buf(&mut peek)?
+        .get(..4)
+        .map(<[u8]>::to_vec);
     if magic.as_deref() == Some(&[0x28, 0xb5, 0x2f, 0xfd]) {
         Ok(Box::new(zstd::Decoder::with_buffer(peek)?))
     } else {
@@ -200,7 +212,12 @@ fn open_source(source: &str) -> Result<Box<dyn Read + Send>> {
 
 /// Copy `src` to `dst`, refusing to run past `limit` bytes, and flush it to
 /// the device before reporting success.
-pub fn copy(mut src: impl Read, mut dst: std::fs::File, limit: u64, mut progress: impl FnMut(u64)) -> Result<()> {
+pub fn copy(
+    mut src: impl Read,
+    mut dst: std::fs::File,
+    limit: u64,
+    mut progress: impl FnMut(u64),
+) -> Result<()> {
     let mut buf = vec![0u8; 4 << 20];
     let mut written = 0u64;
     loop {
@@ -237,12 +254,21 @@ mod tests {
     fn only_unmounted_removable_disks_are_writable() {
         let disks = parse(LSBLK.as_bytes()).unwrap();
         let by = |p: &str| disks.iter().find(|d| d.path == p).unwrap();
-        assert!(!by("/dev/sdc").writable, "a 12 MB USB device is never a target");
+        assert!(
+            !by("/dev/sdc").writable,
+            "a 12 MB USB device is never a target"
+        );
         assert!(!by("/dev/nvme0n1").writable);
         assert!(by("/dev/sda").writable);
         assert_eq!(by("/dev/sda").model.as_deref(), Some("SD Card"));
         assert!(!by("/dev/sdb").writable);
-        assert!(by("/dev/sdb").why_not.as_ref().unwrap().contains("/media/stick"));
+        assert!(
+            by("/dev/sdb")
+                .why_not
+                .as_ref()
+                .unwrap()
+                .contains("/media/stick")
+        );
         assert!(disks.iter().all(|d| d.path != "/dev/loop0"));
     }
 
@@ -253,7 +279,10 @@ mod tests {
         assert!(copy(&[0u8; 100][..], dst, 50, |_| {}).is_err());
         let dst = std::fs::File::create(dir.path().join("disk2")).unwrap();
         copy(&[7u8; 100][..], dst, 100, |_| {}).unwrap();
-        assert_eq!(std::fs::read(dir.path().join("disk2")).unwrap(), vec![7u8; 100]);
+        assert_eq!(
+            std::fs::read(dir.path().join("disk2")).unwrap(),
+            vec![7u8; 100]
+        );
     }
 
     #[test]
@@ -262,7 +291,10 @@ mod tests {
         let p = dir.path().join("img.zst");
         std::fs::write(&p, zstd::encode_all(&b"viaos image"[..], 3).unwrap()).unwrap();
         let mut s = String::new();
-        open_source(p.to_str().unwrap()).unwrap().read_to_string(&mut s).unwrap();
+        open_source(p.to_str().unwrap())
+            .unwrap()
+            .read_to_string(&mut s)
+            .unwrap();
         assert_eq!(s, "viaos image");
     }
 }

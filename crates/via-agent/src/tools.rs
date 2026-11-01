@@ -13,8 +13,8 @@ use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use via_deploy::{Deployer, Store, SystemClock};
 use via_bundle::TrustPolicy;
+use via_deploy::{Deployer, Store, SystemClock};
 use via_runtime::{DockerRuntime, LogOptions, Runtime};
 
 use crate::deploy::Deploys;
@@ -125,7 +125,11 @@ impl Device {
             (Err(e), _) => (json!({ "error": e.to_string() }), Value::Null),
             (_, Err(_)) => (Value::Null, Value::Null),
         };
-        let os = json!({ "version": os::current_version(), "update": self.updater.status() });
+        let os = json!({
+            "version": os::current_version(),
+            "secure_boot": os::secure_boot(),
+            "update": self.updater.status(),
+        });
         json!({
             "host": host,
             "os": os,
@@ -246,7 +250,9 @@ async fn release_and_services(store: &Store, rt: &DockerRuntime) -> (Value, Valu
         "deploying": state.candidate.map(|r| r.to_string()),
         "converged": state.converged(),
     });
-    let Some(current) = state.current else { return (release, json!([])) };
+    let Some(current) = state.current else {
+        return (release, json!([]));
+    };
     let services = match Deployer::new(store, rt, &SystemClock).load_deployment(current) {
         Ok(d) => match rt.service_states(&d).await {
             Ok(states) => json!(
@@ -272,9 +278,21 @@ fn clip(bytes: &[u8]) -> String {
         return text.into_owned();
     }
     let half = EXEC_OUTPUT / 2;
-    let head = text.char_indices().take_while(|(i, _)| *i < half).last().map_or(0, |(i, c)| i + c.len_utf8());
-    let tail = text.char_indices().find(|(i, _)| *i >= text.len() - half).map_or(text.len(), |(i, _)| i);
-    format!("{}\n[... {} bytes cut ...]\n{}", &text[..head], tail - head, &text[tail..])
+    let head = text
+        .char_indices()
+        .take_while(|(i, _)| *i < half)
+        .last()
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let tail = text
+        .char_indices()
+        .find(|(i, _)| *i >= text.len() - half)
+        .map_or(text.len(), |(i, _)| i);
+    format!(
+        "{}\n[... {} bytes cut ...]\n{}",
+        &text[..head],
+        tail - head,
+        &text[tail..]
+    )
 }
 
 fn rendered(value: Value) -> CallToolResult {
@@ -299,7 +317,11 @@ impl Device {
                        temperatures; the container engine; the running, previous and desired \
                        release; and the status and healthcheck of every service. Start here. \
                        Reads only.",
-        annotations(title = "Device health", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "Device health",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn device_health(&self) -> Result<CallToolResult, ErrorData> {
         Ok(rendered(self.health().await))
@@ -310,9 +332,16 @@ impl Device {
         description = "Recent output of the running release's containers, oldest first. Use \
                        after `device_health` names a service that is unhealthy or exited. \
                        Reads only.",
-        annotations(title = "Container logs", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "Container logs",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn logs_tool(&self, Parameters(args): Parameters<LogsArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn logs_tool(
+        &self,
+        Parameters(args): Parameters<LogsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         reported(self.logs(args).await)
     }
 
@@ -321,7 +350,11 @@ impl Device {
         description = "The device's deploy journal, newest first: releases staged, activated, \
                        failed and rolled back. Use it to answer \"what changed and when\". \
                        Reads only.",
-        annotations(title = "Deploy journal", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "Deploy journal",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn journal_tool(
         &self,
@@ -356,7 +389,10 @@ impl Device {
                        apart from /var and /etc. Say what a command changes before running it.",
         annotations(title = "Run command", read_only_hint = false, destructive_hint = true)
     )]
-    async fn exec_tool(&self, Parameters(args): Parameters<ExecArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn exec_tool(
+        &self,
+        Parameters(args): Parameters<ExecArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         reported(self.exec(args).await)
     }
 
@@ -366,9 +402,16 @@ impl Device {
                        containers, and hold the release to its health gate. A release that \
                        fails the gate is rolled back to the previous one. Runs in the \
                        background; device_health shows progress under `deploy`.",
-        annotations(title = "Deploy release", read_only_hint = false, destructive_hint = true)
+        annotations(
+            title = "Deploy release",
+            read_only_hint = false,
+            destructive_hint = true
+        )
     )]
-    async fn deploy_tool(&self, Parameters(args): Parameters<DeployArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn deploy_tool(
+        &self,
+        Parameters(args): Parameters<DeployArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         reported(self.deploy(args))
     }
 }

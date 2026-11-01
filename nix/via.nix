@@ -2,9 +2,12 @@
 {
   lib,
   rustPlatform,
+  makeBinaryWrapper,
   crate,
   bin,
   description,
+  # Programs the binary runs, put on its PATH.
+  runtimeInputs ? [ ],
 }:
 
 rustPlatform.buildRustPackage {
@@ -30,6 +33,11 @@ rustPlatform.buildRustPackage {
   # `cargo test --workspace` runs in CI, against Docker; a package build
   # only needs to compile.
   doCheck = false;
+
+  nativeBuildInputs = lib.optional (runtimeInputs != [ ]) makeBinaryWrapper;
+  postInstall = lib.optionalString (runtimeInputs != [ ]) ''
+    wrapProgram $out/bin/${bin} --suffix PATH : ${lib.makeBinPath runtimeInputs}
+  '';
 
   meta = {
     inherit description;

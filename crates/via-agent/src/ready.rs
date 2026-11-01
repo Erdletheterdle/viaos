@@ -34,7 +34,10 @@ pub async fn run(control: bool, timeout: Duration) -> Result<()> {
     if bless_status().await.as_deref() == Some("indeterminate") {
         tracing::error!("this is a trial boot of a new version: marking it bad and rebooting");
         bless("bad").await;
-        let _ = tokio::process::Command::new("systemctl").arg("reboot").status().await;
+        let _ = tokio::process::Command::new("systemctl")
+            .arg("reboot")
+            .status()
+            .await;
     }
     bail!("{what}")
 }
@@ -58,10 +61,17 @@ fn bless_tool() -> String {
 }
 
 async fn bless_status() -> Option<String> {
-    let out = tokio::process::Command::new(bless_tool()).arg("status").output().await.ok()?;
+    let out = tokio::process::Command::new(bless_tool())
+        .arg("status")
+        .output()
+        .await
+        .ok()?;
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 async fn bless(verdict: &str) {
-    let _ = tokio::process::Command::new(bless_tool()).arg(verdict).status().await;
+    let _ = tokio::process::Command::new(bless_tool())
+        .arg(verdict)
+        .status()
+        .await;
 }

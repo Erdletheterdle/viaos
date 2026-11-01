@@ -14,7 +14,7 @@ is the UI, through MCP.
 ## Try it
 
 `docs/deploy.md` covers running the control plane for real (NixOS module or
-container, TLS, tokens, signing). To try it on one machine:
+container, TLS, tokens, signing, Secure Boot). To try it on one machine:
 
 ```bash
 # 1. Build an image (x86_64 here; aarch64 for Raspberry Pi 4)
@@ -57,7 +57,8 @@ A device without a control plane is still fully manageable:
 | `crates/via-agent` | Device daemon: applies `viaos.toml`, holds the control-plane link, serves device MCP |
 | `crates/via-server` | Control plane: registry, enrollment, provisioning images, OS updates, fleet MCP |
 | `crates/via-link` | Byte streams multiplexed over the device's one WebSocket |
-| `crates/via-cli` | `via` on the operator's machine: flash SD cards, release apps and OS versions (signed), `ssh` and `forward` into devices |
+| `crates/via-cli` | `via` on the operator's machine: flash SD cards, release apps and OS versions (signed, and for Secure Boot), `ssh` and `forward` into devices |
+| `crates/via-image` | The boot partition of a raw image, opened in place |
 | `crates/via-{core,compose,bundle,runtime,deploy}` | App releases, from [beigesys/via](https://github.com/beigesys/via) |
 
 The OS is about 1.1 GB installed. An OS update downloads about 610 MB, and

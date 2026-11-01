@@ -110,7 +110,9 @@ fn visit<'a>(
     }
     // A dependency on a service that does not exist is caught during
     // validation, not here; ignore it so we still report real cycles.
-    let Some(svc) = dep.services.get(name) else { return Ok(()) };
+    let Some(svc) = dep.services.get(name) else {
+        return Ok(());
+    };
 
     visited.insert(name, Mark::InProgress);
     stack.push(name);
@@ -238,7 +240,11 @@ pub struct Service {
 
 impl Service {
     pub fn new(name: impl Into<String>, image: ImageRef) -> Self {
-        Self { name: name.into(), image, ..Default::default() }
+        Self {
+            name: name.into(),
+            image,
+            ..Default::default()
+        }
     }
 
     /// Whether this service asked for a runtime value called `key`.
@@ -270,7 +276,10 @@ pub struct ImageRef {
 
 impl ImageRef {
     pub fn new(reference: impl Into<String>) -> Self {
-        Self { reference: reference.into(), digest: None }
+        Self {
+            reference: reference.into(),
+            digest: None,
+        }
     }
 
     pub fn with_digest(mut self, digest: Digest) -> Self {
@@ -282,7 +291,12 @@ impl ImageRef {
 impl std::fmt::Display for ImageRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.digest {
-            Some(d) => write!(f, "{} ({})", self.reference, &d.hex()[..12.min(d.hex().len())]),
+            Some(d) => write!(
+                f,
+                "{} ({})",
+                self.reference,
+                &d.hex()[..12.min(d.hex().len())]
+            ),
             None => f.write_str(&self.reference),
         }
     }
@@ -316,7 +330,9 @@ pub enum Mount {
 impl Mount {
     pub fn target(&self) -> &str {
         match self {
-            Mount::Volume { target, .. } | Mount::Bind { target, .. } | Mount::Tmpfs { target, .. } => target,
+            Mount::Volume { target, .. }
+            | Mount::Bind { target, .. }
+            | Mount::Tmpfs { target, .. } => target,
         }
     }
 }
@@ -479,7 +495,11 @@ pub struct HealthGate {
 
 impl Default for HealthGate {
     fn default() -> Self {
-        Self { timeout_secs: 300, stable_secs: 10, rollback_on_failure: true }
+        Self {
+            timeout_secs: 300,
+            stable_secs: 10,
+            rollback_on_failure: true,
+        }
     }
 }
 
@@ -518,7 +538,10 @@ mod tests {
         let mut s = Service::new(name, ImageRef::new(format!("{name}:latest")));
         s.depends_on = deps
             .iter()
-            .map(|d| Dependency { service: d.to_string(), condition: DependencyCondition::Started })
+            .map(|d| Dependency {
+                service: d.to_string(),
+                condition: DependencyCondition::Started,
+            })
             .collect();
         s
     }
@@ -533,7 +556,11 @@ mod tests {
 
     #[test]
     fn start_order_respects_dependencies() {
-        let d = deployment(vec![svc("app", &["db"]), svc("db", &[]), svc("proxy", &["app"])]);
+        let d = deployment(vec![
+            svc("app", &["db"]),
+            svc("db", &[]),
+            svc("proxy", &["app"]),
+        ]);
         let order = d.start_order().unwrap();
         let pos = |n: &str| order.iter().position(|s| *s == n).unwrap();
         assert!(pos("db") < pos("app"));
@@ -544,7 +571,10 @@ mod tests {
     fn start_order_reports_the_cycle_path() {
         let d = deployment(vec![svc("a", &["b"]), svc("b", &["a"])]);
         let err = d.start_order().unwrap_err();
-        assert!(err.path.len() >= 2, "cycle path should name the participants: {err}");
+        assert!(
+            err.path.len() >= 2,
+            "cycle path should name the participants: {err}"
+        );
     }
 
     #[test]

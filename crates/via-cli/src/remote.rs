@@ -22,16 +22,21 @@ pub struct Remote {
 
 impl Remote {
     pub fn from_env() -> Result<Self> {
-        let server = std::env::var("VIA_SERVER").context("set VIA_SERVER to the control plane URL")?;
+        let server =
+            std::env::var("VIA_SERVER").context("set VIA_SERVER to the control plane URL")?;
         let token = std::env::var("VIA_TOKEN")
             .or_else(|_| std::env::var("VIA_ADMIN_TOKEN"))
             .context("set VIA_TOKEN to an API token from `via-server token create`")?;
-        Ok(Self { server: server.trim_end_matches('/').to_string(), token })
+        Ok(Self {
+            server: server.trim_end_matches('/').to_string(),
+            token,
+        })
     }
 
     /// PUT a file to `path` on the control plane and return its JSON reply.
     pub fn put_file(&self, path: &str, file: &Path) -> Result<Value> {
-        let body = std::fs::File::open(file).with_context(|| format!("opening {}", file.display()))?;
+        let body =
+            std::fs::File::open(file).with_context(|| format!("opening {}", file.display()))?;
         let resp = reqwest::blocking::Client::builder()
             .timeout(None)
             .build()?
@@ -60,10 +65,19 @@ impl Remote {
 
     /// Carry one TCP stream to `port` on `device` between `local` and the
     /// control plane, until either side closes.
-    pub async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(&self, device: &str, port: u16, local: S) -> Result<()> {
-        let mut req = self.ws_url(&format!("/v1/devices/{device}/tunnel/{port}"))?.into_client_request()?;
-        req.headers_mut()
-            .insert("authorization", HeaderValue::from_str(&format!("Bearer {}", self.token))?);
+    pub async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        device: &str,
+        port: u16,
+        local: S,
+    ) -> Result<()> {
+        let mut req = self
+            .ws_url(&format!("/v1/devices/{device}/tunnel/{port}"))?
+            .into_client_request()?;
+        req.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {}", self.token))?,
+        );
         let (ws, _) = tokio_tungstenite::connect_async(req)
             .await
             .with_context(|| format!("opening a tunnel to {device}:{port}"))?;
@@ -75,7 +89,11 @@ impl Remote {
                 match r.read(&mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if ws_tx.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                        if ws_tx
+                            .send(Message::Binary(buf[..n].to_vec().into()))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -114,10 +132,17 @@ pub fn keygen(path: &Path) -> Result<Value> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     if path.exists() {
-        bail!("{} exists; refusing to overwrite a signing key", path.display());
+        bail!(
+            "{} exists; refusing to overwrite a signing key",
+            path.display()
+        );
     }
     let key = SigningKey::generate();
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
     writeln!(f, "{}", key.to_hex())?;
     let public = key.public().to_hex();
     let pub_path = PathBuf::from(format!("{}.pub", path.display()));
@@ -135,20 +160,27 @@ pub fn keygen(path: &Path) -> Result<Value> {
 /// it. The manifest goes last: it is what publishes the version.
 pub fn os_release(remote: &Remote, dir: &Path, key: Option<&Path>) -> Result<Value> {
     let manifest_path = dir.join("manifest.json");
-    let manifest_bytes = std::fs::read(&manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?;
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
     let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
-    let version = manifest["version"].as_str().context("manifest has no version")?;
+    let version = manifest["version"]
+        .as_str()
+        .context("manifest has no version")?;
     let arch = manifest["arch"].as_str().context("manifest has no arch")?;
     let base = format!("/v1/os/{arch}/{version}");
 
-    for f in manifest["files"].as_array().context("manifest has no files")? {
+    for f in manifest["files"]
+        .as_array()
+        .context("manifest has no files")?
+    {
         let name = f["name"].as_str().context("manifest file has no name")?;
         eprintln!("uploading {name}");
         remote.put_file(&format!("{base}/{name}"), &dir.join(name))?;
     }
     let signed = match key {
         Some(k) => {
-            let key = SigningKey::read_from(k).with_context(|| format!("reading {}", k.display()))?;
+            let key =
+                SigningKey::read_from(k).with_context(|| format!("reading {}", k.display()))?;
             let sig = serde_json::to_vec(&key.sign_manifest(&manifest_bytes))?;
             let tmp = std::env::temp_dir().join(format!("via-os-sig-{}", std::process::id()));
             std::fs::write(&tmp, sig)?;
@@ -169,11 +201,32 @@ pub fn os_release(remote: &Remote, dir: &Path, key: Option<&Path>) -> Result<Val
 }
 
 /// Upload a raw viaos image as the base that provisioning images are made
-/// from, compressed on the way.
-pub fn base_image(remote: &Remote, raw: &Path, arch: &str) -> Result<Value> {
+/// from, compressed on the way. With Secure Boot keys, a copy of it is
+/// signed first.
+pub fn base_image(
+    remote: &Remote,
+    raw: &Path,
+    arch: &str,
+    secure_boot: Option<&Path>,
+) -> Result<Value> {
     let tmp = std::env::temp_dir().join(format!("via-base-{}.raw.zst", std::process::id()));
+    let signed = std::env::temp_dir().join(format!("via-base-{}.raw", std::process::id()));
     let result = (|| {
-        let mut src = std::fs::File::open(raw).with_context(|| format!("opening {}", raw.display()))?;
+        let raw = match secure_boot {
+            Some(keys) => {
+                let status = std::process::Command::new("cp")
+                    .args(["--reflink=auto", "--sparse=always", "--no-preserve=mode"])
+                    .arg(raw)
+                    .arg(&signed)
+                    .status()?;
+                anyhow::ensure!(status.success(), "copying {} failed", raw.display());
+                crate::secureboot::sign_image(keys, &signed)?;
+                signed.as_path()
+            }
+            None => raw,
+        };
+        let mut src =
+            std::fs::File::open(raw).with_context(|| format!("opening {}", raw.display()))?;
         let mut enc = zstd::Encoder::new(std::fs::File::create(&tmp)?, 3)?;
         enc.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
         std::io::copy(&mut src, &mut enc)?;
@@ -181,5 +234,6 @@ pub fn base_image(remote: &Remote, raw: &Path, arch: &str) -> Result<Value> {
         remote.put_file(&format!("/v1/base/{arch}"), &tmp)
     })();
     let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&signed);
     result
 }

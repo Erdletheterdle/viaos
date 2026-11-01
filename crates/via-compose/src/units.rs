@@ -12,7 +12,9 @@ use crate::Error;
 pub fn parse_duration_secs(s: &str) -> Result<u64, Error> {
     let s = s.trim();
     if s.is_empty() {
-        return Err(Error::InvalidDuration { value: s.to_string() });
+        return Err(Error::InvalidDuration {
+            value: s.to_string(),
+        });
     }
     if let Ok(n) = s.parse::<u64>() {
         return Ok(n);
@@ -24,7 +26,9 @@ pub fn parse_duration_secs(s: &str) -> Result<u64, Error> {
 
     while let Some(&(start, c)) = chars.peek() {
         if !c.is_ascii_digit() && c != '.' {
-            return Err(Error::InvalidDuration { value: s.to_string() });
+            return Err(Error::InvalidDuration {
+                value: s.to_string(),
+            });
         }
         let mut end = start;
         while let Some(&(i, c)) = chars.peek() {
@@ -35,7 +39,9 @@ pub fn parse_duration_secs(s: &str) -> Result<u64, Error> {
                 break;
             }
         }
-        let value: f64 = s[start..end].parse().map_err(|_| Error::InvalidDuration { value: s.to_string() })?;
+        let value: f64 = s[start..end].parse().map_err(|_| Error::InvalidDuration {
+            value: s.to_string(),
+        })?;
 
         let unit_start = end;
         let mut unit_end = end;
@@ -55,14 +61,20 @@ pub fn parse_duration_secs(s: &str) -> Result<u64, Error> {
             "s" => 1_000_000_000.0,
             "m" => 60.0 * 1_000_000_000.0,
             "h" => 3_600.0 * 1_000_000_000.0,
-            _ => return Err(Error::InvalidDuration { value: s.to_string() }),
+            _ => {
+                return Err(Error::InvalidDuration {
+                    value: s.to_string(),
+                });
+            }
         };
         total_nanos += (value * nanos_per) as u128;
         matched_any = true;
     }
 
     if !matched_any {
-        return Err(Error::InvalidDuration { value: s.to_string() });
+        return Err(Error::InvalidDuration {
+            value: s.to_string(),
+        });
     }
     let secs = total_nanos / 1_000_000_000;
     if secs == 0 && total_nanos > 0 {
@@ -79,16 +91,26 @@ pub fn parse_size_bytes(s: &str) -> Result<u64, Error> {
     if let Ok(n) = s.parse::<u64>() {
         return Ok(n);
     }
-    let split = s.find(|c: char| c.is_ascii_alphabetic()).ok_or_else(|| Error::InvalidSize { value: s.to_string() })?;
+    let split = s
+        .find(|c: char| c.is_ascii_alphabetic())
+        .ok_or_else(|| Error::InvalidSize {
+            value: s.to_string(),
+        })?;
     let (num, unit) = s.split_at(split);
-    let value: f64 = num.trim().parse().map_err(|_| Error::InvalidSize { value: s.to_string() })?;
+    let value: f64 = num.trim().parse().map_err(|_| Error::InvalidSize {
+        value: s.to_string(),
+    })?;
     let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
         "b" => 1,
         "k" | "kb" => 1024,
         "m" | "mb" => 1024 * 1024,
         "g" | "gb" => 1024 * 1024 * 1024,
         "t" | "tb" => 1024u64 * 1024 * 1024 * 1024,
-        _ => return Err(Error::InvalidSize { value: s.to_string() }),
+        _ => {
+            return Err(Error::InvalidSize {
+                value: s.to_string(),
+            });
+        }
     };
     Ok((value * mult as f64) as u64)
 }

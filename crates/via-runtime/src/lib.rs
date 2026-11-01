@@ -35,9 +35,9 @@ pub use plan::{
     LABEL_CONFIG_HASH, LABEL_PROJECT, LABEL_RELEASE, LABEL_SERVICE, config_hash, container_name,
 };
 pub use types::{
-    Exec, ExecChunk, ExecOptions,
-    ApplyContext, ApplyReport, ContainerStatus, HealthStatus, LogLine, LogOptions, LogSource, Logs,
-    Naming, RuntimeInfo, ServiceState, needs_default_network, resolved_networks,
+    ApplyContext, ApplyReport, ContainerStatus, Exec, ExecChunk, ExecOptions, HealthStatus,
+    LogLine, LogOptions, LogSource, Logs, Naming, RuntimeInfo, ServiceState, needs_default_network,
+    resolved_networks,
 };
 
 /// What the agent needs from a container engine.
@@ -55,7 +55,11 @@ pub trait Runtime: Send + Sync {
     async fn image_present(&self, reference: &str) -> Result<bool, Error>;
 
     /// Converge the engine onto `deployment`. Idempotent.
-    async fn apply(&self, deployment: &Deployment, ctx: &ApplyContext) -> Result<ApplyReport, Error>;
+    async fn apply(
+        &self,
+        deployment: &Deployment,
+        ctx: &ApplyContext,
+    ) -> Result<ApplyReport, Error>;
 
     /// Observed state of every service in the deployment.
     async fn service_states(&self, deployment: &Deployment) -> Result<Vec<ServiceState>, Error>;
@@ -89,7 +93,11 @@ pub enum Error {
     Docker(#[source] bollard::errors::Error),
 
     #[error("{path}: {source}")]
-    Io { path: String, #[source] source: std::io::Error },
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error(
         "image {reference:?} is not loaded. A bundle is self-contained; \
@@ -127,6 +135,9 @@ impl Error {
     }
 
     pub(crate) fn io(path: impl AsRef<Path>, source: std::io::Error) -> Self {
-        Error::Io { path: path.as_ref().display().to_string(), source }
+        Error::Io {
+            path: path.as_ref().display().to_string(),
+            source,
+        }
     }
 }

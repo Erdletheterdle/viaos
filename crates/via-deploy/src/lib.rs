@@ -76,13 +76,21 @@ fn format_rfc3339(secs: u64) -> String {
 #[derive(Debug, ThisError)]
 pub enum Error {
     #[error("{path}: {source}")]
-    Io { path: String, #[source] source: std::io::Error },
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("malformed JSON: {0}")]
     Json(#[source] serde_json::Error),
 
     #[error("agent state at {path} is corrupt: {source}")]
-    CorruptState { path: String, #[source] source: serde_json::Error },
+    CorruptState {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
 
     #[error("agent state schema {found} is not supported by this build (supports {supported})")]
     UnsupportedStateSchema { found: u32, supported: u32 },
@@ -95,7 +103,11 @@ pub enum Error {
     InsufficientDisk { needed: u64, available: u64 },
 
     #[error("applying release {release} failed: {reason}{}", rolled_back(.rolled_back_to))]
-    ApplyFailed { release: ReleaseId, reason: String, rolled_back_to: Option<ReleaseId> },
+    ApplyFailed {
+        release: ReleaseId,
+        reason: String,
+        rolled_back_to: Option<ReleaseId>,
+    },
 
     #[error("release {release} is not stored on this device, so it cannot be rolled back to")]
     RollbackUnavailable { release: ReleaseId },
@@ -105,7 +117,10 @@ pub enum Error {
          and its blobs were reclaimed. The bundle must be sent again",
         missing.join(", ")
     )]
-    ImagesUnavailable { release: ReleaseId, missing: Vec<String> },
+    ImagesUnavailable {
+        release: ReleaseId,
+        missing: Vec<String>,
+    },
 
     #[error("rolling back to release {release} failed: {reason}")]
     RollbackFailed { release: ReleaseId, reason: String },
@@ -113,17 +128,39 @@ pub enum Error {
     #[error("no transfer of release {release} is in progress")]
     NoTransferInProgress { release: ReleaseId },
 
-    #[error("transfer of release {release} is at byte {expected}, but bytes for offset {got} arrived")]
-    TransferOffsetMismatch { release: ReleaseId, expected: u64, got: u64 },
+    #[error(
+        "transfer of release {release} is at byte {expected}, but bytes for offset {got} arrived"
+    )]
+    TransferOffsetMismatch {
+        release: ReleaseId,
+        expected: u64,
+        got: u64,
+    },
 
-    #[error("transfer of release {release} would exceed its declared size of {size} bytes (would reach {would_be})")]
-    TransferOverrun { release: ReleaseId, size: u64, would_be: u64 },
+    #[error(
+        "transfer of release {release} would exceed its declared size of {size} bytes (would reach {would_be})"
+    )]
+    TransferOverrun {
+        release: ReleaseId,
+        size: u64,
+        would_be: u64,
+    },
 
     #[error("transfer of release {release} is incomplete: {received} of {expected} bytes")]
-    TransferIncomplete { release: ReleaseId, received: u64, expected: u64 },
+    TransferIncomplete {
+        release: ReleaseId,
+        received: u64,
+        expected: u64,
+    },
 
-    #[error("release {release} failed verification: expected {expected}, got {actual}. The transfer has been discarded")]
-    TransferDigestMismatch { release: ReleaseId, expected: via_core::Digest, actual: via_core::Digest },
+    #[error(
+        "release {release} failed verification: expected {expected}, got {actual}. The transfer has been discarded"
+    )]
+    TransferDigestMismatch {
+        release: ReleaseId,
+        expected: via_core::Digest,
+        actual: via_core::Digest,
+    },
 
     #[error(transparent)]
     Core(#[from] via_core::Error),
@@ -144,7 +181,10 @@ fn rolled_back(target: &Option<ReleaseId>) -> String {
 
 impl Error {
     pub(crate) fn io(path: impl AsRef<Path>, source: std::io::Error) -> Self {
-        Error::Io { path: path.as_ref().display().to_string(), source }
+        Error::Io {
+            path: path.as_ref().display().to_string(),
+            source,
+        }
     }
 
     pub(crate) fn json(source: serde_json::Error) -> Self {

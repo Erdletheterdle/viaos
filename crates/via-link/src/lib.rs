@@ -75,7 +75,11 @@ impl Mux {
     /// streams the other side opens.
     pub fn new(
         side: Side,
-    ) -> (Self, mpsc::UnboundedReceiver<Vec<u8>>, mpsc::UnboundedReceiver<Incoming>) {
+    ) -> (
+        Self,
+        mpsc::UnboundedReceiver<Vec<u8>>,
+        mpsc::UnboundedReceiver<Incoming>,
+    ) {
         let (out, out_rx) = mpsc::unbounded_channel();
         let (accept, accept_rx) = mpsc::unbounded_channel();
         let next_id = match side {
@@ -85,9 +89,18 @@ impl Mux {
         let inner = Inner {
             out,
             accept,
-            streams: Mutex::new(Streams { next_id, writers: HashMap::new() }),
+            streams: Mutex::new(Streams {
+                next_id,
+                writers: HashMap::new(),
+            }),
         };
-        (Self { inner: Arc::new(inner) }, out_rx, accept_rx)
+        (
+            Self {
+                inner: Arc::new(inner),
+            },
+            out_rx,
+            accept_rx,
+        )
     }
 
     /// Open a stream to `service` on the other side.
@@ -112,7 +125,12 @@ impl Mux {
             OPEN => {
                 let service = String::from_utf8_lossy(payload).into_owned();
                 let stream = self.attach(id);
-                if self.inner.accept.send(Incoming { service, stream }).is_err() {
+                if self
+                    .inner
+                    .accept
+                    .send(Incoming { service, stream })
+                    .is_err()
+                {
                     // Nobody accepts streams on this side; refuse it.
                     self.forget(id);
                     let _ = self.inner.out.send(frame(id, CLOSE, &[]));
@@ -199,7 +217,12 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     /// Two muxes joined back to back, standing in for a carrier.
-    fn pair() -> (Mux, mpsc::UnboundedReceiver<Incoming>, Mux, mpsc::UnboundedReceiver<Incoming>) {
+    fn pair() -> (
+        Mux,
+        mpsc::UnboundedReceiver<Incoming>,
+        Mux,
+        mpsc::UnboundedReceiver<Incoming>,
+    ) {
         let (server, mut s_out, s_accept) = Mux::new(Side::Server);
         let (device, mut d_out, d_accept) = Mux::new(Side::Device);
         let (s, d) = (server.clone(), device.clone());

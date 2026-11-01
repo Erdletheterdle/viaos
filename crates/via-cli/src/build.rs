@@ -71,7 +71,10 @@ pub fn build(args: BuildArgs) -> Result<Built> {
         eprintln!("  warning: {w}");
     }
     if args.strict && !normalized.warnings.is_empty() {
-        bail!("{} warning(s) and --strict was given", normalized.warnings.len());
+        bail!(
+            "{} warning(s) and --strict was given",
+            normalized.warnings.len()
+        );
     }
 
     if !args.no_build && !normalized.builds.is_empty() {
@@ -82,8 +85,12 @@ pub fn build(args: BuildArgs) -> Result<Built> {
     }
 
     // Every image the deployment names, whether built here or pulled earlier.
-    let references: Vec<String> =
-        normalized.deployment.required_images().iter().map(|i| i.reference.clone()).collect();
+    let references: Vec<String> = normalized
+        .deployment
+        .required_images()
+        .iter()
+        .map(|i| i.reference.clone())
+        .collect();
     ensure_images_present(&references, args.no_build)?;
 
     eprintln!("  packaging {} image(s)", references.len());
@@ -129,10 +136,14 @@ pub fn build(args: BuildArgs) -> Result<Built> {
     let deployment = writer.digest_deployment(&normalized.deployment);
 
     let output = args.output.unwrap_or_else(|| {
-        PathBuf::from(via_core::ReleaseRef::new(app.clone(), release).artifact(platform.clone()).file_name())
+        PathBuf::from(
+            via_core::ReleaseRef::new(app.clone(), release)
+                .artifact(platform.clone())
+                .file_name(),
+        )
     });
-    let file = std::fs::File::create(&output)
-        .with_context(|| format!("creating {}", output.display()))?;
+    let file =
+        std::fs::File::create(&output).with_context(|| format!("creating {}", output.display()))?;
     writer.finish(file, &deployment, Some(&loaded.source))?;
 
     let size_bytes = std::fs::metadata(&output)?.len();
@@ -216,7 +227,11 @@ fn ensure_images_present(references: &[String], no_build: bool) -> Result<()> {
 fn normalize_reference(r: &str) -> String {
     let r = r.strip_prefix("docker.io/library/").unwrap_or(r);
     let r = r.strip_prefix("docker.io/").unwrap_or(r);
-    if r.contains(':') || r.contains('@') { r.to_string() } else { format!("{r}:latest") }
+    if r.contains(':') || r.contains('@') {
+        r.to_string()
+    } else {
+        format!("{r}:latest")
+    }
 }
 
 fn default_app_name(compose_path: &Path) -> Result<String> {
@@ -225,7 +240,11 @@ fn default_app_name(compose_path: &Path) -> Result<String> {
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_path_buf())
         .unwrap_or(std::env::current_dir()?);
-    let dir = if dir.as_os_str() == "." { std::env::current_dir()? } else { dir };
+    let dir = if dir.as_os_str() == "." {
+        std::env::current_dir()?
+    } else {
+        dir
+    };
     let name = dir
         .file_name()
         .and_then(|n| n.to_str())

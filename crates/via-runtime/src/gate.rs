@@ -52,9 +52,7 @@ pub fn evaluate(readiness: &Readiness, state: &ServiceState) -> Verdict {
             // a slow-starting service may legitimately restart once, but never
             // ready either.
             ContainerStatus::Restarting => Verdict::Pending("restarting".into()),
-            ContainerStatus::Exited { code } => {
-                Verdict::Failed(format!("exited with code {code}"))
-            }
+            ContainerStatus::Exited { code } => Verdict::Failed(format!("exited with code {code}")),
             ContainerStatus::Dead => Verdict::Failed("container is dead".into()),
             ContainerStatus::Absent => Verdict::Pending("container not created yet".into()),
             status => Verdict::Pending(format!("{status:?}")),
@@ -96,9 +94,16 @@ impl GateReport {
         if self.passed {
             return format!("all services ready in {:.1}s", self.elapsed.as_secs_f64());
         }
-        let blockers: Vec<String> =
-            self.blockers().iter().map(|(n, why)| format!("{n} ({why})")).collect();
-        format!("not ready after {:.1}s: {}", self.elapsed.as_secs_f64(), blockers.join(", "))
+        let blockers: Vec<String> = self
+            .blockers()
+            .iter()
+            .map(|(n, why)| format!("{n} ({why})"))
+            .collect();
+        format!(
+            "not ready after {:.1}s: {}",
+            self.elapsed.as_secs_f64(),
+            blockers.join(", ")
+        )
     }
 }
 
@@ -126,12 +131,16 @@ pub async fn wait_for_ready(
         let mut terminal_failure = false;
 
         for state in &states {
-            let Some(service) = deployment.services.get(&state.service) else { continue };
+            let Some(service) = deployment.services.get(&state.service) else {
+                continue;
+            };
             let verdict = evaluate(&service.readiness, state);
 
             match &verdict {
                 Verdict::Ready => {
-                    let since = *ready_since.entry(state.service.clone()).or_insert_with(Instant::now);
+                    let since = *ready_since
+                        .entry(state.service.clone())
+                        .or_insert_with(Instant::now);
                     // A completed job has nothing left to destabilize, so the
                     // stability window applies only to long-running services.
                     let needs_stability = service.readiness != Readiness::Completed;
@@ -164,10 +173,18 @@ pub async fn wait_for_ready(
         }
 
         if all_ready {
-            return Ok(GateReport { passed: true, verdicts, elapsed: started.elapsed() });
+            return Ok(GateReport {
+                passed: true,
+                verdicts,
+                elapsed: started.elapsed(),
+            });
         }
         if terminal_failure || Instant::now() >= deadline {
-            return Ok(GateReport { passed: false, verdicts, elapsed: started.elapsed() });
+            return Ok(GateReport {
+                passed: false,
+                verdicts,
+                elapsed: started.elapsed(),
+            });
         }
         sleep(POLL_INTERVAL).await;
     }
@@ -178,13 +195,20 @@ mod tests {
     use super::*;
 
     fn state(status: ContainerStatus, health: HealthStatus) -> ServiceState {
-        ServiceState { status, health, ..ServiceState::absent("app") }
+        ServiceState {
+            status,
+            health,
+            ..ServiceState::absent("app")
+        }
     }
 
     #[test]
     fn healthy_readiness_needs_the_healthcheck_to_pass() {
         let r = Readiness::Healthy;
-        assert_eq!(evaluate(&r, &state(ContainerStatus::Running, HealthStatus::Healthy)), Verdict::Ready);
+        assert_eq!(
+            evaluate(&r, &state(ContainerStatus::Running, HealthStatus::Healthy)),
+            Verdict::Ready
+        );
         assert!(matches!(
             evaluate(&r, &state(ContainerStatus::Running, HealthStatus::Starting)),
             Verdict::Pending(_)
@@ -192,7 +216,10 @@ mod tests {
         // A failing healthcheck is pending, not failed: Docker retries it, and
         // a service may legitimately go healthy on the third attempt.
         assert!(matches!(
-            evaluate(&r, &state(ContainerStatus::Running, HealthStatus::Unhealthy)),
+            evaluate(
+                &r,
+                &state(ContainerStatus::Running, HealthStatus::Unhealthy)
+            ),
             Verdict::Pending(_)
         ));
     }
@@ -201,14 +228,20 @@ mod tests {
     fn an_exit_while_waiting_for_health_is_terminal() {
         // Waiting out a five minute timeout on a container that has already
         // died helps nobody.
-        let v = evaluate(&Readiness::Healthy, &state(ContainerStatus::Exited { code: 1 }, HealthStatus::None));
+        let v = evaluate(
+            &Readiness::Healthy,
+            &state(ContainerStatus::Exited { code: 1 }, HealthStatus::None),
+        );
         assert!(matches!(v, Verdict::Failed(_)), "{v:?}");
     }
 
     #[test]
     fn running_readiness_accepts_a_bare_running_container() {
         assert_eq!(
-            evaluate(&Readiness::Running, &state(ContainerStatus::Running, HealthStatus::None)),
+            evaluate(
+                &Readiness::Running,
+                &state(ContainerStatus::Running, HealthStatus::None)
+            ),
             Verdict::Ready
         );
     }
@@ -216,16 +249,28 @@ mod tests {
     #[test]
     fn a_clean_exit_still_fails_a_long_running_service() {
         // `Running` means it should stay up. Exiting 0 is a crash for a server.
-        let v = evaluate(&Readiness::Running, &state(ContainerStatus::Exited { code: 0 }, HealthStatus::None));
+        let v = evaluate(
+            &Readiness::Running,
+            &state(ContainerStatus::Exited { code: 0 }, HealthStatus::None),
+        );
         assert!(matches!(v, Verdict::Failed(_)), "{v:?}");
     }
 
     #[test]
     fn completed_readiness_wants_exit_zero_and_nothing_else() {
         let r = Readiness::Completed;
-        assert_eq!(evaluate(&r, &state(ContainerStatus::Exited { code: 0 }, HealthStatus::None)), Verdict::Ready);
+        assert_eq!(
+            evaluate(
+                &r,
+                &state(ContainerStatus::Exited { code: 0 }, HealthStatus::None)
+            ),
+            Verdict::Ready
+        );
         assert!(matches!(
-            evaluate(&r, &state(ContainerStatus::Exited { code: 2 }, HealthStatus::None)),
+            evaluate(
+                &r,
+                &state(ContainerStatus::Exited { code: 2 }, HealthStatus::None)
+            ),
             Verdict::Failed(_)
         ));
         assert!(matches!(
@@ -236,7 +281,10 @@ mod tests {
 
     #[test]
     fn ignored_services_never_block_a_deploy() {
-        let v = evaluate(&Readiness::Ignored, &state(ContainerStatus::Exited { code: 9 }, HealthStatus::Unhealthy));
+        let v = evaluate(
+            &Readiness::Ignored,
+            &state(ContainerStatus::Exited { code: 9 }, HealthStatus::Unhealthy),
+        );
         assert_eq!(v, Verdict::Ignored);
     }
 }

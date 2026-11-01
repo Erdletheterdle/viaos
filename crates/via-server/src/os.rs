@@ -30,7 +30,11 @@ struct ManifestFile {
 }
 
 fn safe(part: &str) -> bool {
-    !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) && !part.starts_with('.')
+    !part.is_empty()
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        && !part.starts_with('.')
 }
 
 pub fn find(os_dir: &Path, arch: &str, version: &str) -> Result<Release> {
@@ -38,11 +42,17 @@ pub fn find(os_dir: &Path, arch: &str, version: &str) -> Result<Release> {
         bail!("bad arch or version");
     }
     let dir = os_dir.join(arch).join(version);
-    let text = std::fs::read_to_string(dir.join("manifest.json"))
-        .with_context(|| format!("no OS version {version} for {arch}; `list_os_versions` shows them"))?;
+    let text = std::fs::read_to_string(dir.join("manifest.json")).with_context(|| {
+        format!("no OS version {version} for {arch}; `list_os_versions` shows them")
+    })?;
     let m: Manifest = serde_json::from_str(&text).context("reading manifest.json")?;
     if m.version != version || m.arch != arch {
-        bail!("{} holds {} for {}, not {version} for {arch}", dir.display(), m.version, m.arch);
+        bail!(
+            "{} holds {} for {}, not {version} for {arch}",
+            dir.display(),
+            m.version,
+            m.arch
+        );
     }
     Ok(Release {
         arch: m.arch,
@@ -69,9 +79,14 @@ pub fn upload_dir(os_dir: &Path, arch: &str, version: &str, file: &str) -> Resul
 
 /// Check a staged manifest against the files uploaded beside it.
 pub fn check_complete(dir: &Path, manifest: &Path, arch: &str, version: &str) -> Result<()> {
-    let m: Manifest = serde_json::from_slice(&std::fs::read(manifest)?).context("manifest.json is not valid")?;
+    let m: Manifest =
+        serde_json::from_slice(&std::fs::read(manifest)?).context("manifest.json is not valid")?;
     if m.version != version || m.arch != arch {
-        bail!("manifest is for {} on {}, uploaded as {version} on {arch}", m.version, m.arch);
+        bail!(
+            "manifest is for {} on {}, uploaded as {version} on {arch}",
+            m.version,
+            m.arch
+        );
     }
     for f in &m.files {
         if !safe(&f.name) {
@@ -79,7 +94,10 @@ pub fn check_complete(dir: &Path, manifest: &Path, arch: &str, version: &str) ->
         }
         let size = std::fs::metadata(dir.join(&f.name)).map(|m| m.len()).ok();
         if size != Some(f.size) {
-            bail!("{} is missing or the wrong size; upload it before the manifest", f.name);
+            bail!(
+                "{} is missing or the wrong size; upload it before the manifest",
+                f.name
+            );
         }
     }
     Ok(())

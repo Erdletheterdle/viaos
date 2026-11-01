@@ -98,11 +98,20 @@ impl Deploys {
 
     /// Returns the release rolled back to, if the new one failed its gate.
     async fn run(&self, data_dir: &Path, job: Job) -> Result<Option<String>> {
-        let Job { app, release, source, sha256, bearer, trust } = job;
+        let Job {
+            app,
+            release,
+            source,
+            sha256,
+            bearer,
+            trust,
+        } = job;
         let incoming = data_dir.join("incoming");
         tokio::fs::create_dir_all(&incoming).await?;
         let bundle = incoming.join(format!("{app}-{release}.bundle"));
-        let digest = fetch(&source, &bundle, bearer.as_deref()).await.context("fetching the bundle")?;
+        let digest = fetch(&source, &bundle, bearer.as_deref())
+            .await
+            .context("fetching the bundle")?;
         if digest != sha256.trim_start_matches("sha256:") {
             let _ = tokio::fs::remove_file(&bundle).await;
             bail!("bundle is corrupt: sha256 {digest}, expected {sha256}");
@@ -127,7 +136,11 @@ pub async fn recover(data_dir: &Path) {
     let result = async {
         let store = Store::open(data_dir)?;
         let runtime = DockerRuntime::connect()?;
-        Ok::<_, anyhow::Error>(Deployer::new(&store, &runtime, &SystemClock).recover().await?)
+        Ok::<_, anyhow::Error>(
+            Deployer::new(&store, &runtime, &SystemClock)
+                .recover()
+                .await?,
+        )
     }
     .await;
     match result {

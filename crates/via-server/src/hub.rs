@@ -7,9 +7,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-use tokio::io::DuplexStream;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
+use tokio::io::DuplexStream;
 use via_link::{Mux, Side};
 
 /// How long a forwarded tool call may take before the caller gets an error.
@@ -32,8 +32,13 @@ impl Hub {
     /// Serve one device's connection until it closes.
     pub async fn attach(&self, device: String, socket: WebSocket) {
         let (mux, mut outgoing, _incoming) = Mux::new(Side::Server);
-        let generation = self.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.online.lock().unwrap().insert(device.clone(), (generation, mux.clone()));
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.online
+            .lock()
+            .unwrap()
+            .insert(device.clone(), (generation, mux.clone()));
         tracing::info!(%device, "connected");
 
         let (mut tx, mut rx) = socket.split();
@@ -79,6 +84,8 @@ impl Hub {
             let _ = client.cancel().await;
             result
         };
-        tokio::time::timeout(CALL_TIMEOUT, call).await.context("device did not answer in time")?
+        tokio::time::timeout(CALL_TIMEOUT, call)
+            .await
+            .context("device did not answer in time")?
     }
 }

@@ -2714,12 +2714,14 @@ dependencies = [
  "anyhow",
  "clap",
  "futures",
+ "hex",
  "libc",
  "reqwest",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.30.0",
@@ -2729,6 +2731,7 @@ dependencies = [
  "via-compose",
  "via-core",
  "via-deploy",
+ "via-image",
  "zstd",
 ]
 
@@ -2777,6 +2780,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "via-image"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "fatfs",
+]
+
+[[package]]
 name = "via-link"
 version = "0.0.1"
 dependencies = [
@@ -2807,7 +2818,6 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
- "fatfs",
  "futures-util",
  "hex",
  "rand 0.10.3",
@@ -2823,6 +2833,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "via-bundle",
+ "via-image",
  "via-link",
  "zstd",
 ]

@@ -68,7 +68,10 @@ impl BundleManifest {
     /// The transfer-planning primitive: a device reports what it holds, and
     /// only the difference goes over the wire.
     pub fn missing_blobs<'a>(&'a self, have: &[Digest]) -> Vec<&'a BlobEntry> {
-        self.blobs.iter().filter(|b| !have.contains(&b.digest)).collect()
+        self.blobs
+            .iter()
+            .filter(|b| !have.contains(&b.digest))
+            .collect()
     }
 
     /// Reject a bundle this build cannot safely interpret.
@@ -132,8 +135,16 @@ mod tests {
             builder: None,
             images: vec![],
             blobs: vec![
-                BlobEntry { digest: d(b"a"), size: 10, media_type: None },
-                BlobEntry { digest: d(b"b"), size: 20, media_type: None },
+                BlobEntry {
+                    digest: d(b"a"),
+                    size: 10,
+                    media_type: None,
+                },
+                BlobEntry {
+                    digest: d(b"b"),
+                    size: 20,
+                    media_type: None,
+                },
             ],
             deployment_digest: d(b"deployment"),
             compose_digest: None,

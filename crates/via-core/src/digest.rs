@@ -38,16 +38,27 @@ impl Digest {
         let expected_len = match algo {
             "sha256" => 64,
             "sha512" => 128,
-            other => return Err(Error::invalid_digest(&s, format!("unsupported algorithm {other:?}"))),
+            other => {
+                return Err(Error::invalid_digest(
+                    &s,
+                    format!("unsupported algorithm {other:?}"),
+                ));
+            }
         };
 
         if hex.len() != expected_len {
             return Err(Error::invalid_digest(
                 &s,
-                format!("expected {expected_len} hex chars for {algo}, found {}", hex.len()),
+                format!(
+                    "expected {expected_len} hex chars for {algo}, found {}",
+                    hex.len()
+                ),
             ));
         }
-        if !hex.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        if !hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
             return Err(Error::invalid_digest(&s, "digest must be lowercase hex"));
         }
         Ok(Self(s))

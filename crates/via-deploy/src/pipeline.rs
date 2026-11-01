@@ -76,7 +76,12 @@ pub struct Deployer<'a> {
 
 impl<'a> Deployer<'a> {
     pub fn new(store: &'a Store, runtime: &'a dyn Runtime, clock: &'a dyn Clock) -> Self {
-        Self { store, runtime, clock, trust: TrustPolicy::Insecure }
+        Self {
+            store,
+            runtime,
+            clock,
+            trust: TrustPolicy::Insecure,
+        }
     }
 
     /// Require released bundles to be signed by a trusted key.
@@ -159,13 +164,20 @@ impl<'a> Deployer<'a> {
         .map_err(|e| Error::io(&manifest_path, e))?;
 
         let trust_path = dir.join("trust.json");
-        std::fs::write(&trust_path, serde_json::to_vec(&TrustRecord::from(&unpacked.trust)).map_err(Error::json)?)
-            .map_err(|e| Error::io(&trust_path, e))?;
+        std::fs::write(
+            &trust_path,
+            serde_json::to_vec(&TrustRecord::from(&unpacked.trust)).map_err(Error::json)?,
+        )
+        .map_err(|e| Error::io(&trust_path, e))?;
 
         self.note(
             "staged",
             Some(release),
-            Some(format!("{} blob(s), {}", unpacked.manifest.blobs.len(), unpacked.trust)),
+            Some(format!(
+                "{} blob(s), {}",
+                unpacked.manifest.blobs.len(),
+                unpacked.trust
+            )),
         );
         Ok(unpacked)
     }
@@ -180,7 +192,8 @@ impl<'a> Deployer<'a> {
     /// Run the full pipeline for a bundle file.
     pub async fn deploy(&self, bundle: &Path, ctx: &ApplyContext) -> Result<DeployOutcome, Error> {
         let unpacked = self.stage(bundle)?;
-        self.activate(unpacked.manifest.release, &unpacked.deployment, ctx).await
+        self.activate(unpacked.manifest.release, &unpacked.deployment, ctx)
+            .await
     }
 
     /// Apply an already-staged release and hold it to its health gate.
@@ -213,7 +226,11 @@ impl<'a> Deployer<'a> {
                 self.note("apply_failed", Some(release), Some(e.to_string()));
                 let rolled_back_to = self.try_rollback(&mut state, deployment).await?;
                 self.abandon_candidate(&mut state, release, &e.to_string())?;
-                return Err(Error::ApplyFailed { release, reason: e.to_string(), rolled_back_to });
+                return Err(Error::ApplyFailed {
+                    release,
+                    reason: e.to_string(),
+                    rolled_back_to,
+                });
             }
         };
         self.note("applied", Some(release), Some(apply.summary()));
@@ -236,7 +253,13 @@ impl<'a> Deployer<'a> {
                 self.note(
                     "pruned",
                     None,
-                    Some(pruned.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")),
+                    Some(
+                        pruned
+                            .iter()
+                            .map(|r| r.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
                 );
             }
             let reclaimed = self.reclaim_blobs(&state).await?;
@@ -267,11 +290,24 @@ impl<'a> Deployer<'a> {
             self.note(
                 "pruned_after_failure",
                 None,
-                Some(pruned.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")),
+                Some(
+                    pruned
+                        .iter()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
             );
         }
 
-        Ok(DeployOutcome { release, apply, gate, rolled_back_to, pruned, reclaimed_bytes: 0 })
+        Ok(DeployOutcome {
+            release,
+            apply,
+            gate,
+            rolled_back_to,
+            pruned,
+            reclaimed_bytes: 0,
+        })
     }
 
     /// Restore whatever release was running before this attempt.
@@ -288,7 +324,11 @@ impl<'a> Deployer<'a> {
             // to. Tear the failed attempt down rather than leaving a broken
             // stack half-running.
             let _ = self.runtime.remove(failed, false).await;
-            self.note("rollback_skipped", None, Some("no previous release on this device".into()));
+            self.note(
+                "rollback_skipped",
+                None,
+                Some("no previous release on this device".into()),
+            );
             return Ok(None);
         };
 
@@ -304,10 +344,13 @@ impl<'a> Deployer<'a> {
         self.note("rollback_started", Some(target), None);
         let deployment = self.load_deployment(target)?;
         let ctx = ApplyContext::for_release(target);
-        self.runtime.apply(&deployment, &ctx).await.map_err(|e| Error::RollbackFailed {
-            release: target,
-            reason: e.to_string(),
-        })?;
+        self.runtime
+            .apply(&deployment, &ctx)
+            .await
+            .map_err(|e| Error::RollbackFailed {
+                release: target,
+                reason: e.to_string(),
+            })?;
         self.note("rolled_back", Some(target), None);
         Ok(Some(target))
     }
@@ -359,7 +402,11 @@ impl<'a> Deployer<'a> {
         let _ = std::fs::remove_file(&archive_path);
         let loaded = loaded?;
 
-        self.note("images_loaded", Some(release), Some(format!("{} image(s)", loaded.len())));
+        self.note(
+            "images_loaded",
+            Some(release),
+            Some(format!("{} image(s)", loaded.len())),
+        );
         Ok(())
     }
 
@@ -376,7 +423,9 @@ impl<'a> Deployer<'a> {
             if !self.store.has_blobs(release) {
                 continue;
             }
-            let Ok(deployment) = self.load_deployment(release) else { continue };
+            let Ok(deployment) = self.load_deployment(release) else {
+                continue;
+            };
 
             let mut all_present = true;
             for image in deployment.required_images() {
@@ -390,7 +439,11 @@ impl<'a> Deployer<'a> {
             }
         }
         if freed > 0 {
-            self.note("blobs_reclaimed", None, Some(format!("{} MiB", freed / 1_048_576)));
+            self.note(
+                "blobs_reclaimed",
+                None,
+                Some(format!("{} MiB", freed / 1_048_576)),
+            );
         }
         Ok(freed)
     }
@@ -429,14 +482,20 @@ impl<'a> Deployer<'a> {
     /// `apply` is idempotent: unchanged services are left running.
     pub async fn recover(&self) -> Result<Option<ReleaseId>, Error> {
         let mut state = self.store.load_state()?;
-        let Some(candidate) = state.candidate else { return Ok(None) };
+        let Some(candidate) = state.candidate else {
+            return Ok(None);
+        };
 
         self.note("interrupted_deploy_detected", Some(candidate), None);
         state.candidate = None;
         self.store.save_state(&state)?;
 
         let Some(current) = state.current else {
-            self.note("recovery_skipped", None, Some("no known-good release to restore".into()));
+            self.note(
+                "recovery_skipped",
+                None,
+                Some("no known-good release to restore".into()),
+            );
             return Ok(None);
         };
         if !self.store.has_release(current) {
@@ -445,11 +504,14 @@ impl<'a> Deployer<'a> {
 
         let deployment = self.load_deployment(current)?;
         let ctx = ApplyContext::for_release(current);
-        self.runtime.apply(&deployment, &ctx).await.map_err(|e| Error::ApplyFailed {
-            release: current,
-            reason: e.to_string(),
-            rolled_back_to: None,
-        })?;
+        self.runtime
+            .apply(&deployment, &ctx)
+            .await
+            .map_err(|e| Error::ApplyFailed {
+                release: current,
+                reason: e.to_string(),
+                rolled_back_to: None,
+            })?;
         self.note("recovered", Some(current), None);
         Ok(Some(current))
     }
@@ -460,7 +522,8 @@ impl<'a> Deployer<'a> {
             return Err(Error::RollbackUnavailable { release: target });
         }
         let deployment = self.load_deployment(target)?;
-        self.activate(target, &deployment, &ApplyContext::for_release(target)).await
+        self.activate(target, &deployment, &ApplyContext::for_release(target))
+            .await
     }
 }
 
@@ -477,10 +540,12 @@ enum TrustRecord {
 impl From<&Verified> for TrustRecord {
     fn from(v: &Verified) -> Self {
         match v {
-            Verified::Signed { key_id } => TrustRecord::Signed { key_id: key_id.to_string() },
-            Verified::UncheckedSignature { key_id } => {
-                TrustRecord::UncheckedSignature { key_id: key_id.to_string() }
-            }
+            Verified::Signed { key_id } => TrustRecord::Signed {
+                key_id: key_id.to_string(),
+            },
+            Verified::UncheckedSignature { key_id } => TrustRecord::UncheckedSignature {
+                key_id: key_id.to_string(),
+            },
             Verified::Unsigned => TrustRecord::Unsigned,
         }
     }

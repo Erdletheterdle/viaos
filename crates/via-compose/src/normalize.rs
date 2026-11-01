@@ -103,7 +103,9 @@ pub fn normalize(file: &ComposeFile, opts: &NormalizeOptions) -> Result<Normaliz
         ));
     }
     if file.version.is_some() {
-        warnings.push(Warning::new("top-level `version:` is obsolete in the Compose spec and is ignored"));
+        warnings.push(Warning::new(
+            "top-level `version:` is obsolete in the Compose spec and is ignored",
+        ));
     }
     if !file.configs.is_empty() || !file.secrets.is_empty() {
         warnings.push(Warning::new(
@@ -131,24 +133,37 @@ pub fn normalize(file: &ComposeFile, opts: &NormalizeOptions) -> Result<Normaliz
     }
 
     for (name, raw) in &file.networks {
-        deployment.networks.insert(name.clone(), normalize_network(raw.as_ref()));
+        deployment
+            .networks
+            .insert(name.clone(), normalize_network(raw.as_ref()));
     }
     for (name, raw) in &file.volumes {
-        deployment.volumes.insert(name.clone(), normalize_volume(raw.as_ref()));
+        deployment
+            .volumes
+            .insert(name.clone(), normalize_volume(raw.as_ref()));
     }
 
     // Referencing something that does not exist is a build-time error. The
     // device is the wrong place to discover a typo in a network name.
     validate_references(&deployment)?;
     if let Err(cycle) = deployment.start_order() {
-        return Err(Error::DependencyCycle { path: cycle.path.join(" -> ") });
+        return Err(Error::DependencyCycle {
+            path: cycle.path.join(" -> "),
+        });
     }
 
-    Ok(Normalized { deployment, builds, warnings })
+    Ok(Normalized {
+        deployment,
+        builds,
+        warnings,
+    })
 }
 
 fn is_profile_active(service_profiles: &[String], active: &[String]) -> bool {
-    service_profiles.is_empty() || service_profiles.iter().any(|p| active.iter().any(|a| a == p))
+    service_profiles.is_empty()
+        || service_profiles
+            .iter()
+            .any(|p| active.iter().any(|a| a == p))
 }
 
 fn normalize_service(
@@ -182,7 +197,10 @@ fn normalize_service(
         ));
     }
     if let Some(p) = &raw.platform {
-        if Platform::parse(p).map(|sp| !sp.is_compatible_with(&opts.platform)).unwrap_or(false) {
+        if Platform::parse(p)
+            .map(|sp| !sp.is_compatible_with(&opts.platform))
+            .unwrap_or(false)
+        {
             return Err(Error::PlatformConflict {
                 service: name.to_string(),
                 declared: p.clone(),
@@ -219,7 +237,11 @@ fn normalize_service(
     svc.restart = normalize_restart(raw.restart.as_deref())?;
     svc.readiness = resolve_readiness(name, raw, svc.healthcheck.is_some(), warnings)?;
 
-    svc.devices = raw.devices.iter().map(|d| parse_device(d)).collect::<Result<_, _>>()?;
+    svc.devices = raw
+        .devices
+        .iter()
+        .map(|d| parse_device(d))
+        .collect::<Result<_, _>>()?;
     svc.cap_add = raw.cap_add.clone();
     svc.cap_drop = raw.cap_drop.clone();
     svc.privileged = raw.privileged.unwrap_or(false);
@@ -229,9 +251,16 @@ fn normalize_service(
     svc.init = raw.init;
     svc.pid = raw.pid.clone();
     svc.ipc = raw.ipc.clone();
-    svc.shm_size_bytes = raw.shm_size.as_ref().map(|s| parse_size_bytes(&s.as_string())).transpose()?;
-    svc.stop_grace_period_secs =
-        raw.stop_grace_period.as_deref().map(parse_duration_secs).transpose()?;
+    svc.shm_size_bytes = raw
+        .shm_size
+        .as_ref()
+        .map(|s| parse_size_bytes(&s.as_string()))
+        .transpose()?;
+    svc.stop_grace_period_secs = raw
+        .stop_grace_period
+        .as_deref()
+        .map(parse_duration_secs)
+        .transpose()?;
     svc.stop_signal = raw.stop_signal.clone();
     svc.tty = raw.tty.unwrap_or(false);
     svc.stdin_open = raw.stdin_open.unwrap_or(false);
@@ -253,7 +282,9 @@ fn resolve_image(
     opts: &NormalizeOptions,
 ) -> Result<(ImageRef, Option<BuildSpec>), Error> {
     match (&raw.image, &raw.build) {
-        (None, None) => Err(Error::ServiceHasNoImage { service: name.to_string() }),
+        (None, None) => Err(Error::ServiceHasNoImage {
+            service: name.to_string(),
+        }),
         (Some(image), None) => Ok((ImageRef::new(image.clone()), None)),
         (image, Some(build)) => {
             // With both `image:` and `build:`, Compose builds and tags as
@@ -356,7 +387,11 @@ fn resolve_readiness(
     }
 }
 
-fn normalize_mounts(name: &str, raw: &RawService, opts: &NormalizeOptions) -> Result<Vec<Mount>, Error> {
+fn normalize_mounts(
+    name: &str,
+    raw: &RawService,
+    opts: &NormalizeOptions,
+) -> Result<Vec<Mount>, Error> {
     let mut mounts = Vec::new();
 
     for v in &raw.volumes {
@@ -417,7 +452,10 @@ fn normalize_mounts(name: &str, raw: &RawService, opts: &NormalizeOptions) -> Re
 
     if let Some(t) = &raw.tmpfs {
         for target in to_string_list(t) {
-            mounts.push(Mount::Tmpfs { target, size_bytes: None });
+            mounts.push(Mount::Tmpfs {
+                target,
+                size_bytes: None,
+            });
         }
     }
 
@@ -462,17 +500,27 @@ fn parse_short_volume(service: &str, s: &str, opts: &NormalizeOptions) -> Result
             read_only,
         },
         Some(src) if is_host_path(src) => Mount::Bind {
-            source: resolve_path(&opts.base_dir, src).to_string_lossy().into_owned(),
+            source: resolve_path(&opts.base_dir, src)
+                .to_string_lossy()
+                .into_owned(),
             target: target.to_string(),
             read_only,
         },
-        Some(src) => Mount::Volume { source: src.to_string(), target: target.to_string(), read_only },
+        Some(src) => Mount::Volume {
+            source: src.to_string(),
+            target: target.to_string(),
+            read_only,
+        },
     })
 }
 
 /// Compose treats a source as a host path when it looks like one.
 fn is_host_path(s: &str) -> bool {
-    s.starts_with('/') || s.starts_with("./") || s.starts_with("../") || s.starts_with('~') || s == "."
+    s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with('~')
+        || s == "."
 }
 
 /// Give anonymous volumes a deterministic name derived from where they mount.
@@ -573,9 +621,13 @@ fn parse_short_port(service: &str, s: &str) -> Result<Vec<PortMapping>, Error> {
 
     // An IPv6 host address is bracketed, so split off the address first.
     let (host_ip, rest) = if let Some(stripped) = body.strip_prefix('[') {
-        let close = stripped.find(']').ok_or_else(|| bad("unterminated IPv6 address"))?;
+        let close = stripped
+            .find(']')
+            .ok_or_else(|| bad("unterminated IPv6 address"))?;
         let ip = &stripped[..close];
-        let rest = stripped[close + 1..].strip_prefix(':').ok_or_else(|| bad("expected ':' after IPv6 address"))?;
+        let rest = stripped[close + 1..]
+            .strip_prefix(':')
+            .ok_or_else(|| bad("expected ':' after IPv6 address"))?;
         (Some(ip.to_string()), rest)
     } else {
         let colons = body.matches(':').count();
@@ -652,7 +704,9 @@ fn parse_device(s: &str) -> Result<DeviceMapping, Error> {
             container_path: Some(container.to_string()),
             permissions: perms.to_string(),
         }),
-        _ => Err(Error::InvalidDevice { value: s.to_string() }),
+        _ => Err(Error::InvalidDevice {
+            value: s.to_string(),
+        }),
     }
 }
 
@@ -661,7 +715,10 @@ fn normalize_depends_on(raw: Option<&RawDependsOn>) -> Vec<Dependency> {
         None => Vec::new(),
         Some(RawDependsOn::List(l)) => l
             .iter()
-            .map(|s| Dependency { service: s.clone(), condition: DependencyCondition::Started })
+            .map(|s| Dependency {
+                service: s.clone(),
+                condition: DependencyCondition::Started,
+            })
             .collect(),
         Some(RawDependsOn::Map(m)) => m
             .iter()
@@ -669,7 +726,9 @@ fn normalize_depends_on(raw: Option<&RawDependsOn>) -> Vec<Dependency> {
                 service: k.clone(),
                 condition: match v.condition.as_deref() {
                     Some("service_healthy") => DependencyCondition::Healthy,
-                    Some("service_completed_successfully") => DependencyCondition::CompletedSuccessfully,
+                    Some("service_completed_successfully") => {
+                        DependencyCondition::CompletedSuccessfully
+                    }
                     _ => DependencyCondition::Started,
                 },
             })
@@ -682,7 +741,9 @@ fn normalize_healthcheck(raw: Option<&RawHealthcheck>) -> Result<Option<HealthCh
     if hc.disable.unwrap_or(false) {
         return Ok(None);
     }
-    let Some(test) = &hc.test else { return Ok(None) };
+    let Some(test) = &hc.test else {
+        return Ok(None);
+    };
 
     let test = match test {
         // A bare string is a shell command, exactly as Docker treats it.
@@ -703,10 +764,18 @@ fn normalize_healthcheck(raw: Option<&RawHealthcheck>) -> Result<Option<HealthCh
 
     Ok(Some(HealthCheck {
         test,
-        interval_secs: hc.interval.as_deref().map(parse_duration_secs).transpose()?,
+        interval_secs: hc
+            .interval
+            .as_deref()
+            .map(parse_duration_secs)
+            .transpose()?,
         timeout_secs: hc.timeout.as_deref().map(parse_duration_secs).transpose()?,
         retries: hc.retries,
-        start_period_secs: hc.start_period.as_deref().map(parse_duration_secs).transpose()?,
+        start_period_secs: hc
+            .start_period
+            .as_deref()
+            .map(parse_duration_secs)
+            .transpose()?,
     }))
 }
 
@@ -720,9 +789,14 @@ fn normalize_restart(s: Option<&str>) -> Result<RestartPolicy, Error> {
         Some("always") => Ok(RestartPolicy::Always),
         Some("unless-stopped") => Ok(RestartPolicy::UnlessStopped),
         Some(s) if s.starts_with("on-failure") => {
-            let max_retries = s.split_once(':').map(|(_, n)| n.trim().parse::<u32>()).transpose().map_err(|e| {
-                Error::InvalidRestartPolicy { value: s.to_string(), reason: e.to_string() }
-            })?;
+            let max_retries = s
+                .split_once(':')
+                .map(|(_, n)| n.trim().parse::<u32>())
+                .transpose()
+                .map_err(|e| Error::InvalidRestartPolicy {
+                    value: s.to_string(),
+                    reason: e.to_string(),
+                })?;
             Ok(RestartPolicy::OnFailure { max_retries })
         }
         Some(other) => Err(Error::InvalidRestartPolicy {
@@ -733,10 +807,16 @@ fn normalize_restart(s: Option<&str>) -> Result<RestartPolicy, Error> {
 }
 
 fn normalize_network(raw: Option<&RawNetwork>) -> Network {
-    let Some(r) = raw else { return Network::default() };
+    let Some(r) = raw else {
+        return Network::default();
+    };
     Network {
         driver: r.driver.clone(),
-        driver_opts: r.driver_opts.iter().map(|(k, v)| (k.clone(), v.as_string())).collect(),
+        driver_opts: r
+            .driver_opts
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_string()))
+            .collect(),
         external: r.external.unwrap_or(false),
         internal: r.internal.unwrap_or(false),
         labels: map_or_list_to_map(r.labels.as_ref(), '='),
@@ -744,10 +824,16 @@ fn normalize_network(raw: Option<&RawNetwork>) -> Network {
 }
 
 fn normalize_volume(raw: Option<&RawVolume>) -> Volume {
-    let Some(r) = raw else { return Volume::default() };
+    let Some(r) = raw else {
+        return Volume::default();
+    };
     Volume {
         driver: r.driver.clone(),
-        driver_opts: r.driver_opts.iter().map(|(k, v)| (k.clone(), v.as_string())).collect(),
+        driver_opts: r
+            .driver_opts
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_string()))
+            .collect(),
         external: r.external.unwrap_or(false),
         labels: map_or_list_to_map(r.labels.as_ref(), '='),
     }
@@ -836,7 +922,11 @@ fn shell_split(s: &str) -> Result<Vec<String>, Error> {
                     match chars.next() {
                         Some('\'') => break,
                         Some(c) => cur.push(c),
-                        None => return Err(Error::UnbalancedQuote { value: s.to_string() }),
+                        None => {
+                            return Err(Error::UnbalancedQuote {
+                                value: s.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -853,10 +943,18 @@ fn shell_split(s: &str) -> Result<Vec<String>, Error> {
                                 cur.push('\\');
                                 cur.push(n);
                             }
-                            None => return Err(Error::UnbalancedQuote { value: s.to_string() }),
+                            None => {
+                                return Err(Error::UnbalancedQuote {
+                                    value: s.to_string(),
+                                });
+                            }
                         },
                         Some(c) => cur.push(c),
-                        None => return Err(Error::UnbalancedQuote { value: s.to_string() }),
+                        None => {
+                            return Err(Error::UnbalancedQuote {
+                                value: s.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -864,7 +962,11 @@ fn shell_split(s: &str) -> Result<Vec<String>, Error> {
                 has_word = true;
                 match chars.next() {
                     Some(n) => cur.push(n),
-                    None => return Err(Error::UnbalancedQuote { value: s.to_string() }),
+                    None => {
+                        return Err(Error::UnbalancedQuote {
+                            value: s.to_string(),
+                        });
+                    }
                 }
             }
             c => {
@@ -927,7 +1029,10 @@ fn map_or_list_to_map(v: Option<&MapOrList>, sep: char) -> BTreeMap<String, Stri
             for (k, v) in m {
                 // `KEY:` with no value means "inherit from the build
                 // environment", which is resolved during interpolation.
-                out.insert(k.clone(), v.as_ref().map(|s| s.as_string()).unwrap_or_default());
+                out.insert(
+                    k.clone(),
+                    v.as_ref().map(|s| s.as_string()).unwrap_or_default(),
+                );
             }
         }
         Some(MapOrList::List(l)) => {

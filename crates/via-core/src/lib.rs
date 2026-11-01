@@ -24,8 +24,8 @@ mod release;
 
 pub use deployment::{
     DEPLOYMENT_SCHEMA_VERSION, Dependency, DependencyCondition, DependencyCycle, Deployment,
-    HealthCheck, HealthGate, ImageRef, Mount, Network, PortMapping, Protocol, Readiness,
-    RestartPolicy, Service, Volume, DeviceMapping,
+    DeviceMapping, HealthCheck, HealthGate, ImageRef, Mount, Network, PortMapping, Protocol,
+    Readiness, RestartPolicy, Service, Volume,
 };
 pub use digest::Digest;
 pub use error::Error;

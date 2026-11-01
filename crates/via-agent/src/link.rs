@@ -115,24 +115,38 @@ async fn identity(control: &Control, data_dir: &Path) -> Result<Identity> {
         .await
         .context("reaching the control plane")?;
     if !resp.status().is_success() {
-        bail!("enrollment refused: {} {}", resp.status(), resp.text().await.unwrap_or_default());
+        bail!(
+            "enrollment refused: {} {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        );
     }
     let e: Enrolled = resp.json().await?;
     tracing::info!(device = %e.device.id, name = %e.device.name, fleet = %e.device.fleet, "enrolled");
 
-    let id = Identity { url: control.url.clone(), device: e.device.id, credential: e.credential };
+    let id = Identity {
+        url: control.url.clone(),
+        device: e.device.id,
+        credential: e.credential,
+    };
     write_private(&path, &serde_json::to_vec_pretty(&id)?)?;
     Ok(id)
 }
 
 async fn session(identity: &Identity, device: &Device) -> Result<()> {
-    let mut url = format!("{}/v1/connect?agent_version={}", identity.url, env!("CARGO_PKG_VERSION"));
+    let mut url = format!(
+        "{}/v1/connect?agent_version={}",
+        identity.url,
+        env!("CARGO_PKG_VERSION")
+    );
     if let Some(v) = os_version() {
         url += &format!("&os_version={v}");
     }
     let mut req = url.into_client_request()?;
-    req.headers_mut()
-        .insert("authorization", HeaderValue::from_str(&format!("Bearer {}", identity.credential))?);
+    req.headers_mut().insert(
+        "authorization",
+        HeaderValue::from_str(&format!("Bearer {}", identity.credential))?,
+    );
     let (ws, _) = tokio_tungstenite::connect_async(req).await?;
     tracing::info!("connected to {}", identity.url);
     // What `via-agent ready` waits for: this boot reached the control plane.
@@ -223,7 +237,10 @@ fn http_url(ws: &str) -> Result<String> {
 fn os_version() -> Option<String> {
     let text = std::fs::read_to_string("/etc/os-release").ok()?;
     text.lines()
-        .find_map(|l| l.strip_prefix("IMAGE_VERSION=").or_else(|| l.strip_prefix("VERSION_ID=")))
+        .find_map(|l| {
+            l.strip_prefix("IMAGE_VERSION=")
+                .or_else(|| l.strip_prefix("VERSION_ID="))
+        })
         .map(|v| v.trim_matches('"').to_string())
 }
 
@@ -231,7 +248,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     std::fs::rename(tmp, path)?;
@@ -244,8 +266,14 @@ mod tests {
 
     #[test]
     fn ws_urls_map_to_http() {
-        assert_eq!(http_url("wss://via.example.com/").unwrap(), "https://via.example.com");
-        assert_eq!(http_url("ws://10.0.2.2:8080").unwrap(), "http://10.0.2.2:8080");
+        assert_eq!(
+            http_url("wss://via.example.com/").unwrap(),
+            "https://via.example.com"
+        );
+        assert_eq!(
+            http_url("ws://10.0.2.2:8080").unwrap(),
+            "http://10.0.2.2:8080"
+        );
         assert!(http_url("https://x").is_err());
     }
 }

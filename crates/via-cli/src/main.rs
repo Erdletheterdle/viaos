@@ -11,6 +11,7 @@
 mod build;
 mod flash;
 mod remote;
+mod secureboot;
 
 use std::path::PathBuf;
 
@@ -68,6 +69,10 @@ enum Command {
         dir: PathBuf,
         #[arg(long, env = "VIA_SIGNING_KEY")]
         sign_key: Option<PathBuf>,
+        /// Sign the UKI for Secure Boot with the keys in this directory
+        /// (from `via secure-boot keygen`).
+        #[arg(long, env = "VIA_SECURE_BOOT_KEYS")]
+        secure_boot: Option<PathBuf>,
     },
     /// Upload a raw image (`nix build .#images.<arch>`) as the base that
     /// provisioning images are made from.
@@ -75,7 +80,14 @@ enum Command {
         raw: PathBuf,
         #[arg(long)]
         arch: String,
+        /// Sign its EFI binaries with, and have devices enroll, the Secure
+        /// Boot keys in this directory (from `via secure-boot keygen`).
+        #[arg(long, env = "VIA_SECURE_BOOT_KEYS")]
+        secure_boot: Option<PathBuf>,
     },
+    /// Secure Boot keys.
+    #[command(subcommand)]
+    SecureBoot(SecureBoot),
     /// Carry a TCP stream to a port on a device over stdin/stdout. For
     /// `ssh -o ProxyCommand='via tunnel %n 22'`.
     Tunnel { device: String, port: u16 },
@@ -88,7 +100,17 @@ enum Command {
     },
     /// Listen on a local port and forward each connection to a port on a
     /// device, e.g. `via forward line-07 8080 8080`.
-    Forward { device: String, port: u16, local_port: u16 },
+    Forward {
+        device: String,
+        port: u16,
+        local_port: u16,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecureBoot {
+    /// Make a PK, KEK and db for a fleet's devices to enroll.
+    Keygen { dir: PathBuf },
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -120,7 +142,11 @@ fn release(
     sign_key: Option<PathBuf>,
 ) -> Result<Value> {
     let remote = remote::Remote::from_env()?;
-    let archs = if archs.is_empty() { vec!["x86_64".to_string()] } else { archs };
+    let archs = if archs.is_empty() {
+        vec!["x86_64".to_string()]
+    } else {
+        archs
+    };
     let out_dir = std::env::temp_dir().join(format!("via-release-{}", std::process::id()));
     std::fs::create_dir_all(&out_dir)?;
 
@@ -144,7 +170,10 @@ fn release(
             compression: 3,
             sign_key: sign_key.clone(),
         })?;
-        let uploaded = remote.put_file(&format!("/v1/releases/{}/{number}/{arch}", built.app), &built.path);
+        let uploaded = remote.put_file(
+            &format!("/v1/releases/{}/{number}/{arch}", built.app),
+            &built.path,
+        );
         let _ = std::fs::remove_file(&built.path);
         uploaded.with_context(|| format!("uploading the {arch} build"))?;
         app_name = built.app.clone();
@@ -157,8 +186,10 @@ fn release(
         }));
     }
     let _ = std::fs::remove_dir_all(&out_dir);
-    Ok(json!({ "app": app_name, "release": number, "uploaded": results,
-               "next": "Deploy it with `deploy` on the control plane (dry_run first)." }))
+    Ok(
+        json!({ "app": app_name, "release": number, "uploaded": results,
+               "next": "Deploy it with `deploy` on the control plane (dry_run first)." }),
+    )
 }
 
 #[derive(Clone)]
@@ -213,7 +244,10 @@ impl Local {
                        the card or disk in the device and power it on.",
         annotations(title = "Flash image", read_only_hint = false, destructive_hint = true)
     )]
-    async fn flash_image(&self, Parameters(a): Parameters<FlashArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn flash_image(
+        &self,
+        Parameters(a): Parameters<FlashArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         reported(
             self.flasher
                 .start(a.source, a.disk.clone(), a.size_bytes)
@@ -227,12 +261,26 @@ impl Local {
                        packed into one self-contained bundle per architecture, and uploaded. \
                        Devices need no registry. Can take minutes. Then use `deploy` on the \
                        control plane.",
-        annotations(title = "Release app", read_only_hint = false, destructive_hint = false)
+        annotations(
+            title = "Release app",
+            read_only_hint = false,
+            destructive_hint = false
+        )
     )]
-    async fn release_app(&self, Parameters(a): Parameters<ReleaseArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn release_app(
+        &self,
+        Parameters(a): Parameters<ReleaseArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let r = tokio::task::spawn_blocking(move || {
             let key = std::env::var_os("VIA_SIGNING_KEY").map(PathBuf::from);
-            release(a.compose_file.into(), a.app, a.release, a.archs, a.no_build, key)
+            release(
+                a.compose_file.into(),
+                a.app,
+                a.release,
+                a.archs,
+                a.no_build,
+                key,
+            )
         })
         .await
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
@@ -266,28 +314,68 @@ async fn main() -> Result<()> {
         .init();
     match Cli::parse().command {
         Command::Mcp => {
-            let local = Local { flasher: Default::default(), tool_router: Local::tool_router() };
-            local.serve(rmcp::transport::stdio()).await?.waiting().await?;
+            let local = Local {
+                flasher: Default::default(),
+                tool_router: Local::tool_router(),
+            };
+            local
+                .serve(rmcp::transport::stdio())
+                .await?
+                .waiting()
+                .await?;
         }
         Command::Disks => println!("{}", serde_json::to_string_pretty(&flash::list()?)?),
-        Command::Release { file, app, release: number, arch, no_build, sign_key } => {
-            let r = tokio::task::spawn_blocking(move || release(file, app, number, arch, no_build, sign_key)).await??;
+        Command::Release {
+            file,
+            app,
+            release: number,
+            arch,
+            no_build,
+            sign_key,
+        } => {
+            let r = tokio::task::spawn_blocking(move || {
+                release(file, app, number, arch, no_build, sign_key)
+            })
+            .await??;
             print_json(&r)?;
         }
         Command::Keygen { path } => print_json(&remote::keygen(&path)?)?,
-        Command::OsRelease { dir, sign_key } => {
+        Command::OsRelease {
+            dir,
+            sign_key,
+            secure_boot,
+        } => {
             let remote = remote::Remote::from_env()?;
-            let r = tokio::task::spawn_blocking(move || remote::os_release(&remote, &dir, sign_key.as_deref())).await??;
+            let r = tokio::task::spawn_blocking(move || match secure_boot {
+                Some(keys) => {
+                    let signed = secureboot::sign_update(&keys, &dir)?;
+                    let r = remote::os_release(&remote, &signed, sign_key.as_deref());
+                    let _ = std::fs::remove_dir_all(&signed);
+                    r
+                }
+                None => remote::os_release(&remote, &dir, sign_key.as_deref()),
+            })
+            .await??;
             print_json(&r)?;
         }
-        Command::BaseImage { raw, arch } => {
+        Command::BaseImage {
+            raw,
+            arch,
+            secure_boot,
+        } => {
             let remote = remote::Remote::from_env()?;
-            let r = tokio::task::spawn_blocking(move || remote::base_image(&remote, &raw, &arch)).await??;
+            let r = tokio::task::spawn_blocking(move || {
+                remote::base_image(&remote, &raw, &arch, secure_boot.as_deref())
+            })
+            .await??;
             print_json(&r)?;
         }
+        Command::SecureBoot(SecureBoot::Keygen { dir }) => print_json(&secureboot::keygen(&dir)?)?,
         Command::Tunnel { device, port } => {
             let stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-            remote::Remote::from_env()?.tunnel(&device, port, stdio).await?;
+            remote::Remote::from_env()?
+                .tunnel(&device, port, stdio)
+                .await?;
         }
         Command::Ssh { device, args } => {
             remote::Remote::from_env()?;
@@ -305,7 +393,11 @@ async fn main() -> Result<()> {
             );
             return Err(err).context("running ssh");
         }
-        Command::Forward { device, port, local_port } => {
+        Command::Forward {
+            device,
+            port,
+            local_port,
+        } => {
             let remote = std::sync::Arc::new(remote::Remote::from_env()?);
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port)).await?;
             eprintln!("forwarding 127.0.0.1:{local_port} to {device}:{port}");

@@ -53,7 +53,9 @@ impl Config {
     /// containers and still answers MCP over SSH or the console.
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("parsing {}", path.display())),
+            Ok(text) => {
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
@@ -67,7 +69,9 @@ impl Config {
             .trust
             .keys
             .iter()
-            .map(|k| via_bundle::PublicKey::from_hex(k).with_context(|| format!("[trust] key {k:?}")))
+            .map(|k| {
+                via_bundle::PublicKey::from_hex(k).with_context(|| format!("[trust] key {k:?}"))
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(via_bundle::TrustPolicy::from_keys(keys))
     }
@@ -80,7 +84,12 @@ impl Config {
             tracing::warn!("hostname {name:?} not applied: {e:#}");
         }
         let keys = authorized_keys_path(data_dir);
-        let body: String = self.ssh.authorized_keys.iter().map(|k| format!("{}\n", k.trim())).collect();
+        let body: String = self
+            .ssh
+            .authorized_keys
+            .iter()
+            .map(|k| format!("{}\n", k.trim()))
+            .collect();
         if let Err(e) = std::fs::write(&keys, body) {
             tracing::warn!("{} not written: {e}", keys.display());
         }

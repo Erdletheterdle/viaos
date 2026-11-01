@@ -57,21 +57,40 @@ impl DockerRuntime {
         project: &str,
     ) -> Result<Vec<bollard::models::ContainerSummary>, Error> {
         let mut filters = HashMap::new();
-        filters.insert("label".to_string(), vec![format!("{LABEL_PROJECT}={project}")]);
-        let options = qp::ListContainersOptionsBuilder::new().all(true).filters(&filters).build();
-        self.docker.list_containers(Some(options)).await.map_err(Error::docker)
+        filters.insert(
+            "label".to_string(),
+            vec![format!("{LABEL_PROJECT}={project}")],
+        );
+        let options = qp::ListContainersOptionsBuilder::new()
+            .all(true)
+            .filters(&filters)
+            .build();
+        self.docker
+            .list_containers(Some(options))
+            .await
+            .map_err(Error::docker)
     }
 
     async fn inspect_service(&self, name: &str) -> Result<Option<ServiceState>, Error> {
-        let inspect = match self.docker.inspect_container(name, None::<qp::InspectContainerOptions>).await {
+        let inspect = match self
+            .docker
+            .inspect_container(name, None::<qp::InspectContainerOptions>)
+            .await
+        {
             Ok(c) => c,
-            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
                 return Ok(None);
             }
             Err(e) => return Err(Error::docker(e)),
         };
 
-        let labels = inspect.config.as_ref().and_then(|c| c.labels.clone()).unwrap_or_default();
+        let labels = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.labels.clone())
+            .unwrap_or_default();
         let state = inspect.state.as_ref();
 
         let status = match state.and_then(|s| s.status) {
@@ -80,9 +99,9 @@ impl DockerRuntime {
             Some(ContainerStateStatusEnum::RESTARTING) => ContainerStatus::Restarting,
             Some(ContainerStateStatusEnum::PAUSED) => ContainerStatus::Paused,
             Some(ContainerStateStatusEnum::DEAD) => ContainerStatus::Dead,
-            Some(ContainerStateStatusEnum::EXITED) => {
-                ContainerStatus::Exited { code: state.and_then(|s| s.exit_code).unwrap_or(0) }
-            }
+            Some(ContainerStateStatusEnum::EXITED) => ContainerStatus::Exited {
+                code: state.and_then(|s| s.exit_code).unwrap_or(0),
+            },
             _ => ContainerStatus::Created,
         };
 
@@ -106,7 +125,11 @@ impl DockerRuntime {
     }
 
     /// Create the networks a deployment needs, skipping external ones.
-    async fn ensure_networks(&self, deployment: &Deployment, report: &mut ApplyReport) -> Result<(), Error> {
+    async fn ensure_networks(
+        &self,
+        deployment: &Deployment,
+        report: &mut ApplyReport,
+    ) -> Result<(), Error> {
         let existing: Vec<String> = self
             .docker
             .list_networks(None::<qp::ListNetworksOptions>)
@@ -137,13 +160,21 @@ impl DockerRuntime {
             }
             let request = NetworkCreateRequest {
                 name: full_name.clone(),
-                driver: spec.and_then(|s| s.driver.clone()).or_else(|| Some("bridge".into())),
+                driver: spec
+                    .and_then(|s| s.driver.clone())
+                    .or_else(|| Some("bridge".into())),
                 internal: spec.map(|s| s.internal),
                 options: spec.map(|s| s.driver_opts.clone().into_iter().collect()),
-                labels: Some(merge_labels(object_labels(&deployment.project), spec.map(|s| &s.labels))),
+                labels: Some(merge_labels(
+                    object_labels(&deployment.project),
+                    spec.map(|s| &s.labels),
+                )),
                 ..Default::default()
             };
-            self.docker.create_network(request).await.map_err(Error::docker)?;
+            self.docker
+                .create_network(request)
+                .await
+                .map_err(Error::docker)?;
             report.networks_created.push(full_name);
         }
         Ok(())
@@ -153,7 +184,11 @@ impl DockerRuntime {
     ///
     /// Existing volumes are never touched: their whole purpose is to outlive
     /// releases (spec section 19).
-    async fn ensure_volumes(&self, deployment: &Deployment, report: &mut ApplyReport) -> Result<(), Error> {
+    async fn ensure_volumes(
+        &self,
+        deployment: &Deployment,
+        report: &mut ApplyReport,
+    ) -> Result<(), Error> {
         let existing: Vec<String> = self
             .docker
             .list_volumes(None::<qp::ListVolumesOptions>)
@@ -198,10 +233,16 @@ impl DockerRuntime {
                 name: Some(full_name.clone()),
                 driver: spec.and_then(|s| s.driver.clone()),
                 driver_opts: spec.map(|s| s.driver_opts.clone().into_iter().collect()),
-                labels: Some(merge_labels(object_labels(&deployment.project), spec.map(|s| &s.labels))),
+                labels: Some(merge_labels(
+                    object_labels(&deployment.project),
+                    spec.map(|s| &s.labels),
+                )),
                 ..Default::default()
             };
-            self.docker.create_volume(options).await.map_err(Error::docker)?;
+            self.docker
+                .create_volume(options)
+                .await
+                .map_err(Error::docker)?;
             report.volumes_created.push(full_name);
         }
         Ok(())
@@ -215,15 +256,21 @@ impl DockerRuntime {
         deadline: Instant,
     ) -> Result<(), Error> {
         use via_core::DependencyCondition::*;
-        let Some(service) = deployment.services.get(&dep.service) else { return Ok(()) };
+        let Some(service) = deployment.services.get(&dep.service) else {
+            return Ok(());
+        };
         let name = container_name(deployment, service);
 
         loop {
             let state = self.inspect_service(&name).await?;
             let satisfied = match (&dep.condition, &state) {
-                (Started, Some(s)) => s.status.is_running() || matches!(s.status, ContainerStatus::Exited { .. }),
+                (Started, Some(s)) => {
+                    s.status.is_running() || matches!(s.status, ContainerStatus::Exited { .. })
+                }
                 (Healthy, Some(s)) => s.health == HealthStatus::Healthy,
-                (CompletedSuccessfully, Some(s)) => matches!(s.status, ContainerStatus::Exited { code: 0 }),
+                (CompletedSuccessfully, Some(s)) => {
+                    matches!(s.status, ContainerStatus::Exited { code: 0 })
+                }
                 (_, None) => false,
             };
             if satisfied {
@@ -252,10 +299,15 @@ impl DockerRuntime {
     }
 
     async fn remove_container(&self, name: &str) -> Result<(), Error> {
-        let options = qp::RemoveContainerOptionsBuilder::new().force(true).v(false).build();
+        let options = qp::RemoveContainerOptionsBuilder::new()
+            .force(true)
+            .v(false)
+            .build();
         match self.docker.remove_container(name, Some(options)).await {
             Ok(()) => Ok(()),
-            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(()),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(()),
             Err(e) => Err(Error::docker(e)),
         }
     }
@@ -271,7 +323,11 @@ impl DockerRuntime {
         let mut mounts = Vec::new();
         for m in &service.mounts {
             mounts.push(match m {
-                Mount::Volume { source, target, read_only } => DockerMount {
+                Mount::Volume {
+                    source,
+                    target,
+                    read_only,
+                } => DockerMount {
                     typ: Some(MountType::VOLUME),
                     // Volumes declared in the manifest are namespaced by
                     // project; external ones keep their real name.
@@ -283,7 +339,11 @@ impl DockerRuntime {
                     read_only: Some(*read_only),
                     ..Default::default()
                 },
-                Mount::Bind { source, target, read_only } => DockerMount {
+                Mount::Bind {
+                    source,
+                    target,
+                    read_only,
+                } => DockerMount {
                     typ: Some(MountType::BIND),
                     source: Some(source.clone()),
                     target: Some(target.clone()),
@@ -307,14 +367,17 @@ impl DockerRuntime {
         for p in &service.ports {
             let key = format!("{}/{}", p.container_port, p.protocol);
             exposed.push(key.clone());
-            port_bindings.entry(key).or_insert_with(|| Some(Vec::new())).as_mut().unwrap().push(
-                PortBinding {
+            port_bindings
+                .entry(key)
+                .or_insert_with(|| Some(Vec::new()))
+                .as_mut()
+                .unwrap()
+                .push(PortBinding {
                     host_ip: p.host_ip.clone(),
                     // An empty host port asks Docker for an ephemeral one,
                     // which is what Compose's bare `- "80"` means.
                     host_port: Some(p.host_port.map(|h| h.to_string()).unwrap_or_default()),
-                },
-            );
+                });
         }
 
         let restart_policy = Some(match &service.restart {
@@ -359,7 +422,9 @@ impl DockerRuntime {
                     },
                 );
             }
-            NetworkingConfig { endpoints_config: Some(endpoints) }
+            NetworkingConfig {
+                endpoints_config: Some(endpoints),
+            }
         });
 
         let host_config = HostConfig {
@@ -399,8 +464,15 @@ impl DockerRuntime {
             cmd: service.command.clone(),
             entrypoint: service.entrypoint.clone(),
             env: Some(env_list(service, ctx)),
-            labels: Some(container_labels(deployment, service, ctx, hash).into_iter().collect()),
-            hostname: service.hostname.clone().or_else(|| Some(service.name.clone())),
+            labels: Some(
+                container_labels(deployment, service, ctx, hash)
+                    .into_iter()
+                    .collect(),
+            ),
+            hostname: service
+                .hostname
+                .clone()
+                .or_else(|| Some(service.name.clone())),
             user: service.user.clone(),
             working_dir: service.working_dir.clone(),
             tty: Some(service.tty),
@@ -433,7 +505,9 @@ impl Runtime for DockerRuntime {
     }
 
     async fn load_images(&self, archive: &Path) -> Result<Vec<String>, Error> {
-        let file = tokio::fs::File::open(archive).await.map_err(|e| Error::io(archive, e))?;
+        let file = tokio::fs::File::open(archive)
+            .await
+            .map_err(|e| Error::io(archive, e))?;
         let stream = tokio_util::io::ReaderStream::new(file);
         let options = qp::ImportImageOptionsBuilder::new().quiet(true).build();
 
@@ -454,12 +528,18 @@ impl Runtime for DockerRuntime {
     async fn image_present(&self, reference: &str) -> Result<bool, Error> {
         match self.docker.inspect_image(reference).await {
             Ok(_) => Ok(true),
-            Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => Ok(false),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
             Err(e) => Err(Error::docker(e)),
         }
     }
 
-    async fn apply(&self, deployment: &Deployment, ctx: &ApplyContext) -> Result<ApplyReport, Error> {
+    async fn apply(
+        &self,
+        deployment: &Deployment,
+        ctx: &ApplyContext,
+    ) -> Result<ApplyReport, Error> {
         let mut report = ApplyReport::default();
 
         // Refuse to start anything if an image is missing. A bundle is
@@ -467,14 +547,20 @@ impl Runtime for DockerRuntime {
         // is broken, not that something should be fetched.
         for image in deployment.required_images() {
             if !self.image_present(&image.reference).await? {
-                return Err(Error::ImageNotLoaded { reference: image.reference.clone() });
+                return Err(Error::ImageNotLoaded {
+                    reference: image.reference.clone(),
+                });
             }
         }
 
         self.ensure_networks(deployment, &mut report).await?;
         self.ensure_volumes(deployment, &mut report).await?;
 
-        let order = deployment.start_order().map_err(|c| Error::DependencyCycle { path: c.to_string() })?;
+        let order = deployment
+            .start_order()
+            .map_err(|c| Error::DependencyCycle {
+                path: c.to_string(),
+            })?;
         let deadline = Instant::now() + Duration::from_secs(deployment.health_gate.timeout_secs);
 
         for service_name in &order {
@@ -500,7 +586,9 @@ impl Runtime for DockerRuntime {
                     ContainerStatus::Running | ContainerStatus::Restarting => {
                         report.unchanged.push(service.name.clone());
                     }
-                    ContainerStatus::Exited { code: 0 } if service.readiness == Readiness::Completed => {
+                    ContainerStatus::Exited { code: 0 }
+                        if service.readiness == Readiness::Completed =>
+                    {
                         report.unchanged.push(service.name.clone());
                     }
                     _ => {
@@ -522,7 +610,10 @@ impl Runtime for DockerRuntime {
 
             let config = self.container_config(deployment, service, ctx, &hash);
             let options = qp::CreateContainerOptionsBuilder::new().name(&name).build();
-            self.docker.create_container(Some(options), config).await.map_err(Error::docker)?;
+            self.docker
+                .create_container(Some(options), config)
+                .await
+                .map_err(Error::docker)?;
             self.docker
                 .start_container(&name, None::<qp::StartContainerOptions>)
                 .await
@@ -541,7 +632,9 @@ impl Runtime for DockerRuntime {
         // would keep running forever.
         for container in self.project_containers(&deployment.project).await? {
             let labels = container.labels.unwrap_or_default();
-            let Some(service) = labels.get(LABEL_SERVICE) else { continue };
+            let Some(service) = labels.get(LABEL_SERVICE) else {
+                continue;
+            };
             if deployment.services.contains_key(service) {
                 continue;
             }
@@ -580,7 +673,9 @@ impl Runtime for DockerRuntime {
         // stream that looks like a silent application.
         for wanted in &options.services {
             if !deployment.services.contains_key(wanted) {
-                return Err(Error::NoSuchService { service: wanted.clone() });
+                return Err(Error::NoSuchService {
+                    service: wanted.clone(),
+                });
             }
         }
 
@@ -627,23 +722,33 @@ impl Runtime for DockerRuntime {
             streams.push(crate::logs::lines(name.clone(), chunks).boxed());
         }
 
-        Ok(Logs { services, lines: futures::stream::select_all(streams).boxed() })
+        Ok(Logs {
+            services,
+            lines: futures::stream::select_all(streams).boxed(),
+        })
     }
 
     async fn exec(&self, deployment: &Deployment, options: &ExecOptions) -> Result<Exec, Error> {
         if options.command.is_empty() {
-            return Err(Error::Invalid { reason: "no command was given to run".into() });
+            return Err(Error::Invalid {
+                reason: "no command was given to run".into(),
+            });
         }
-        let service = deployment
-            .services
-            .get(&options.service)
-            .ok_or_else(|| Error::NoSuchService { service: options.service.clone() })?;
+        let service =
+            deployment
+                .services
+                .get(&options.service)
+                .ok_or_else(|| Error::NoSuchService {
+                    service: options.service.clone(),
+                })?;
         let container = container_name(deployment, service);
         // A service that is not running is an error rather than an empty
         // stream: "the command produced no output" and "there was nothing to
         // run it in" are opposite answers to a debugging question.
         if self.inspect_service(&container).await?.is_none() {
-            return Err(Error::NoSuchService { service: options.service.clone() });
+            return Err(Error::NoSuchService {
+                service: options.service.clone(),
+            });
         }
 
         let created = self
@@ -664,7 +769,11 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(Error::docker)?;
 
-        let started = self.docker.start_exec(&created.id, None).await.map_err(Error::docker)?;
+        let started = self
+            .docker
+            .start_exec(&created.id, None)
+            .await
+            .map_err(Error::docker)?;
         let bollard::exec::StartExecResults::Attached { output, .. } = started else {
             return Err(Error::Invalid {
                 reason: "the engine detached the command instead of attaching to it".into(),
@@ -694,15 +803,24 @@ impl Runtime for DockerRuntime {
             })
             .chain(futures::stream::once(async move {
                 let status = docker.inspect_exec(&exec_id).await.map_err(Error::docker)?;
-                Ok(ExecChunk::Exit { code: status.exit_code })
+                Ok(ExecChunk::Exit {
+                    code: status.exit_code,
+                })
             }));
 
-        Ok(Exec { container, output: body.boxed() })
+        Ok(Exec {
+            container,
+            output: body.boxed(),
+        })
     }
 
     async fn stop(&self, deployment: &Deployment) -> Result<(), Error> {
         // Reverse dependency order, so dependents stop before what they need.
-        let order = deployment.start_order().map_err(|c| Error::DependencyCycle { path: c.to_string() })?;
+        let order = deployment
+            .start_order()
+            .map_err(|c| Error::DependencyCycle {
+                path: c.to_string(),
+            })?;
         for service_name in order.iter().rev() {
             let service = &deployment.services[*service_name];
             let name = container_name(deployment, service);
@@ -711,8 +829,12 @@ impl Runtime for DockerRuntime {
                 .build();
             match self.docker.stop_container(&name, Some(options)).await {
                 Ok(()) => {}
-                Err(bollard::errors::Error::DockerResponseServerError { status_code: 404, .. }) => {}
-                Err(bollard::errors::Error::DockerResponseServerError { status_code: 304, .. }) => {}
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 304, ..
+                }) => {}
                 Err(e) => return Err(Error::docker(e)),
             }
         }

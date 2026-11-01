@@ -45,11 +45,17 @@ pub struct Warning {
 
 impl Warning {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { service: None, message: message.into() }
+        Self {
+            service: None,
+            message: message.into(),
+        }
     }
 
     pub fn for_service(service: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { service: Some(service.into()), message: message.into() }
+        Self {
+            service: Some(service.into()),
+            message: message.into(),
+        }
     }
 }
 
@@ -65,10 +71,18 @@ impl std::fmt::Display for Warning {
 #[derive(Debug, ThisError)]
 pub enum Error {
     #[error("reading {path}: {source}")]
-    Io { path: String, #[source] source: std::io::Error },
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("parsing {path}: {source}")]
-    Yaml { path: String, #[source] source: serde_yaml_ng::Error },
+    Yaml {
+        path: String,
+        #[source]
+        source: serde_yaml_ng::Error,
+    },
 
     #[error(transparent)]
     Interpolation(#[from] InterpolationError),
@@ -79,14 +93,28 @@ pub enum Error {
     #[error("service {service:?} has neither `image:` nor `build:`")]
     ServiceHasNoImage { service: String },
 
-    #[error("service {service:?} declares platform {declared:?} but this bundle targets {target:?}")]
-    PlatformConflict { service: String, declared: String, target: String },
+    #[error(
+        "service {service:?} declares platform {declared:?} but this bundle targets {target:?}"
+    )]
+    PlatformConflict {
+        service: String,
+        declared: String,
+        target: String,
+    },
 
     #[error("service {service:?}: invalid mount {value:?}: {reason}")]
-    InvalidMount { service: String, value: String, reason: String },
+    InvalidMount {
+        service: String,
+        value: String,
+        reason: String,
+    },
 
     #[error("service {service:?}: invalid port {value:?}: {reason}")]
-    InvalidPort { service: String, value: String, reason: String },
+    InvalidPort {
+        service: String,
+        value: String,
+        reason: String,
+    },
 
     #[error("invalid device mapping {value:?}: expected host[:container[:permissions]]")]
     InvalidDevice { value: String },
@@ -104,13 +132,21 @@ pub enum Error {
     UnbalancedQuote { value: String },
 
     #[error("service {service:?} references unknown {kind} {referenced:?}")]
-    UnknownReference { service: String, kind: &'static str, referenced: String },
+    UnknownReference {
+        service: String,
+        kind: &'static str,
+        referenced: String,
+    },
 
     #[error("{path}")]
     DependencyCycle { path: String },
 
     #[error("service {service:?}: {feature} is not supported: {reason}")]
-    Unsupported { service: String, feature: String, reason: String },
+    Unsupported {
+        service: String,
+        feature: String,
+        reason: String,
+    },
 
     #[error(transparent)]
     Core(#[from] via_core::Error),
@@ -135,7 +171,10 @@ pub struct Loader {
 
 impl Loader {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), vars: None }
+        Self {
+            path: path.into(),
+            vars: None,
+        }
     }
 
     /// Override the interpolation environment. Defaults to the process
@@ -148,16 +187,28 @@ impl Loader {
     /// Find a compose file using Compose's own preference order.
     pub fn discover(dir: impl AsRef<Path>) -> Option<PathBuf> {
         let dir = dir.as_ref();
-        ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"]
-            .iter()
-            .map(|f| dir.join(f))
-            .find(|p| p.is_file())
+        [
+            "compose.yaml",
+            "compose.yml",
+            "docker-compose.yaml",
+            "docker-compose.yml",
+        ]
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.is_file())
     }
 
     pub fn load(self) -> Result<Loaded, Error> {
-        let raw = std::fs::read_to_string(&self.path)
-            .map_err(|e| Error::Io { path: self.path.display().to_string(), source: e })?;
-        let base_dir = self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+        let raw = std::fs::read_to_string(&self.path).map_err(|e| Error::Io {
+            path: self.path.display().to_string(),
+            source: e,
+        })?;
+        let base_dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
 
         let vars = match self.vars {
             Some(v) => v,
@@ -174,14 +225,23 @@ impl Loader {
         // Interpolate the text before parsing, as Compose does. Doing it after
         // parsing would miss `${...}` appearing in keys.
         let source = interpolate(&raw, &vars)?;
-        let file: ComposeFile = serde_yaml_ng::from_str(&source)
-            .map_err(|e| Error::Yaml { path: self.path.display().to_string(), source: e })?;
+        let file: ComposeFile = serde_yaml_ng::from_str(&source).map_err(|e| Error::Yaml {
+            path: self.path.display().to_string(),
+            source: e,
+        })?;
 
-        Ok(Loaded { file, source, base_dir })
+        Ok(Loaded {
+            file,
+            source,
+            base_dir,
+        })
     }
 }
 
 /// Parse an already-interpolated compose document.
 pub fn parse_str(yaml: &str) -> Result<ComposeFile, Error> {
-    serde_yaml_ng::from_str(yaml).map_err(|e| Error::Yaml { path: "<string>".into(), source: e })
+    serde_yaml_ng::from_str(yaml).map_err(|e| Error::Yaml {
+        path: "<string>".into(),
+        source: e,
+    })
 }

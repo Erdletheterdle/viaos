@@ -57,7 +57,8 @@ impl Assembler {
 
         while let Some(at) = buffer.iter().position(|b| *b == b'\n') {
             let line: Vec<u8> = buffer.drain(..=at).collect();
-            self.ready.push_back(build(&self.service, source, &line[..line.len() - 1]));
+            self.ready
+                .push_back(build(&self.service, source, &line[..line.len() - 1]));
         }
         // `while`, because one chunk is however many bytes arrived together:
         // a container attached to a tty hands over raw output with no framing
@@ -109,7 +110,12 @@ fn build(service: &str, source: LogSource, bytes: &[u8]) -> LogLine {
         }
         _ => (None, text.to_string()),
     };
-    LogLine { service: service.to_string(), source, at, line }
+    LogLine {
+        service: service.to_string(),
+        source,
+        at,
+        line,
+    }
 }
 
 /// Whether a token is the engine's timestamp rather than the first word the
@@ -235,7 +241,10 @@ mod tests {
     #[test]
     fn the_engine_timestamp_is_parsed_off_rather_than_left_in_the_text() {
         let mut a = Assembler::new("detector");
-        a.push(LogSource::Stdout, b"2026-08-23T10:00:00.123456789Z v44 tick 10:00:00\n");
+        a.push(
+            LogSource::Stdout,
+            b"2026-08-23T10:00:00.123456789Z v44 tick 10:00:00\n",
+        );
         let line = a.next_line().unwrap();
         assert_eq!(line.at.as_deref(), Some("2026-08-23T10:00:00.123456789Z"));
         assert_eq!(line.line, "v44 tick 10:00:00");
@@ -246,7 +255,10 @@ mod tests {
         // Timestamps are a request, not a guarantee. Assuming one would eat
         // the first word of every line from an engine that did not add them.
         let mut a = Assembler::new("detector");
-        a.push(LogSource::Stdout, b"database reachable; entering main loop\n");
+        a.push(
+            LogSource::Stdout,
+            b"database reachable; entering main loop\n",
+        );
         let line = a.next_line().unwrap();
         assert_eq!(line.at, None);
         assert_eq!(line.line, "database reachable; entering main loop");
@@ -288,7 +300,10 @@ mod tests {
             MAX_LINE * 15,
             "nothing is lost by cutting: every byte fed is either emitted or still buffered"
         );
-        assert!(lines.iter().all(|l| l.len() == MAX_LINE), "each cut is exactly at the limit");
+        assert!(
+            lines.iter().all(|l| l.len() == MAX_LINE),
+            "each cut is exactly at the limit"
+        );
     }
 
     #[test]

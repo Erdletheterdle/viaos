@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 
 use via_core::{AppName, Deployment, Digest, ImageRef, Platform, ReleaseId};
 
+use crate::Error;
 use crate::manifest::*;
 use crate::oci::{self, blob_path};
 use crate::signing::{SIGNATURE_PATH, SigningKey};
-use crate::Error;
 
 /// Default zstd level.
 ///
@@ -133,7 +133,9 @@ impl BundleWriter {
 
         let mut added = 0;
         for image in ingested.images {
-            let Some(reference) = reference_for(image.reference.as_deref()) else { continue };
+            let Some(reference) = reference_for(image.reference.as_deref()) else {
+                continue;
+            };
             if self.images.iter().any(|i| i.reference == reference) {
                 continue;
             }
@@ -200,7 +202,8 @@ impl BundleWriter {
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(Error::json)?;
 
-        let encoder = zstd::Encoder::new(out, self.compression).map_err(|e| Error::io(Path::new("<zstd>"), e))?;
+        let encoder = zstd::Encoder::new(out, self.compression)
+            .map_err(|e| Error::io(Path::new("<zstd>"), e))?;
         let mut tar = tar::Builder::new(encoder);
 
         append_bytes(&mut tar, MANIFEST_PATH, &manifest_bytes)?;
@@ -222,12 +225,18 @@ impl BundleWriter {
             header.set_mode(0o644);
             header.set_mtime(0);
             header.set_cksum();
-            tar.append_data(&mut header, format!("{BLOB_PREFIX}{}", blob.digest.to_path_segment()), &mut file)
-                .map_err(Error::tar)?;
+            tar.append_data(
+                &mut header,
+                format!("{BLOB_PREFIX}{}", blob.digest.to_path_segment()),
+                &mut file,
+            )
+            .map_err(Error::tar)?;
         }
 
         let encoder = tar.into_inner().map_err(Error::tar)?;
-        encoder.finish().map_err(|e| Error::io(Path::new("<zstd>"), e))
+        encoder
+            .finish()
+            .map_err(|e| Error::io(Path::new("<zstd>"), e))
     }
 
     /// Refuse to build a bundle that would need a registry at deploy time.
@@ -239,7 +248,9 @@ impl BundleWriter {
             .map(|img| img.reference.clone())
             .collect();
         if !missing.is_empty() {
-            return Err(Error::MissingImages { references: missing });
+            return Err(Error::MissingImages {
+                references: missing,
+            });
         }
         Ok(())
     }
@@ -249,19 +260,30 @@ impl BundleWriter {
     pub fn digest_deployment(&self, deployment: &Deployment) -> Deployment {
         let mut out = deployment.clone();
         for svc in out.services.values_mut() {
-            if let Some(img) = self.images.iter().find(|i| i.reference == svc.image.reference) {
-                svc.image = ImageRef::new(svc.image.reference.clone()).with_digest(img.manifest_digest.clone());
+            if let Some(img) = self
+                .images
+                .iter()
+                .find(|i| i.reference == svc.image.reference)
+            {
+                svc.image = ImageRef::new(svc.image.reference.clone())
+                    .with_digest(img.manifest_digest.clone());
             }
         }
         out
     }
 }
 
-fn append_bytes<W: Write>(builder: &mut tar::Builder<W>, name: &str, data: &[u8]) -> Result<(), Error> {
+fn append_bytes<W: Write>(
+    builder: &mut tar::Builder<W>,
+    name: &str,
+    data: &[u8],
+) -> Result<(), Error> {
     let mut header = tar::Header::new_gnu();
     header.set_size(data.len() as u64);
     header.set_mode(0o644);
     header.set_mtime(0);
     header.set_cksum();
-    builder.append_data(&mut header, name, data).map_err(Error::tar)
+    builder
+        .append_data(&mut header, name, data)
+        .map_err(Error::tar)
 }

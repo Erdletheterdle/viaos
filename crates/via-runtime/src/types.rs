@@ -27,7 +27,9 @@ pub enum ContainerStatus {
     Running,
     Restarting,
     Paused,
-    Exited { code: i64 },
+    Exited {
+        code: i64,
+    },
     Dead,
 }
 
@@ -144,7 +146,10 @@ pub struct ApplyContext {
 
 impl ApplyContext {
     pub fn for_release(release: ReleaseId) -> Self {
-        Self { release: Some(release), ..Default::default() }
+        Self {
+            release: Some(release),
+            ..Default::default()
+        }
     }
 
     /// Overrides for one service, if any.
@@ -247,10 +252,15 @@ pub struct Exec {
 /// One piece of a running command's output, or its exit status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecChunk {
-    Output { source: LogSource, data: String },
+    Output {
+        source: LogSource,
+        data: String,
+    },
     /// `None` when the engine reported no status, which is not the same as
     /// zero and must not be flattened into it.
-    Exit { code: Option<i64> },
+    Exit {
+        code: Option<i64>,
+    },
 }
 
 /// Names Via gives to the Docker objects it owns.

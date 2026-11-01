@@ -21,7 +21,11 @@ impl ReleaseRef {
     }
 
     pub fn artifact(&self, platform: Platform) -> ArtifactRef {
-        ArtifactRef { app: self.app.clone(), release: self.release, platform }
+        ArtifactRef {
+            app: self.app.clone(),
+            release: self.release,
+            platform,
+        }
     }
 }
 
@@ -43,7 +47,12 @@ pub struct ArtifactRef {
 impl ArtifactRef {
     /// Conventional bundle filename, e.g. `demo-stack-44-linux-arm64.bundle.zst`.
     pub fn file_name(&self) -> String {
-        format!("{}-{}-{}.bundle.zst", self.app, self.release, self.platform.to_file_segment())
+        format!(
+            "{}-{}-{}.bundle.zst",
+            self.app,
+            self.release,
+            self.platform.to_file_segment()
+        )
     }
 
     /// Control-plane storage path (spec section 62).
@@ -104,18 +113,26 @@ mod tests {
     #[test]
     fn store_path_matches_spec_layout() {
         let a = ReleaseRef::new(app(), ReleaseId(44)).artifact(Platform::new("linux", "amd64"));
-        assert_eq!(a.store_path(), "applications/demo-stack/releases/44/linux-amd64.bundle.zst");
+        assert_eq!(
+            a.store_path(),
+            "applications/demo-stack/releases/44/linux-amd64.bundle.zst"
+        );
     }
 
     #[test]
     fn pinned_target_ignores_the_application_default() {
-        let pinned = ReleaseTarget::Pinned { release: ReleaseId(42) };
+        let pinned = ReleaseTarget::Pinned {
+            release: ReleaseId(42),
+        };
         assert_eq!(pinned.resolve(Some(ReleaseId(45))), Some(ReleaseId(42)));
     }
 
     #[test]
     fn default_target_follows_and_tolerates_no_default_yet() {
-        assert_eq!(ReleaseTarget::Default.resolve(Some(ReleaseId(45))), Some(ReleaseId(45)));
+        assert_eq!(
+            ReleaseTarget::Default.resolve(Some(ReleaseId(45))),
+            Some(ReleaseId(45))
+        );
         assert_eq!(ReleaseTarget::Default.resolve(None), None);
     }
 }

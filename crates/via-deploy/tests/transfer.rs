@@ -47,7 +47,11 @@ fn build_bundle(release: u64, sign: Option<&SigningKey>) -> Vec<u8> {
         h.set_cksum();
         tar.append_data(&mut h, name, data).unwrap();
     };
-    for (d, b) in [(&layer_digest, &layer), (&config_digest, &config_bytes), (&manifest_digest, &manifest_bytes)] {
+    for (d, b) in [
+        (&layer_digest, &layer),
+        (&config_digest, &config_bytes),
+        (&manifest_digest, &manifest_bytes),
+    ] {
         put(format!("blobs/{}/{}", d.algorithm(), d.hex()), b);
     }
     let index = serde_json::json!({
@@ -71,12 +75,15 @@ fn build_bundle(release: u64, sign: Option<&SigningKey>) -> Vec<u8> {
     if let Some(key) = sign {
         writer = writer.sign_with(SigningKey::from_hex(&key.to_hex()).unwrap());
     }
-    writer.add_docker_archive(&archive[..], |n| n.map(str::to_string)).unwrap();
+    writer
+        .add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
 
     let mut deployment = Deployment::new("demo-stack", Platform::new("linux", "arm64"));
-    deployment
-        .services
-        .insert("app".into(), Service::new("app", ImageRef::new(format!("app:{release}"))));
+    deployment.services.insert(
+        "app".into(),
+        Service::new("app", ImageRef::new(format!("app:{release}"))),
+    );
 
     writer.finish(Vec::new(), &deployment, None).unwrap()
 }
@@ -100,7 +107,9 @@ fn a_bundle_transferred_in_chunks_across_a_restart_unpacks_correctly() {
     let reception = Reception::open(store.root()).unwrap();
     reception.begin(&expect).unwrap();
     let first_leg = bundle.len() / 3;
-    reception.append(ReleaseId(44), 0, &bundle[..first_leg]).unwrap();
+    reception
+        .append(ReleaseId(44), 0, &bundle[..first_leg])
+        .unwrap();
     drop(reception);
 
     // Restart: a fresh Reception must find the partial transfer and resume.
@@ -111,14 +120,19 @@ fn a_bundle_transferred_in_chunks_across_a_restart_unpacks_correctly() {
     assert!(!resumed[0].complete());
 
     let offset = reception.offset(ReleaseId(44));
-    reception.append_stream(ReleaseId(44), &bundle[offset as usize..]).unwrap();
+    reception
+        .append_stream(ReleaseId(44), &bundle[offset as usize..])
+        .unwrap();
 
     let path = reception.finish(ReleaseId(44)).unwrap();
     assert_eq!(digest_file(&path).unwrap(), expect.digest);
 
     // The resumed file must be a working bundle, not merely the right length.
-    let unpacked =
-        UnpackedBundle::unpack(std::fs::File::open(&path).unwrap(), dir.path().join("staged")).unwrap();
+    let unpacked = UnpackedBundle::unpack(
+        std::fs::File::open(&path).unwrap(),
+        dir.path().join("staged"),
+    )
+    .unwrap();
     assert_eq!(unpacked.manifest.release, ReleaseId(44));
     assert_eq!(unpacked.deployment.services.len(), 1);
     unpacked.verify().unwrap();
@@ -135,7 +149,9 @@ fn a_resumed_transfer_is_still_subject_to_signature_checks() {
     reception.begin(&expectation(45, &bundle)).unwrap();
     reception.append(ReleaseId(45), 0, &bundle[..500]).unwrap();
     let offset = reception.offset(ReleaseId(45));
-    reception.append_stream(ReleaseId(45), &bundle[offset as usize..]).unwrap();
+    reception
+        .append_stream(ReleaseId(45), &bundle[offset as usize..])
+        .unwrap();
     let path = reception.finish(ReleaseId(45)).unwrap();
 
     // Trusted key: accepted.
@@ -157,7 +173,10 @@ fn a_resumed_transfer_is_still_subject_to_signature_checks() {
         &wrong,
     )
     .unwrap_err();
-    assert!(matches!(err, via_bundle::Error::UntrustedSigner { .. }), "{err}");
+    assert!(
+        matches!(err, via_bundle::Error::UntrustedSigner { .. }),
+        "{err}"
+    );
 }
 
 #[test]
@@ -171,7 +190,9 @@ fn a_transfer_truncated_at_a_chunk_boundary_is_caught_not_deployed() {
 
     let reception = Reception::open(store.root()).unwrap();
     reception.begin(&expect).unwrap();
-    reception.append(ReleaseId(46), 0, &bundle[..bundle.len() - 100]).unwrap();
+    reception
+        .append(ReleaseId(46), 0, &bundle[..bundle.len() - 100])
+        .unwrap();
 
     let err = reception.finish(ReleaseId(46)).unwrap_err();
     assert!(matches!(err, Error::TransferIncomplete { .. }), "{err}");
@@ -218,7 +239,9 @@ fn many_small_chunks_reassemble_byte_for_byte() {
     let mut sizes = [7usize, 1, 4096, 33, 512].iter().cycle();
     while (at as usize) < bundle.len() {
         let n = (*sizes.next().unwrap()).min(bundle.len() - at as usize);
-        let p = reception.append(ReleaseId(48), at, &bundle[at as usize..at as usize + n]).unwrap();
+        let p = reception
+            .append(ReleaseId(48), at, &bundle[at as usize..at as usize + n])
+            .unwrap();
         at = p.received;
     }
 
@@ -242,7 +265,9 @@ fn transfers_for_different_releases_do_not_interfere() {
 
     for (release, bundle) in &bundles {
         let offset = reception.offset(ReleaseId(*release));
-        reception.append_stream(ReleaseId(*release), &bundle[offset as usize..]).unwrap();
+        reception
+            .append_stream(ReleaseId(*release), &bundle[offset as usize..])
+            .unwrap();
         let path = reception.finish(ReleaseId(*release)).unwrap();
         assert_eq!(&std::fs::read(&path).unwrap(), bundle);
     }

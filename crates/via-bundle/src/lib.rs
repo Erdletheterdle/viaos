@@ -54,7 +54,11 @@ pub use writer::{BundleWriter, DEFAULT_COMPRESSION};
 #[derive(Debug, ThisError)]
 pub enum Error {
     #[error("{path}: {source}")]
-    Io { path: String, #[source] source: std::io::Error },
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("malformed archive: {0}")]
     Tar(#[source] std::io::Error),
@@ -65,7 +69,9 @@ pub enum Error {
     #[error("bundle schema version {found} is not supported by this build (supports {supported})")]
     UnsupportedSchema { found: u32, supported: u32 },
 
-    #[error("deployment schema version {found} is not supported by this build (supports {supported})")]
+    #[error(
+        "deployment schema version {found} is not supported by this build (supports {supported})"
+    )]
     UnsupportedDeploymentSchema { found: u32, supported: u32 },
 
     #[error("bundle contains no {}", MANIFEST_PATH)]
@@ -78,16 +84,28 @@ pub enum Error {
     MalformedBlobPath { path: String },
 
     #[error("blob digest mismatch: expected {expected}, got {actual}")]
-    BlobDigestMismatch { expected: via_core::Digest, actual: via_core::Digest },
+    BlobDigestMismatch {
+        expected: via_core::Digest,
+        actual: via_core::Digest,
+    },
 
     #[error("deployment.json digest mismatch: expected {expected}, got {actual}")]
-    DeploymentDigestMismatch { expected: via_core::Digest, actual: via_core::Digest },
+    DeploymentDigestMismatch {
+        expected: via_core::Digest,
+        actual: via_core::Digest,
+    },
 
     #[error("compose.yaml digest mismatch: expected {expected}, got {actual}")]
-    ComposeDigestMismatch { expected: via_core::Digest, actual: via_core::Digest },
+    ComposeDigestMismatch {
+        expected: via_core::Digest,
+        actual: via_core::Digest,
+    },
 
     #[error("bundle is incomplete: {missing} blob(s) missing, starting with {first}")]
-    IncompleteBundle { missing: usize, first: via_core::Digest },
+    IncompleteBundle {
+        missing: usize,
+        first: via_core::Digest,
+    },
 
     #[error("archive is not a docker image archive (no index.json)")]
     NotAnImageArchive,
@@ -130,7 +148,10 @@ pub enum Error {
 
 impl Error {
     pub(crate) fn io(path: impl AsRef<Path>, source: std::io::Error) -> Self {
-        Error::Io { path: path.as_ref().display().to_string(), source }
+        Error::Io {
+            path: path.as_ref().display().to_string(),
+            source,
+        }
     }
 
     pub(crate) fn tar(source: std::io::Error) -> Self {

@@ -59,7 +59,11 @@ impl Progress {
     }
 
     pub fn percent(&self) -> f64 {
-        if self.total == 0 { 100.0 } else { 100.0 * self.received as f64 / self.total as f64 }
+        if self.total == 0 {
+            100.0
+        } else {
+            100.0 * self.received as f64 / self.total as f64
+        }
     }
 
     pub fn remaining(&self) -> u64 {
@@ -112,8 +116,11 @@ impl Reception {
             }
         }
         let meta = self.meta_path(expect.release);
-        std::fs::write(&meta, serde_json::to_vec_pretty(expect).map_err(Error::json)?)
-            .map_err(|e| Error::io(&meta, e))?;
+        std::fs::write(
+            &meta,
+            serde_json::to_vec_pretty(expect).map_err(Error::json)?,
+        )
+        .map_err(|e| Error::io(&meta, e))?;
 
         Ok(Progress {
             release: expect.release,
@@ -139,7 +146,9 @@ impl Reception {
     /// This is the actual length of the partial file, never a separately
     /// recorded counter, so it cannot disagree with what is on disk.
     pub fn offset(&self, release: ReleaseId) -> u64 {
-        std::fs::metadata(self.part_path(release)).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(self.part_path(release))
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     /// Progress of an in-flight transfer.
@@ -162,8 +171,12 @@ impl Reception {
         };
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else { continue };
-            let Ok(id) = stem.parse::<u64>() else { continue };
+            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+                continue;
+            };
+            let Ok(id) = stem.parse::<u64>() else {
+                continue;
+            };
             if let Some(p) = self.progress(ReleaseId(id))? {
                 out.push(p);
             }
@@ -185,7 +198,11 @@ impl Reception {
         let path = self.part_path(release);
         let current = self.offset(release);
         if at != current {
-            return Err(Error::TransferOffsetMismatch { release, expected: current, got: at });
+            return Err(Error::TransferOffsetMismatch {
+                release,
+                expected: current,
+                got: at,
+            });
         }
         if current + bytes.len() as u64 > expect.size {
             return Err(Error::TransferOverrun {
@@ -205,16 +222,26 @@ impl Reception {
         let received = current + bytes.len() as u64;
         // Sync on interval boundaries and at the end, so a crash costs at most
         // one interval of re-download.
-        if received >= expect.size || received / SYNC_INTERVAL_BYTES != current / SYNC_INTERVAL_BYTES {
+        if received >= expect.size
+            || received / SYNC_INTERVAL_BYTES != current / SYNC_INTERVAL_BYTES
+        {
             file.sync_data().map_err(|e| Error::io(&path, e))?;
         }
 
-        Ok(Progress { release, received, total: expect.size })
+        Ok(Progress {
+            release,
+            received,
+            total: expect.size,
+        })
     }
 
     /// Consume a whole stream into the partial file, resuming where it left
     /// off. The reader must already be positioned at [`Self::offset`].
-    pub fn append_stream(&self, release: ReleaseId, mut source: impl Read) -> Result<Progress, Error> {
+    pub fn append_stream(
+        &self,
+        release: ReleaseId,
+        mut source: impl Read,
+    ) -> Result<Progress, Error> {
         let mut buf = vec![0u8; 256 * 1024];
         let mut at = self.offset(release);
         let mut progress = self
@@ -222,7 +249,9 @@ impl Reception {
             .ok_or(Error::NoTransferInProgress { release })?;
 
         loop {
-            let n = source.read(&mut buf).map_err(|e| Error::io(self.part_path(release), e))?;
+            let n = source
+                .read(&mut buf)
+                .map_err(|e| Error::io(self.part_path(release), e))?;
             if n == 0 {
                 return Ok(progress);
             }
@@ -242,7 +271,11 @@ impl Reception {
 
         let received = self.offset(release);
         if received != expect.size {
-            return Err(Error::TransferIncomplete { release, received, expected: expect.size });
+            return Err(Error::TransferIncomplete {
+                release,
+                received,
+                expected: expect.size,
+            });
         }
 
         let path = self.part_path(release);
@@ -251,7 +284,11 @@ impl Reception {
             // Do not keep bytes that failed verification: on the next attempt
             // they would look like resumable progress.
             self.discard(release)?;
-            return Err(Error::TransferDigestMismatch { release, expected: expect.digest, actual });
+            return Err(Error::TransferDigestMismatch {
+                release,
+                expected: expect.digest,
+                actual,
+            });
         }
 
         let done = self.root.join(format!("{release}.bundle.zst"));
@@ -343,7 +380,10 @@ mod tests {
         let r2 = Reception::open(_d.path()).unwrap();
         let offset = r2.offset(ReleaseId(44));
         assert_eq!(offset, cut as u64);
-        assert_eq!(r2.progress(ReleaseId(44)).unwrap().unwrap().remaining(), 8_000);
+        assert_eq!(
+            r2.progress(ReleaseId(44)).unwrap().unwrap().remaining(),
+            8_000
+        );
 
         r2.append(ReleaseId(44), offset, &payload[cut..]).unwrap();
         let path = r2.finish(ReleaseId(44)).unwrap();
@@ -393,7 +433,11 @@ mod tests {
 
         let err = r.finish(ReleaseId(44)).unwrap_err();
         assert!(matches!(err, Error::TransferDigestMismatch { .. }), "{err}");
-        assert_eq!(r.offset(ReleaseId(44)), 0, "failed bytes must not look like progress");
+        assert_eq!(
+            r.offset(ReleaseId(44)),
+            0,
+            "failed bytes must not look like progress"
+        );
     }
 
     #[test]
@@ -407,7 +451,10 @@ mod tests {
         // Same release number, different artifact.
         let second = vec![2u8; 900];
         let progress = r.begin(&expectation(&second)).unwrap();
-        assert_eq!(progress.received, 0, "bytes from a different artifact must not be reused");
+        assert_eq!(
+            progress.received, 0,
+            "bytes from a different artifact must not be reused"
+        );
         assert_eq!(progress.total, 900);
     }
 
@@ -420,7 +467,10 @@ mod tests {
         r.append(ReleaseId(44), 0, &payload[..700]).unwrap();
 
         let progress = r.begin(&expect).unwrap();
-        assert_eq!(progress.received, 700, "re-declaring the same transfer must not restart it");
+        assert_eq!(
+            progress.received, 700,
+            "re-declaring the same transfer must not restart it"
+        );
     }
 
     #[test]

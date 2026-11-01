@@ -58,7 +58,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,rmcp=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,rmcp=warn".into()),
         )
         .init();
 
@@ -78,13 +79,21 @@ async fn main() -> Result<()> {
             }
         }
         Command::Mcp => {
-            device.serve(rmcp::transport::stdio()).await?.waiting().await?;
+            device
+                .serve(rmcp::transport::stdio())
+                .await?
+                .waiting()
+                .await?;
         }
         Command::Health => {
             println!("{}", serde_json::to_string_pretty(&device.health().await)?);
         }
         Command::Ready { timeout_secs } => {
-            ready::run(cfg.control.is_some(), std::time::Duration::from_secs(timeout_secs)).await?;
+            ready::run(
+                cfg.control.is_some(),
+                std::time::Duration::from_secs(timeout_secs),
+            )
+            .await?;
         }
     }
     Ok(())

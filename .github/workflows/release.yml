@@ -5,6 +5,11 @@
 #   VIA_SERVER       https://via.example.com
 #   VIA_TOKEN        an admin token: `via-server token create ci`
 #   VIA_SIGNING_KEY  the contents of a key from `via keygen`
+#
+# and, to sign for Secure Boot, optionally:
+#
+#   VIA_SECURE_BOOT_KEYS  `tar -C <dir> -c . | base64 -w0` of the directory
+#                         from `via secure-boot keygen`
 name: release
 
 on:
@@ -28,6 +33,9 @@ jobs:
       # An image build needs more disk than a runner has free.
       - uses: jlumbroso/free-disk-space@main
       - uses: cachix/install-nix-action@v31
+      # systemd-repart builds the image in a user namespace, which Ubuntu's
+      # AppArmor policy forbids by default.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: nix build .#via -o via
       - run: nix build .#images.${{ matrix.arch }} -o image
       - run: nix build .#updates.${{ matrix.arch }} -o update
@@ -36,9 +44,15 @@ jobs:
           VIA_SERVER: ${{ secrets.VIA_SERVER }}
           VIA_TOKEN: ${{ secrets.VIA_TOKEN }}
           VIA_SIGNING_KEY_HEX: ${{ secrets.VIA_SIGNING_KEY }}
+          SECURE_BOOT_TAR: ${{ secrets.VIA_SECURE_BOOT_KEYS }}
         run: |
           umask 077
           printf '%s\n' "$VIA_SIGNING_KEY_HEX" > "$RUNNER_TEMP/key"
+          if [ -n "$SECURE_BOOT_TAR" ]; then
+            mkdir "$RUNNER_TEMP/sb"
+            printf '%s' "$SECURE_BOOT_TAR" | base64 -d | tar -C "$RUNNER_TEMP/sb" -x
+            export VIA_SECURE_BOOT_KEYS="$RUNNER_TEMP/sb"
+          fi
           via/bin/via os-release update --sign-key "$RUNNER_TEMP/key"
           via/bin/via base-image image/viaos_$(cat VERSION).raw --arch ${{ matrix.arch }}
-          rm "$RUNNER_TEMP/key"
+          rm -rf "$RUNNER_TEMP/key" "$RUNNER_TEMP/sb"

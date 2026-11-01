@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 
 use via_core::{Deployment, Digest};
 
+use crate::Error;
 use crate::manifest::*;
 use crate::oci::{self, blob_path};
 use crate::signing::{BundleSignature, SIGNATURE_PATH, TrustPolicy, Verified};
-use crate::Error;
 
 /// Read just the manifest from the front of a bundle stream.
 ///
@@ -23,7 +23,9 @@ pub fn peek_manifest(source: impl Read) -> Result<BundleManifest, Error> {
         let path = entry.path().map_err(Error::tar)?.into_owned();
         if path.to_string_lossy().trim_start_matches("./") == MANIFEST_PATH {
             let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).map_err(|e| Error::io(&path, e))?;
+            entry
+                .read_to_end(&mut buf)
+                .map_err(|e| Error::io(&path, e))?;
             let manifest: BundleManifest = serde_json::from_slice(&buf).map_err(Error::json)?;
             manifest.check_supported()?;
             return Ok(manifest);
@@ -54,12 +56,16 @@ pub fn peek_signature(
         match path.to_string_lossy().trim_start_matches("./") {
             MANIFEST_PATH => {
                 let mut buf = Vec::new();
-                entry.read_to_end(&mut buf).map_err(|e| Error::io(&path, e))?;
+                entry
+                    .read_to_end(&mut buf)
+                    .map_err(|e| Error::io(&path, e))?;
                 manifest_bytes = Some(buf);
             }
             SIGNATURE_PATH => {
                 let mut buf = Vec::new();
-                entry.read_to_end(&mut buf).map_err(|e| Error::io(&path, e))?;
+                entry
+                    .read_to_end(&mut buf)
+                    .map_err(|e| Error::io(&path, e))?;
                 signature = Some(serde_json::from_slice(&buf).map_err(Error::json)?);
             }
             // Both live at the head of the archive; anything else means we
@@ -130,7 +136,9 @@ impl UnpackedBundle {
             match name.as_str() {
                 MANIFEST_PATH => {
                     let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).map_err(|e| Error::io(&raw, e))?;
+                    entry
+                        .read_to_end(&mut buf)
+                        .map_err(|e| Error::io(&raw, e))?;
                     let m: BundleManifest = serde_json::from_slice(&buf).map_err(Error::json)?;
                     m.check_supported()?;
                     manifest = Some(m);
@@ -142,7 +150,9 @@ impl UnpackedBundle {
                 }
                 SIGNATURE_PATH => {
                     let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).map_err(|e| Error::io(&raw, e))?;
+                    entry
+                        .read_to_end(&mut buf)
+                        .map_err(|e| Error::io(&raw, e))?;
                     let sig: BundleSignature = serde_json::from_slice(&buf).map_err(Error::json)?;
                     let bytes = manifest_bytes.as_deref().ok_or(Error::MissingManifest)?;
                     // Verify here, before a single blob is written, so an
@@ -152,30 +162,43 @@ impl UnpackedBundle {
                 }
                 DEPLOYMENT_PATH => {
                     let mut buf = Vec::new();
-                    entry.read_to_end(&mut buf).map_err(|e| Error::io(&raw, e))?;
+                    entry
+                        .read_to_end(&mut buf)
+                        .map_err(|e| Error::io(&raw, e))?;
                     deployment_bytes = Some(buf);
                 }
                 COMPOSE_PATH => {
                     let mut buf = String::new();
-                    entry.read_to_string(&mut buf).map_err(|e| Error::io(&raw, e))?;
+                    entry
+                        .read_to_string(&mut buf)
+                        .map_err(|e| Error::io(&raw, e))?;
                     compose_source = Some(buf);
                 }
                 other => {
-                    let Some(segment) = other.strip_prefix(BLOB_PREFIX) else { continue };
+                    let Some(segment) = other.strip_prefix(BLOB_PREFIX) else {
+                        continue;
+                    };
                     // A tar path is attacker-controlled input. Only a bare,
                     // well-formed digest segment is ever written, so a crafted
                     // `../../etc` path cannot escape the blob directory.
-                    let digest = Digest::parse(segment.replacen('-', ":", 1))
-                        .map_err(|_| Error::MalformedBlobPath { path: other.to_string() })?;
+                    let digest = Digest::parse(segment.replacen('-', ":", 1)).map_err(|_| {
+                        Error::MalformedBlobPath {
+                            path: other.to_string(),
+                        }
+                    })?;
 
                     let dest_path = blob_dir.join(digest.to_path_segment());
-                    let mut file = std::fs::File::create(&dest_path).map_err(|e| Error::io(&dest_path, e))?;
+                    let mut file =
+                        std::fs::File::create(&dest_path).map_err(|e| Error::io(&dest_path, e))?;
                     let actual = copy_and_digest(&mut entry, &mut file)?;
                     file.flush().map_err(|e| Error::io(&dest_path, e))?;
 
                     if actual != digest {
                         let _ = std::fs::remove_file(&dest_path);
-                        return Err(Error::BlobDigestMismatch { expected: digest, actual });
+                        return Err(Error::BlobDigestMismatch {
+                            expected: digest,
+                            actual,
+                        });
                     }
                     seen.push(digest);
                 }
@@ -202,20 +225,31 @@ impl UnpackedBundle {
         if let (Some(expected), Some(src)) = (&manifest.compose_digest, &compose_source) {
             let actual = Digest::sha256_of(src.as_bytes());
             if &actual != expected {
-                return Err(Error::ComposeDigestMismatch { expected: expected.clone(), actual });
+                return Err(Error::ComposeDigestMismatch {
+                    expected: expected.clone(),
+                    actual,
+                });
             }
         }
 
         // Every blob the manifest promises must actually be here. A truncated
         // transfer that happened to end on an entry boundary would otherwise
         // look like a valid bundle right up until Docker failed to load it.
-        let missing: Vec<Digest> =
-            manifest.blobs.iter().filter(|b| !seen.contains(&b.digest)).map(|b| b.digest.clone()).collect();
+        let missing: Vec<Digest> = manifest
+            .blobs
+            .iter()
+            .filter(|b| !seen.contains(&b.digest))
+            .map(|b| b.digest.clone())
+            .collect();
         if !missing.is_empty() {
-            return Err(Error::IncompleteBundle { missing: missing.len(), first: missing[0].clone() });
+            return Err(Error::IncompleteBundle {
+                missing: missing.len(),
+                first: missing[0].clone(),
+            });
         }
 
-        let deployment: Deployment = serde_json::from_slice(&deployment_bytes).map_err(Error::json)?;
+        let deployment: Deployment =
+            serde_json::from_slice(&deployment_bytes).map_err(Error::json)?;
         if deployment.schema_version != via_core::DEPLOYMENT_SCHEMA_VERSION {
             return Err(Error::UnsupportedDeploymentSchema {
                 found: deployment.schema_version,
@@ -223,7 +257,13 @@ impl UnpackedBundle {
             });
         }
 
-        Ok(Self { manifest, deployment, compose_source, blob_dir, trust })
+        Ok(Self {
+            manifest,
+            deployment,
+            compose_source,
+            blob_dir,
+            trust,
+        })
     }
 
     /// Re-verify blobs already on disk.
@@ -236,7 +276,10 @@ impl UnpackedBundle {
             let mut file = std::fs::File::open(&path).map_err(|e| Error::io(&path, e))?;
             let actual = copy_and_digest(&mut file, &mut std::io::sink())?;
             if actual != blob.digest {
-                return Err(Error::BlobDigestMismatch { expected: blob.digest.clone(), actual });
+                return Err(Error::BlobDigestMismatch {
+                    expected: blob.digest.clone(),
+                    actual,
+                });
             }
         }
         Ok(())
@@ -269,13 +312,15 @@ fn copy_and_digest(from: &mut impl Read, to: &mut impl Write) -> Result<Digest, 
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = from.read(&mut buf).map_err(|e| Error::io(Path::new("<blob>"), e))?;
+        let n = from
+            .read(&mut buf)
+            .map_err(|e| Error::io(Path::new("<blob>"), e))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
-        to.write_all(&buf[..n]).map_err(|e| Error::io(Path::new("<blob>"), e))?;
+        to.write_all(&buf[..n])
+            .map_err(|e| Error::io(Path::new("<blob>"), e))?;
     }
-    Digest::parse(format!("sha256:{}", hex::encode(hasher.finalize())))
-        .map_err(Error::Core)
+    Digest::parse(format!("sha256:{}", hex::encode(hasher.finalize()))).map_err(Error::Core)
 }

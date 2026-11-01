@@ -92,8 +92,16 @@ fn make_docker_archive(images: &[FakeImage]) -> Vec<u8> {
         "mediaType": "application/vnd.oci.image.index.v1+json",
         "manifests": index_manifests,
     });
-    tar_append(&mut builder, "index.json", &serde_json::to_vec(&index).unwrap());
-    tar_append(&mut builder, "oci-layout", br#"{"imageLayoutVersion": "1.0.0"}"#);
+    tar_append(
+        &mut builder,
+        "index.json",
+        &serde_json::to_vec(&index).unwrap(),
+    );
+    tar_append(
+        &mut builder,
+        "oci-layout",
+        br#"{"imageLayoutVersion": "1.0.0"}"#,
+    );
 
     builder.into_inner().unwrap()
 }
@@ -109,7 +117,8 @@ fn image(reference: &str, layers: &[&str]) -> FakeImage {
 fn deployment_with(images: &[(&str, &str)]) -> Deployment {
     let mut d = Deployment::new("demo-stack", Platform::new("linux", "arm64"));
     for (svc, img) in images {
-        d.services.insert(svc.to_string(), Service::new(*svc, ImageRef::new(*img)));
+        d.services
+            .insert(svc.to_string(), Service::new(*svc, ImageRef::new(*img)));
     }
     d
 }
@@ -126,8 +135,12 @@ fn writer() -> BundleWriter {
 #[test]
 fn bundle_round_trips_with_contents_intact() {
     let archive = make_docker_archive(&[image("app:v44", &["layer-a", "layer-b"])]);
-    let mut w = writer().created_at("2026-08-22T13:45:00Z").builder("via/test");
-    let added = w.add_docker_archive(&archive[..], |name| name.map(str::to_string)).unwrap();
+    let mut w = writer()
+        .created_at("2026-08-22T13:45:00Z")
+        .builder("via/test");
+    let added = w
+        .add_docker_archive(&archive[..], |name| name.map(str::to_string))
+        .unwrap();
     assert_eq!(added, 1);
 
     let deployment = w.digest_deployment(&deployment_with(&[("app", "app:v44")]));
@@ -136,26 +149,46 @@ fn bundle_round_trips_with_contents_intact() {
         "the manifest should identify images by digest, not just by tag"
     );
 
-    let bytes = w.finish(Vec::new(), &deployment, Some("services:\n  app:\n    image: app:v44\n")).unwrap();
+    let bytes = w
+        .finish(
+            Vec::new(),
+            &deployment,
+            Some("services:\n  app:\n    image: app:v44\n"),
+        )
+        .unwrap();
 
     let dir = tempfile::TempDir::new().unwrap();
     let unpacked = UnpackedBundle::unpack(&bytes[..], dir.path()).unwrap();
 
     assert_eq!(unpacked.manifest.app.as_str(), "demo-stack");
     assert_eq!(unpacked.manifest.release, ReleaseId(44));
-    assert_eq!(unpacked.manifest.created_at.as_deref(), Some("2026-08-22T13:45:00Z"));
+    assert_eq!(
+        unpacked.manifest.created_at.as_deref(),
+        Some("2026-08-22T13:45:00Z")
+    );
     assert_eq!(unpacked.manifest.images.len(), 1);
     assert_eq!(unpacked.deployment.services.len(), 1);
-    assert!(unpacked.compose_source.as_deref().unwrap().contains("app:v44"));
-    unpacked.verify().expect("blobs on disk should still verify");
+    assert!(
+        unpacked
+            .compose_source
+            .as_deref()
+            .unwrap()
+            .contains("app:v44")
+    );
+    unpacked
+        .verify()
+        .expect("blobs on disk should still verify");
 }
 
 #[test]
 fn manifest_can_be_read_without_unpacking_the_blobs() {
     let archive = make_docker_archive(&[image("app:v44", &["a"])]);
     let mut w = writer();
-    w.add_docker_archive(&archive[..], |n| n.map(str::to_string)).unwrap();
-    let bytes = w.finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None).unwrap();
+    w.add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
+    let bytes = w
+        .finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None)
+        .unwrap();
 
     let manifest = peek_manifest(&bytes[..]).unwrap();
     assert_eq!(manifest.release, ReleaseId(44));
@@ -170,7 +203,8 @@ fn shared_layers_are_stored_once() {
         image("worker:v44", &["shared-base", "worker-specific"]),
     ]);
     let mut w = writer();
-    w.add_docker_archive(&archive[..], |n| n.map(str::to_string)).unwrap();
+    w.add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
     let deployment = deployment_with(&[("app", "app:v44"), ("worker", "worker:v44")]);
     let bytes = w.finish(Vec::new(), &deployment, None).unwrap();
 
@@ -188,8 +222,11 @@ fn shared_layers_are_stored_once() {
 fn missing_blobs_computes_the_transfer_plan() {
     let archive = make_docker_archive(&[image("app:v44", &["a", "b", "c"])]);
     let mut w = writer();
-    w.add_docker_archive(&archive[..], |n| n.map(str::to_string)).unwrap();
-    let bytes = w.finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None).unwrap();
+    w.add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
+    let bytes = w
+        .finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None)
+        .unwrap();
     let manifest = peek_manifest(&bytes[..]).unwrap();
 
     let all = manifest.blobs.len();
@@ -208,28 +245,37 @@ fn a_deployment_referencing_an_absent_image_is_refused_at_build_time() {
     // would need a registry on a device that has no credentials for one.
     let archive = make_docker_archive(&[image("app:v44", &["a"])]);
     let mut w = writer();
-    w.add_docker_archive(&archive[..], |n| n.map(str::to_string)).unwrap();
+    w.add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
 
     let deployment = deployment_with(&[("app", "app:v44"), ("db", "postgres:17")]);
     let err = w.finish(Vec::new(), &deployment, None).unwrap_err();
     let msg = err.to_string();
     assert!(matches!(err, Error::MissingImages { .. }), "{msg}");
     assert!(msg.contains("postgres:17"), "{msg}");
-    assert!(msg.contains("self-contained"), "the message should explain why: {msg}");
+    assert!(
+        msg.contains("self-contained"),
+        "the message should explain why: {msg}"
+    );
 }
 
 #[test]
 fn a_corrupted_blob_is_detected_before_anything_reaches_docker() {
     let archive = make_docker_archive(&[image("app:v44", &["payload-to-corrupt"])]);
     let mut w = writer();
-    w.add_docker_archive(&archive[..], |n| n.map(str::to_string)).unwrap();
-    let bytes = w.finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None).unwrap();
+    w.add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
+    let bytes = w
+        .finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None)
+        .unwrap();
 
     // Flip a byte inside the compressed stream and reassemble a valid archive
     // with one wrong blob body.
     let dir = tempfile::TempDir::new().unwrap();
     let unpacked = UnpackedBundle::unpack(&bytes[..], dir.path()).unwrap();
-    let target = unpacked.blob_dir.join(Digest::sha256_of(b"payload-to-corrupt").to_path_segment());
+    let target = unpacked
+        .blob_dir
+        .join(Digest::sha256_of(b"payload-to-corrupt").to_path_segment());
     let mut f = std::fs::File::create(&target).unwrap();
     f.write_all(b"tampered").unwrap();
     drop(f);
@@ -242,8 +288,11 @@ fn a_corrupted_blob_is_detected_before_anything_reaches_docker() {
 fn a_truncated_bundle_is_rejected_rather_than_partially_applied() {
     let archive = make_docker_archive(&[image("app:v44", &["a", "b", "c"])]);
     let mut w = writer();
-    w.add_docker_archive(&archive[..], |n| n.map(str::to_string)).unwrap();
-    let bytes = w.finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None).unwrap();
+    w.add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
+    let bytes = w
+        .finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None)
+        .unwrap();
 
     let dir = tempfile::TempDir::new().unwrap();
     let truncated = &bytes[..bytes.len() / 2];
@@ -270,8 +319,11 @@ fn only_the_target_platform_is_carried() {
         },
     ]);
     let mut w = writer();
-    w.add_docker_archive(&archive[..], |n| n.map(str::to_string)).unwrap();
-    let bytes = w.finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None).unwrap();
+    w.add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
+    let bytes = w
+        .finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None)
+        .unwrap();
     let manifest = peek_manifest(&bytes[..]).unwrap();
 
     let amd = Digest::sha256_of(b"amd-layer");
@@ -286,8 +338,15 @@ fn images_can_be_retagged_on_the_way_into_the_bundle() {
     // The tag Docker built under is rarely the tag the deployment refers to.
     let archive = make_docker_archive(&[image("localhost/scratch-build:tmp", &["a"])]);
     let mut w = writer();
-    w.add_docker_archive(&archive[..], |_| Some("demo-stack/app:44".to_string())).unwrap();
-    let bytes = w.finish(Vec::new(), &deployment_with(&[("app", "demo-stack/app:44")]), None).unwrap();
+    w.add_docker_archive(&archive[..], |_| Some("demo-stack/app:44".to_string()))
+        .unwrap();
+    let bytes = w
+        .finish(
+            Vec::new(),
+            &deployment_with(&[("app", "demo-stack/app:44")]),
+            None,
+        )
+        .unwrap();
     let manifest = peek_manifest(&bytes[..]).unwrap();
     assert_eq!(manifest.images[0].reference, "demo-stack/app:44");
 }
@@ -296,8 +355,11 @@ fn images_can_be_retagged_on_the_way_into_the_bundle() {
 fn a_docker_load_archive_can_be_regenerated_from_the_bundle() {
     let archive = make_docker_archive(&[image("app:v44", &["a", "b"])]);
     let mut w = writer();
-    w.add_docker_archive(&archive[..], |n| n.map(str::to_string)).unwrap();
-    let bytes = w.finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None).unwrap();
+    w.add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
+    let bytes = w
+        .finish(Vec::new(), &deployment_with(&[("app", "app:v44")]), None)
+        .unwrap();
 
     let dir = tempfile::TempDir::new().unwrap();
     let unpacked = UnpackedBundle::unpack(&bytes[..], dir.path()).unwrap();
@@ -313,5 +375,8 @@ fn a_docker_load_archive_can_be_regenerated_from_the_bundle() {
     assert!(names.iter().any(|n| n == "oci-layout"), "{names:?}");
     assert!(names.iter().any(|n| n == "index.json"), "{names:?}");
     assert!(names.iter().any(|n| n == "manifest.json"), "{names:?}");
-    assert!(names.iter().any(|n| n.starts_with("blobs/sha256/")), "{names:?}");
+    assert!(
+        names.iter().any(|n| n.starts_with("blobs/sha256/")),
+        "{names:?}"
+    );
 }

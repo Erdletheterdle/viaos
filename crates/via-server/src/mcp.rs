@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Implementation, JsonObject, ServerCapabilities, ServerConfig};
+use rmcp::model::{
+    CallToolResult, ContentBlock, Implementation, JsonObject, ServerCapabilities, ServerConfig,
+};
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
@@ -156,7 +158,11 @@ fn rendered(value: Value) -> CallToolResult {
 }
 
 fn text_of(r: &CallToolResult) -> String {
-    r.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n")
+    r.content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn failed(e: anyhow::Error) -> CallToolResult {
@@ -165,12 +171,20 @@ fn failed(e: anyhow::Error) -> CallToolResult {
 
 impl Fleet {
     pub fn new(state: Arc<State>) -> Self {
-        Self { state, tool_router: Self::tool_router() }
+        Self {
+            state,
+            tool_router: Self::tool_router(),
+        }
     }
 
     /// Run a tool body, record it in the audit log, and turn its error into
     /// something the model can read.
-    async fn audited<F>(&self, tool: &str, args: Value, body: F) -> Result<CallToolResult, ErrorData>
+    async fn audited<F>(
+        &self,
+        tool: &str,
+        args: Value,
+        body: F,
+    ) -> Result<CallToolResult, ErrorData>
     where
         F: std::future::Future<Output = anyhow::Result<CallToolResult>>,
     {
@@ -181,7 +195,12 @@ impl Fleet {
         Ok(result.unwrap_or_else(failed))
     }
 
-    async fn forward(&self, device: &str, tool: &str, args: JsonObject) -> anyhow::Result<CallToolResult> {
+    async fn forward(
+        &self,
+        device: &str,
+        tool: &str,
+        args: JsonObject,
+    ) -> anyhow::Result<CallToolResult> {
         let d = self.state.db.resolve(device)?;
         self.state.hub.call(&d.id, tool, args).await
     }
@@ -203,7 +222,11 @@ impl Fleet {
     }
 
     /// The devices a fleet-or-device argument pair names.
-    fn targets(&self, fleet: &Option<String>, device: &Option<String>) -> anyhow::Result<Vec<crate::db::Device>> {
+    fn targets(
+        &self,
+        fleet: &Option<String>,
+        device: &Option<String>,
+    ) -> anyhow::Result<Vec<crate::db::Device>> {
         match (fleet, device) {
             (Some(f), None) => {
                 let d = self.state.db.devices(Some(f))?;
@@ -226,7 +249,8 @@ impl Fleet {
     ) -> Vec<Value> {
         let mut results = Vec::new();
         for d in devices {
-            let skip = skip(&d).or_else(|| (!self.state.hub.is_online(&d.id)).then(|| "offline".to_string()));
+            let skip = skip(&d)
+                .or_else(|| (!self.state.hub.is_online(&d.id)).then(|| "offline".to_string()));
             let mut r = json!({ "device": d.name, "id": d.id });
             match (skip, dry_run) {
                 (Some(reason), _) => r["skipped"] = json!(reason),
@@ -254,19 +278,28 @@ impl Fleet {
                 devices,
                 a.dry_run,
                 |d| {
-                    crate::releases::artifact(&root, &a.app, a.release, d.arch.as_deref().unwrap_or_default())
-                        .err()
-                        .map(|e| format!("{e:#}"))
+                    crate::releases::artifact(
+                        &root,
+                        &a.app,
+                        a.release,
+                        d.arch.as_deref().unwrap_or_default(),
+                    )
+                    .err()
+                    .map(|e| format!("{e:#}"))
                 },
                 |d| {
                     let arch = d.arch.clone().unwrap_or_default();
-                    let art = crate::releases::artifact(&root, &a.app, a.release, &arch).expect("checked in skip");
+                    let art = crate::releases::artifact(&root, &a.app, a.release, &arch)
+                        .expect("checked in skip");
                     let mut args = JsonObject::new();
                     args.insert("app".into(), json!(a.app));
                     args.insert("release".into(), json!(a.release));
                     args.insert(
                         "source".into(),
-                        json!(format!("{}/v1/releases/{}/{}/{arch}", s.public_url, a.app, a.release)),
+                        json!(format!(
+                            "{}/v1/releases/{}/{}/{arch}",
+                            s.public_url, a.app, a.release
+                        )),
                     );
                     args.insert("sha256".into(), json!(art.sha256));
                     ("deploy", args)
@@ -338,12 +371,17 @@ impl Fleet {
         // The token goes into the image and nowhere else: not into this
         // result, the audit log, or the server's own log.
         let id = crate::db::random_secret()[..24].to_string();
-        let token = s.db.mint_token(&a.fleet, a.hostname.as_deref(), 30 * 24 * 3600, Some(&id))?;
+        let token =
+            s.db.mint_token(&a.fleet, a.hostname.as_deref(), 30 * 24 * 3600, Some(&id))?;
         let mut toml = String::new();
         if let Some(h) = &a.hostname {
             toml += &format!("hostname = {}\n", toml_str(h));
         }
-        toml += &format!("\n[control]\nurl = {}\ntoken = {}\n", toml_str(&s.device_url), toml_str(&token));
+        toml += &format!(
+            "\n[control]\nurl = {}\ntoken = {}\n",
+            toml_str(&s.device_url),
+            toml_str(&token)
+        );
         if !a.ssh_keys.is_empty() {
             let keys: Vec<String> = a.ssh_keys.iter().map(|k| toml_str(k)).collect();
             toml += &format!("\n[ssh]\nauthorized_keys = [{}]\n", keys.join(", "));
@@ -402,9 +440,16 @@ impl Fleet {
         name = "create_fleet",
         description = "Create an empty fleet. Devices join it through a provisioning image. \
                        Does nothing if it already exists.",
-        annotations(title = "Create fleet", read_only_hint = false, destructive_hint = false)
+        annotations(
+            title = "Create fleet",
+            read_only_hint = false,
+            destructive_hint = false
+        )
     )]
-    async fn create_fleet(&self, Parameters(a): Parameters<FleetArg>) -> Result<CallToolResult, ErrorData> {
+    async fn create_fleet(
+        &self,
+        Parameters(a): Parameters<FleetArg>,
+    ) -> Result<CallToolResult, ErrorData> {
         self.audited("create_fleet", json!({ "fleet": a.fleet }), async {
             self.state.db.create_fleet(&a.fleet)?;
             Ok(rendered(json!({ "fleet": a.fleet })))
@@ -435,11 +480,19 @@ impl Fleet {
                        temperatures; the container engine; the running, previous and desired \
                        release; and every service's status and healthcheck. The first call for \
                        any question about one device. Needs the device online. Reads only.",
-        annotations(title = "Device health", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "Device health",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn device_health(&self, Parameters(a): Parameters<DeviceArg>) -> Result<CallToolResult, ErrorData> {
+    async fn device_health(
+        &self,
+        Parameters(a): Parameters<DeviceArg>,
+    ) -> Result<CallToolResult, ErrorData> {
         self.audited("device_health", json!({ "device": a.device }), async {
-            self.forward(&a.device, "device_health", JsonObject::new()).await
+            self.forward(&a.device, "device_health", JsonObject::new())
+                .await
         })
         .await
     }
@@ -448,7 +501,11 @@ impl Fleet {
         name = "logs",
         description = "Recent container output from a device's running release. Use after \
                        `device_health` names a service that is unhealthy or exited. Reads only.",
-        annotations(title = "Container logs", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "Container logs",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn logs(&self, Parameters(a): Parameters<LogsArgs>) -> Result<CallToolResult, ErrorData> {
         let args = json!({ "device": a.device, "service": a.service, "tail": a.tail });
@@ -469,16 +526,27 @@ impl Fleet {
         name = "journal",
         description = "A device's deploy journal, newest first: releases staged, activated, \
                        failed and rolled back. Reads only.",
-        annotations(title = "Deploy journal", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "Deploy journal",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
-    async fn journal(&self, Parameters(a): Parameters<JournalArgs>) -> Result<CallToolResult, ErrorData> {
-        self.audited("journal", json!({ "device": a.device, "limit": a.limit }), async {
-            let mut fwd = JsonObject::new();
-            if let Some(l) = a.limit {
-                fwd.insert("limit".into(), json!(l));
-            }
-            self.forward(&a.device, "journal", fwd).await
-        })
+    async fn journal(
+        &self,
+        Parameters(a): Parameters<JournalArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.audited(
+            "journal",
+            json!({ "device": a.device, "limit": a.limit }),
+            async {
+                let mut fwd = JsonObject::new();
+                if let Some(l) = a.limit {
+                    fwd.insert("limit".into(), json!(l));
+                }
+                self.forward(&a.device, "journal", fwd).await
+            },
+        )
         .await
     }
 
@@ -509,7 +577,11 @@ impl Fleet {
         description = "App releases the control plane holds, newest first, with the \
                        architectures each was built for. A device can only run a release built \
                        for its arch. Releases are uploaded with `via release`. Reads only.",
-        annotations(title = "List releases", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "List releases",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_releases(
         &self,
@@ -530,13 +602,23 @@ impl Fleet {
                        gate; one that fails is rolled back to its previous release on the \
                        device. Devices without a build for their arch, and offline devices, \
                        are skipped and reported.",
-        annotations(title = "Deploy release", read_only_hint = false, destructive_hint = true)
+        annotations(
+            title = "Deploy release",
+            read_only_hint = false,
+            destructive_hint = true
+        )
     )]
-    async fn deploy_tool(&self, Parameters(a): Parameters<DeployArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn deploy_tool(
+        &self,
+        Parameters(a): Parameters<DeployArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let args = json!({
             "app": a.app, "release": a.release, "fleet": a.fleet, "device": a.device, "dry_run": a.dry_run,
         });
-        self.audited("deploy", args, async { Ok(rendered(self.deploy(&a).await?)) }).await
+        self.audited("deploy", args, async {
+            Ok(rendered(self.deploy(&a).await?))
+        })
+        .await
     }
 
     #[tool(
@@ -544,11 +626,17 @@ impl Fleet {
         description = "OS versions the control plane can install, per architecture, with \
                        download size. Compare with each device's os_version from \
                        `list_devices`. Reads only.",
-        annotations(title = "List OS versions", read_only_hint = true, open_world_hint = false)
+        annotations(
+            title = "List OS versions",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn list_os_versions(&self) -> Result<CallToolResult, ErrorData> {
         self.audited("list_os_versions", json!({}), async {
-            Ok(rendered(json!({ "versions": crate::os::list(&self.state.os_dir) })))
+            Ok(rendered(
+                json!({ "versions": crate::os::list(&self.state.os_dir) }),
+            ))
         })
         .await
     }
@@ -563,9 +651,15 @@ impl Fleet {
                        devices are skipped and reported.",
         annotations(title = "Update OS", read_only_hint = false, destructive_hint = true)
     )]
-    async fn update_os_tool(&self, Parameters(a): Parameters<UpdateOsArgs>) -> Result<CallToolResult, ErrorData> {
+    async fn update_os_tool(
+        &self,
+        Parameters(a): Parameters<UpdateOsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         let args = json!({ "version": a.version, "fleet": a.fleet, "device": a.device, "dry_run": a.dry_run });
-        self.audited("update_os", args, async { Ok(rendered(self.update_os(&a).await?)) }).await
+        self.audited("update_os", args, async {
+            Ok(rendered(self.update_os(&a).await?))
+        })
+        .await
     }
 
     #[tool(
@@ -575,7 +669,11 @@ impl Fleet {
                        enrollment token that is never shown here: write the image to exactly \
                        one device. Make one image per device; for a Raspberry Pi and a PC, \
                        call this twice with `aarch64` and `x86_64`. Takes up to a minute.",
-        annotations(title = "Create provisioning image", read_only_hint = false, destructive_hint = false)
+        annotations(
+            title = "Create provisioning image",
+            read_only_hint = false,
+            destructive_hint = false
+        )
     )]
     async fn create_provisioning_image(
         &self,
@@ -617,7 +715,10 @@ impl ServerHandler for Fleet {
             .and_then(|a| a.read_only_hint)
             == Some(true);
         if caller.role == Role::Viewer && !read_only {
-            let msg = format!("{} is a viewer; `{}` needs an admin token", caller.name, request.name);
+            let msg = format!(
+                "{} is a viewer; `{}` needs an admin token",
+                caller.name, request.name
+            );
             return Ok(CallToolResult::error(vec![ContentBlock::text(msg)]).into());
         }
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);

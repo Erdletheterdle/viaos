@@ -10,7 +10,7 @@ On NixOS, with Caddy getting the certificate:
 
 ```nix
 {
-  inputs.viaos.url = "github:<you>/viaos";
+  inputs.viaos.url = "github:beigesys/viaos";
   outputs = { nixpkgs, viaos, ... }: {
     nixosConfigurations.via = nixpkgs.lib.nixosSystem {
       system = "x86_64-linux";
@@ -74,7 +74,28 @@ provisioning image made from then on writes that key into the device's
 are not signed by it. Keep the private key off the server: it belongs in
 CI or on the machine you release from.
 
-## 4. Give it an OS
+## 4. Secure Boot (optional)
+
+```bash
+via secure-boot keygen ~/.config/via/secure-boot
+export VIA_SECURE_BOOT_KEYS=~/.config/via/secure-boot
+```
+
+With that set, `via base-image` signs systemd-boot and the UKI on the
+image and puts the keys on its boot partition; `via os-release` signs each
+update's UKI. A device whose firmware is in setup mode (clear the keys in
+its firmware menu once) enrolls them on first boot, reboots, and from then
+on runs only what these keys signed. The UKI holds the kernel, initrd,
+command line and the root hash of the dm-verity /nix/store, so that is the
+whole OS. `device_status` shows `secure_boot`, and a device enforcing it
+refuses an OS update that was not signed for it.
+
+The keys replace the firmware's own, Microsoft's included. Hardware whose
+graphics or network card loads a Microsoft-signed option ROM at boot will
+not show a picture or PXE boot with only these keys. Keep the `.key` files
+off the server.
+
+## 5. Give it an OS
 
 ```bash
 export VIA_SERVER=https://via.example.com VIA_TOKEN=<token>
@@ -87,7 +108,7 @@ For each new OS version, bump `VERSION`, then run
 `nix build .#updates.x86_64 -o update` and `via os-release update`.
 `.github/workflows/release.yml` does both architectures on a `v<N>` tag.
 
-## 5. Point Claude at it
+## 6. Point Claude at it
 
 ```bash
 claude mcp add --transport http via https://via.example.com/mcp \

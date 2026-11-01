@@ -42,7 +42,14 @@
         {
           via-agent = via "via-agent" "via-agent" "viaos device agent";
           inherit via-server;
-          via = via "via-cli" "via" "viaos operator tools: flash, release, ssh";
+          # Secure Boot signing shells out to sbsign, openssl and efitools.
+          via = (via "via-cli" "via" "viaos operator tools: flash, release, ssh").override {
+            runtimeInputs = with pkgs; [
+              sbsigntool
+              openssl
+              efitools
+            ];
+          };
           default = self.packages.${pkgs.stdenv.hostPlatform.system}.via;
 
           # `docker load < result`, then run with VIA_PUBLIC_URL set and a

@@ -49,7 +49,12 @@ impl FakeRuntime {
     }
 
     fn behavior_for(&self, release: u64) -> Behavior {
-        self.behavior.lock().unwrap().get(&release).copied().unwrap_or(Behavior::Healthy)
+        self.behavior
+            .lock()
+            .unwrap()
+            .get(&release)
+            .copied()
+            .unwrap_or(Behavior::Healthy)
     }
 
     fn current(&self) -> Option<u64> {
@@ -75,7 +80,11 @@ impl FakeRuntime {
 #[async_trait]
 impl Runtime for FakeRuntime {
     async fn info(&self) -> Result<RuntimeInfo, via_runtime::Error> {
-        Ok(RuntimeInfo { engine: "fake".into(), version: "1".into(), ..Default::default() })
+        Ok(RuntimeInfo {
+            engine: "fake".into(),
+            version: "1".into(),
+            ..Default::default()
+        })
     }
 
     async fn load_images(&self, _archive: &Path) -> Result<Vec<String>, via_runtime::Error> {
@@ -93,7 +102,9 @@ impl Runtime for FakeRuntime {
     ) -> Result<ApplyReport, via_runtime::Error> {
         let release = Self::release_of(deployment);
         if self.behavior_for(release) == Behavior::ApplyErrors {
-            return Err(via_runtime::Error::ImageNotLoaded { reference: "broken".into() });
+            return Err(via_runtime::Error::ImageNotLoaded {
+                reference: "broken".into(),
+            });
         }
         self.applied.lock().unwrap().push(release);
         Ok(ApplyReport {
@@ -121,7 +132,12 @@ impl Runtime for FakeRuntime {
                     Behavior::Crashes => (ContainerStatus::Exited { code: 1 }, HealthStatus::None),
                     Behavior::ApplyErrors => (ContainerStatus::Absent, HealthStatus::None),
                 };
-                ServiceState { service: name.clone(), status, health, ..ServiceState::absent(name) }
+                ServiceState {
+                    service: name.clone(),
+                    status,
+                    health,
+                    ..ServiceState::absent(name)
+                }
             })
             .collect())
     }
@@ -133,7 +149,10 @@ impl Runtime for FakeRuntime {
     ) -> Result<via_runtime::Logs, via_runtime::Error> {
         // Nothing in the deploy pipeline reads logs; a fake engine that
         // produced them would be inventing behaviour no test asserts on.
-        Ok(via_runtime::Logs { services: Vec::new(), lines: Box::pin(futures::stream::empty()) })
+        Ok(via_runtime::Logs {
+            services: Vec::new(),
+            lines: Box::pin(futures::stream::empty()),
+        })
     }
 
     async fn exec(
@@ -144,7 +163,9 @@ impl Runtime for FakeRuntime {
         // The deploy pipeline never runs commands in containers, so refusing
         // is more honest than a fake that succeeds: a test that started
         // depending on this would fail rather than pass on invented output.
-        Err(via_runtime::Error::NoSuchService { service: o.service.clone() })
+        Err(via_runtime::Error::NoSuchService {
+            service: o.service.clone(),
+        })
     }
 
     async fn stop(&self, _d: &Deployment) -> Result<(), via_runtime::Error> {
@@ -181,7 +202,11 @@ fn stage(store: &Store, runtime: &FakeRuntime, release: u64) {
         serde_json::to_vec_pretty(&deployment(release)).unwrap(),
     )
     .unwrap();
-    runtime.images.lock().unwrap().push(format!("app:{release}"));
+    runtime
+        .images
+        .lock()
+        .unwrap()
+        .push(format!("app:{release}"));
 }
 
 struct Harness {
@@ -213,13 +238,20 @@ async fn a_healthy_release_becomes_current() {
     let h = Harness::new();
     stage(&h.store, &h.runtime, 44);
 
-    let outcome = h.deployer().activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
+    let outcome = h
+        .deployer()
+        .activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
     assert!(outcome.succeeded());
 
     let state = h.store.load_state().unwrap();
     assert_eq!(state.current, Some(ReleaseId(44)));
     assert_eq!(state.previous, None);
-    assert_eq!(state.candidate, None, "the candidate must be cleared once the release is active");
+    assert_eq!(
+        state.candidate, None,
+        "the candidate must be cleared once the release is active"
+    );
 }
 
 #[tokio::test]
@@ -229,12 +261,20 @@ async fn a_second_release_pushes_the_first_to_previous() {
     stage(&h.store, &h.runtime, 45);
     let d = h.deployer();
 
-    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
-    d.activate(ReleaseId(45), &deployment(45), &ApplyContext::default()).await.unwrap();
+    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
+    d.activate(ReleaseId(45), &deployment(45), &ApplyContext::default())
+        .await
+        .unwrap();
 
     let state = h.store.load_state().unwrap();
     assert_eq!(state.current, Some(ReleaseId(45)));
-    assert_eq!(state.previous, Some(ReleaseId(44)), "rollback needs the old release retained");
+    assert_eq!(
+        state.previous,
+        Some(ReleaseId(44)),
+        "rollback needs the old release retained"
+    );
 }
 
 #[tokio::test]
@@ -245,15 +285,28 @@ async fn a_release_that_never_becomes_ready_is_rolled_back() {
     h.runtime.set(45, Behavior::NeverReady);
     let d = h.deployer();
 
-    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
-    let outcome = d.activate(ReleaseId(45), &deployment(45), &ApplyContext::default()).await.unwrap();
+    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
+    let outcome = d
+        .activate(ReleaseId(45), &deployment(45), &ApplyContext::default())
+        .await
+        .unwrap();
 
     assert!(!outcome.succeeded());
     assert_eq!(outcome.rolled_back_to, Some(ReleaseId(44)));
-    assert_eq!(h.runtime.current(), Some(44), "the device must end up running the good release");
+    assert_eq!(
+        h.runtime.current(),
+        Some(44),
+        "the device must end up running the good release"
+    );
 
     let state = h.store.load_state().unwrap();
-    assert_eq!(state.current, Some(ReleaseId(44)), "a failed release must never become current");
+    assert_eq!(
+        state.current,
+        Some(ReleaseId(44)),
+        "a failed release must never become current"
+    );
     assert_eq!(state.candidate, None);
 }
 
@@ -265,10 +318,15 @@ async fn a_crashing_release_fails_fast_rather_than_burning_the_timeout() {
     h.runtime.set(45, Behavior::Crashes);
     let d = h.deployer();
 
-    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
+    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
 
     let started = std::time::Instant::now();
-    let outcome = d.activate(ReleaseId(45), &deployment(45), &ApplyContext::default()).await.unwrap();
+    let outcome = d
+        .activate(ReleaseId(45), &deployment(45), &ApplyContext::default())
+        .await
+        .unwrap();
     assert!(!outcome.succeeded());
     assert!(
         started.elapsed() < std::time::Duration::from_secs(2),
@@ -285,11 +343,20 @@ async fn a_failing_apply_rolls_back_and_reports_why() {
     h.runtime.set(45, Behavior::ApplyErrors);
     let d = h.deployer();
 
-    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
-    let err = d.activate(ReleaseId(45), &deployment(45), &ApplyContext::default()).await.unwrap_err();
+    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
+    let err = d
+        .activate(ReleaseId(45), &deployment(45), &ApplyContext::default())
+        .await
+        .unwrap_err();
 
     match err {
-        Error::ApplyFailed { release, rolled_back_to, .. } => {
+        Error::ApplyFailed {
+            release,
+            rolled_back_to,
+            ..
+        } => {
             assert_eq!(release, ReleaseId(45));
             assert_eq!(rolled_back_to, Some(ReleaseId(44)));
         }
@@ -297,7 +364,10 @@ async fn a_failing_apply_rolls_back_and_reports_why() {
     }
     let state = h.store.load_state().unwrap();
     assert_eq!(state.current, Some(ReleaseId(44)));
-    assert_eq!(state.candidate, None, "a failed attempt must not leave a candidate behind");
+    assert_eq!(
+        state.candidate, None,
+        "a failed attempt must not leave a candidate behind"
+    );
 }
 
 #[tokio::test]
@@ -306,7 +376,11 @@ async fn the_first_release_on_a_device_has_nothing_to_roll_back_to() {
     stage(&h.store, &h.runtime, 44);
     h.runtime.set(44, Behavior::NeverReady);
 
-    let outcome = h.deployer().activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
+    let outcome = h
+        .deployer()
+        .activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
     assert!(!outcome.succeeded());
     assert_eq!(outcome.rolled_back_to, None);
     assert_eq!(h.store.load_state().unwrap().current, None);
@@ -320,7 +394,10 @@ async fn an_interrupted_deploy_is_detected_and_the_good_release_restored() {
     stage(&h.store, &h.runtime, 44);
     stage(&h.store, &h.runtime, 45);
 
-    h.deployer().activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
+    h.deployer()
+        .activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
 
     // Simulate the crash: a candidate is recorded, nothing else happened.
     let mut state = h.store.load_state().unwrap();
@@ -341,7 +418,10 @@ async fn an_interrupted_deploy_is_detected_and_the_good_release_restored() {
 async fn recovery_is_a_no_op_when_no_deploy_was_interrupted() {
     let h = Harness::new();
     stage(&h.store, &h.runtime, 44);
-    h.deployer().activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
+    h.deployer()
+        .activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
     assert_eq!(h.deployer().recover().await.unwrap(), None);
 }
 
@@ -349,7 +429,10 @@ async fn recovery_is_a_no_op_when_no_deploy_was_interrupted() {
 async fn rolling_back_to_a_release_this_device_never_had_is_refused() {
     let h = Harness::new();
     stage(&h.store, &h.runtime, 44);
-    h.deployer().activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
+    h.deployer()
+        .activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
 
     let err = h.deployer().rollback_to(ReleaseId(99)).await.unwrap_err();
     assert!(matches!(err, Error::RollbackUnavailable { .. }), "{err}");
@@ -364,10 +447,17 @@ async fn a_failed_release_does_not_stay_on_disk() {
     h.runtime.set(45, Behavior::NeverReady);
     let d = h.deployer();
 
-    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
-    d.activate(ReleaseId(45), &deployment(45), &ApplyContext::default()).await.unwrap();
+    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
+    d.activate(ReleaseId(45), &deployment(45), &ApplyContext::default())
+        .await
+        .unwrap();
 
-    assert!(!h.store.has_release(ReleaseId(45)), "the failed release should have been pruned");
+    assert!(
+        !h.store.has_release(ReleaseId(45)),
+        "the failed release should have been pruned"
+    );
     assert!(h.store.has_release(ReleaseId(44)));
 }
 
@@ -379,12 +469,31 @@ async fn the_journal_records_the_whole_story() {
     h.runtime.set(45, Behavior::NeverReady);
     let d = h.deployer();
 
-    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default()).await.unwrap();
-    d.activate(ReleaseId(45), &deployment(45), &ApplyContext::default()).await.unwrap();
+    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
+    d.activate(ReleaseId(45), &deployment(45), &ApplyContext::default())
+        .await
+        .unwrap();
 
-    let events: Vec<String> = h.store.read_journal().unwrap().into_iter().map(|e| e.event).collect();
-    for expected in ["deploy_started", "active", "health_gate_failed", "rolled_back", "deploy_failed"] {
-        assert!(events.iter().any(|e| e == expected), "missing {expected:?} in {events:?}");
+    let events: Vec<String> = h
+        .store
+        .read_journal()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.event)
+        .collect();
+    for expected in [
+        "deploy_started",
+        "active",
+        "health_gate_failed",
+        "rolled_back",
+        "deploy_failed",
+    ] {
+        assert!(
+            events.iter().any(|e| e == expected),
+            "missing {expected:?} in {events:?}"
+        );
     }
 }
 

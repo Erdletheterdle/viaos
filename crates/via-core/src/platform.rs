@@ -21,7 +21,11 @@ pub struct Platform {
 
 impl Platform {
     pub fn new(os: impl Into<String>, arch: impl Into<String>) -> Self {
-        Self { os: os.into(), arch: arch.into(), variant: None }
+        Self {
+            os: os.into(),
+            arch: arch.into(),
+            variant: None,
+        }
     }
 
     pub fn with_variant(mut self, variant: impl Into<String>) -> Self {
@@ -116,8 +120,14 @@ mod tests {
 
     #[test]
     fn parses_two_and_three_part_forms() {
-        assert_eq!(Platform::parse("linux/arm64").unwrap().to_string(), "linux/arm64");
-        assert_eq!(Platform::parse("linux/arm/v7").unwrap().to_string(), "linux/arm/v7");
+        assert_eq!(
+            Platform::parse("linux/arm64").unwrap().to_string(),
+            "linux/arm64"
+        );
+        assert_eq!(
+            Platform::parse("linux/arm/v7").unwrap().to_string(),
+            "linux/arm/v7"
+        );
         assert!(Platform::parse("linux").is_err());
     }
 
@@ -131,6 +141,9 @@ mod tests {
 
     #[test]
     fn file_segment_has_no_slashes() {
-        assert_eq!(Platform::parse("linux/arm/v7").unwrap().to_file_segment(), "linux-arm-v7");
+        assert_eq!(
+            Platform::parse("linux/arm/v7").unwrap().to_file_segment(),
+            "linux-arm-v7"
+        );
     }
 }

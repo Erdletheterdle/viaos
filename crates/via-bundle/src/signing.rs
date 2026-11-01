@@ -78,7 +78,11 @@ impl KeyId {
     /// values out of error messages and log lines.
     pub fn parse(s: impl Into<String>) -> Result<Self, Error> {
         let s = s.into();
-        if s.len() != 16 || !s.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        if s.len() != 16
+            || !s
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
             return Err(Error::MalformedKey {
                 kind: "key id",
                 reason: "expected 16 lowercase hex characters".into(),
@@ -172,8 +176,11 @@ impl PublicKey {
 
     pub fn from_hex(s: &str) -> Result<Self, Error> {
         let raw = decode_key_hex(s, "public")?;
-        let key = ed25519_dalek::VerifyingKey::from_bytes(&raw)
-            .map_err(|e| Error::MalformedKey { kind: "public", reason: e.to_string() })?;
+        let key =
+            ed25519_dalek::VerifyingKey::from_bytes(&raw).map_err(|e| Error::MalformedKey {
+                kind: "public",
+                reason: e.to_string(),
+            })?;
         Ok(Self(key))
     }
 
@@ -241,7 +248,11 @@ pub enum TrustPolicy {
 
 impl TrustPolicy {
     pub fn from_keys(keys: Vec<PublicKey>) -> Self {
-        if keys.is_empty() { TrustPolicy::Insecure } else { TrustPolicy::Require(keys) }
+        if keys.is_empty() {
+            TrustPolicy::Insecure
+        } else {
+            TrustPolicy::Require(keys)
+        }
     }
 
     pub fn requires_signature(&self) -> bool {
@@ -256,7 +267,9 @@ impl TrustPolicy {
     ) -> Result<Verified, Error> {
         let TrustPolicy::Require(trusted) = self else {
             return Ok(match signature {
-                Some(s) => Verified::UncheckedSignature { key_id: s.key_id.clone() },
+                Some(s) => Verified::UncheckedSignature {
+                    key_id: s.key_id.clone(),
+                },
                 None => Verified::Unsigned,
             });
         };
@@ -281,9 +294,13 @@ impl TrustPolicy {
         let sig = ed25519_dalek::Signature::from_bytes(&bytes);
         key.0
             .verify(manifest_bytes, &sig)
-            .map_err(|_| Error::SignatureVerificationFailed { key_id: signature.key_id.clone() })?;
+            .map_err(|_| Error::SignatureVerificationFailed {
+                key_id: signature.key_id.clone(),
+            })?;
 
-        Ok(Verified::Signed { key_id: signature.key_id.clone() })
+        Ok(Verified::Signed {
+            key_id: signature.key_id.clone(),
+        })
     }
 }
 
@@ -309,7 +326,9 @@ impl fmt::Display for Verified {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Verified::Signed { key_id } => write!(f, "signed by {key_id}"),
-            Verified::UncheckedSignature { key_id } => write!(f, "signature by {key_id} (not checked)"),
+            Verified::UncheckedSignature { key_id } => {
+                write!(f, "signature by {key_id} (not checked)")
+            }
             Verified::Unsigned => f.write_str("unsigned"),
         }
     }
@@ -326,7 +345,12 @@ mod tests {
         let sig = key.sign_manifest(manifest);
 
         let policy = TrustPolicy::Require(vec![key.public()]);
-        assert_eq!(policy.verify(manifest, Some(&sig)).unwrap(), Verified::Signed { key_id: key.key_id() });
+        assert_eq!(
+            policy.verify(manifest, Some(&sig)).unwrap(),
+            Verified::Signed {
+                key_id: key.key_id()
+            }
+        );
     }
 
     #[test]
@@ -338,7 +362,10 @@ mod tests {
         let policy = TrustPolicy::Require(vec![key.public()]);
 
         let err = policy.verify(br#"{"release":45}"#, Some(&sig)).unwrap_err();
-        assert!(matches!(err, Error::SignatureVerificationFailed { .. }), "{err}");
+        assert!(
+            matches!(err, Error::SignatureVerificationFailed { .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -352,14 +379,20 @@ mod tests {
         let err = policy.verify(manifest, Some(&sig)).unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, Error::UntrustedSigner { .. }), "{msg}");
-        assert!(msg.contains(signer.key_id().as_str()), "the error should name the offending key: {msg}");
+        assert!(
+            msg.contains(signer.key_id().as_str()),
+            "the error should name the offending key: {msg}"
+        );
     }
 
     #[test]
     fn an_unsigned_bundle_is_refused_when_signatures_are_required() {
         let key = SigningKey::generate();
         let policy = TrustPolicy::Require(vec![key.public()]);
-        assert!(matches!(policy.verify(b"payload", None), Err(Error::BundleUnsigned)));
+        assert!(matches!(
+            policy.verify(b"payload", None),
+            Err(Error::BundleUnsigned)
+        ));
     }
 
     #[test]

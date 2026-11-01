@@ -26,6 +26,10 @@ pub struct Manifest {
     pub version: String,
     pub arch: String,
     pub files: Vec<ManifestFile>,
+    /// Set by `via os-release --secure-boot`: the UKI is signed for the
+    /// fleet's Secure Boot keys.
+    #[serde(default)]
+    pub secure_boot: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,14 +92,20 @@ impl Updater {
         self.set(&version, "downloading", Some(0), None);
         let this = self.clone();
         tokio::spawn(async move {
-            match this.run(&data_dir, &source, &version, bearer.as_deref(), &trust).await {
+            match this
+                .run(&data_dir, &source, &version, bearer.as_deref(), &trust)
+                .await
+            {
                 Ok(()) => {
                     if reboot {
                         this.set(&version, "rebooting", None, None);
                         tracing::info!(%version, "installed; rebooting");
                         // Long enough for the caller to read the status.
                         tokio::time::sleep(Duration::from_secs(5)).await;
-                        let _ = tokio::process::Command::new("systemctl").arg("reboot").status().await;
+                        let _ = tokio::process::Command::new("systemctl")
+                            .arg("reboot")
+                            .status()
+                            .await;
                     } else {
                         this.set(&version, "installed", None, None);
                     }
@@ -127,17 +137,35 @@ impl Updater {
         // The manifest holds every file's sha256, so a signature over it
         // covers the whole update, checked before anything is downloaded.
         if trust.requires_signature() {
-            let sig = fetch.bytes("manifest.json.sig").await.context("the update is not signed")?;
+            let sig = fetch
+                .bytes("manifest.json.sig")
+                .await
+                .context("the update is not signed")?;
             let sig: via_bundle::BundleSignature =
                 serde_json::from_slice(&sig).context("reading manifest.json.sig")?;
-            trust.verify(&manifest_bytes, Some(&sig)).context("checking the update's signature")?;
+            trust
+                .verify(&manifest_bytes, Some(&sig))
+                .context("checking the update's signature")?;
         }
-        let manifest: Manifest = serde_json::from_slice(&manifest_bytes).context("reading manifest.json")?;
+        let manifest: Manifest =
+            serde_json::from_slice(&manifest_bytes).context("reading manifest.json")?;
         if manifest.version != version {
             bail!("source holds version {}, not {version}", manifest.version);
         }
         if manifest.arch != std::env::consts::ARCH {
-            bail!("update is for {}, this device is {}", manifest.arch, std::env::consts::ARCH);
+            bail!(
+                "update is for {}, this device is {}",
+                manifest.arch,
+                std::env::consts::ARCH
+            );
+        }
+        // Firmware would refuse the UKI three times, then boot the old
+        // version: an update that cannot work. Say so now instead.
+        if secure_boot() && !manifest.secure_boot {
+            bail!(
+                "this device enforces Secure Boot and version {version} is not signed for it; \
+                 publish it with `via os-release --secure-boot`"
+            );
         }
 
         let total: u64 = manifest.files.iter().map(|f| f.size).sum::<u64>().max(1);
@@ -155,25 +183,40 @@ impl Updater {
                 .await
                 .with_context(|| format!("fetching {}", file.name))?;
             if digest != file.sha256 {
-                bail!("{} is corrupt: sha256 {digest}, expected {}", file.name, file.sha256);
+                bail!(
+                    "{} is corrupt: sha256 {digest}, expected {}",
+                    file.name,
+                    file.sha256
+                );
             }
             done += file.size;
         }
 
         self.set(version, "installing", None, None);
         // Not on PATH on NixOS; the unit says where it is.
-        let sysupdate = std::env::var("VIA_SYSUPDATE").unwrap_or_else(|_| "systemd-sysupdate".into());
+        let sysupdate =
+            std::env::var("VIA_SYSUPDATE").unwrap_or_else(|_| "systemd-sysupdate".into());
         let out = tokio::process::Command::new(sysupdate)
             .args(["update", version])
             .output()
             .await
             .context("running systemd-sysupdate")?;
         if !out.status.success() {
-            bail!("systemd-sysupdate failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            bail!(
+                "systemd-sysupdate failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         let _ = tokio::fs::remove_dir_all(&dir).await;
         Ok(())
     }
+}
+
+/// Whether the firmware is enforcing Secure Boot. The EFI variable is four
+/// bytes of attributes, then 1 or 0.
+pub fn secure_boot() -> bool {
+    std::fs::read("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e098032b8c4b")
+        .is_ok_and(|v| v.get(4) == Some(&1))
 }
 
 /// The running OS version, from os-release.
@@ -186,7 +229,11 @@ pub fn current_version() -> Option<String> {
 
 /// Reads an update source: an http(s) URL or a local directory.
 enum Fetch {
-    Http { base: String, client: reqwest::Client, bearer: Option<String> },
+    Http {
+        base: String,
+        client: reqwest::Client,
+        bearer: Option<String>,
+    },
     Dir(PathBuf),
 }
 
@@ -204,7 +251,14 @@ impl Fetch {
     }
 
     async fn get(&self, name: &str) -> Result<reqwest::Response> {
-        let Self::Http { base, client, bearer } = self else { unreachable!() };
+        let Self::Http {
+            base,
+            client,
+            bearer,
+        } = self
+        else {
+            unreachable!()
+        };
         let mut req = client.get(format!("{base}/{name}"));
         if let Some(b) = bearer {
             req = req.bearer_auth(b);
@@ -224,7 +278,12 @@ impl Fetch {
     }
 
     /// Copy `name` to `path`, returning its sha256 in hex.
-    async fn to_file(&self, name: &str, path: &Path, mut progress: impl FnMut(u64)) -> Result<String> {
+    async fn to_file(
+        &self,
+        name: &str,
+        path: &Path,
+        mut progress: impl FnMut(u64),
+    ) -> Result<String> {
         let mut hash = Sha256::new();
         let mut out = tokio::fs::File::create(path).await?;
         let mut written = 0u64;

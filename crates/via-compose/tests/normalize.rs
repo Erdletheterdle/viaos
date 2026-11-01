@@ -37,7 +37,10 @@ services:
   detector:
     build: ./detector
 "#);
-    assert_eq!(n.deployment.services["detector"].image.reference, "demo-stack/detector:44");
+    assert_eq!(
+        n.deployment.services["detector"].image.reference,
+        "demo-stack/detector:44"
+    );
     assert_eq!(n.builds.len(), 1);
     assert_eq!(n.builds[0].service, "detector");
     assert_eq!(n.builds[0].context.to_string_lossy(), "/src/app/detector");
@@ -52,7 +55,10 @@ services:
     image: registry.example.com/detector:1.2.3
 "#);
     assert_eq!(n.builds[0].tag, "registry.example.com/detector:1.2.3");
-    assert_eq!(n.deployment.services["detector"].image.reference, "registry.example.com/detector:1.2.3");
+    assert_eq!(
+        n.deployment.services["detector"].image.reference,
+        "registry.example.com/detector:1.2.3"
+    );
 }
 
 #[test]
@@ -85,7 +91,10 @@ services:
     image: busybox
     command: ["sleep", "3600"]
 "#);
-    assert_eq!(n.deployment.services["app"].command.as_deref().unwrap(), ["sleep", "3600"]);
+    assert_eq!(
+        n.deployment.services["app"].command.as_deref().unwrap(),
+        ["sleep", "3600"]
+    );
 }
 
 #[test]
@@ -124,7 +133,9 @@ volumes:
   db-data:
 "#);
     let mounts = &n.deployment.services["db"].mounts;
-    assert!(matches!(&mounts[0], Mount::Volume { source, read_only: false, .. } if source == "db-data"));
+    assert!(
+        matches!(&mounts[0], Mount::Volume { source, read_only: false, .. } if source == "db-data")
+    );
     assert!(
         matches!(&mounts[1], Mount::Bind { source, read_only: true, .. } if source == "/src/app/config"),
         "relative binds must be made absolute against the compose directory: {:?}",
@@ -151,7 +162,8 @@ services:
 
 #[test]
 fn duplicate_mount_targets_are_rejected() {
-    let err = norm(r#"
+    let err = norm(
+        r#"
 services:
   db:
     image: postgres:17
@@ -161,7 +173,8 @@ services:
 volumes:
   a:
   b:
-"#)
+"#,
+    )
     .unwrap_err();
     assert!(matches!(err, Error::InvalidMount { .. }), "{err}");
 }
@@ -182,7 +195,10 @@ services:
     assert_eq!((p[0].host_port, p[0].container_port), (Some(8080), 80));
     assert_eq!(p[1].host_ip.as_deref(), Some("127.0.0.1"));
     assert_eq!(p[2].protocol, Protocol::Udp);
-    assert_eq!(p[3].host_port, None, "a bare port publishes on an ephemeral host port");
+    assert_eq!(
+        p[3].host_port, None,
+        "a bare port publishes on an ephemeral host port"
+    );
     assert_eq!(p[3].container_port, 80);
 }
 
@@ -197,13 +213,15 @@ services:
 "#);
     assert_eq!(n.deployment.services["app"].ports.len(), 3);
 
-    let err = norm(r#"
+    let err = norm(
+        r#"
 services:
   app:
     image: busybox
     ports:
       - "3000-3002:4000-4009"
-"#)
+"#,
+    )
     .unwrap_err();
     assert!(matches!(err, Error::InvalidPort { .. }), "{err}");
 }
@@ -212,7 +230,10 @@ services:
 fn restart_defaults_to_unless_stopped_not_no() {
     // An unattended device must bring its application back after a power cut.
     let n = ok("services:\n  app:\n    image: busybox\n");
-    assert_eq!(n.deployment.services["app"].restart, RestartPolicy::UnlessStopped);
+    assert_eq!(
+        n.deployment.services["app"].restart,
+        RestartPolicy::UnlessStopped
+    );
 }
 
 #[test]
@@ -225,7 +246,9 @@ services:
 "#);
     assert_eq!(
         n.deployment.services["app"].restart,
-        RestartPolicy::OnFailure { max_retries: Some(5) }
+        RestartPolicy::OnFailure {
+            max_retries: Some(5)
+        }
     );
 }
 
@@ -244,7 +267,11 @@ services:
     let hc = n.deployment.services["app"].healthcheck.as_ref().unwrap();
     assert_eq!(hc.test[0], "CMD-SHELL");
     assert_eq!(hc.interval_secs, Some(90));
-    assert_eq!(hc.start_period_secs, Some(1), "sub-second rounds up, never to zero");
+    assert_eq!(
+        hc.start_period_secs,
+        Some(1),
+        "sub-second rounds up, never to zero"
+    );
     assert_eq!(hc.retries, Some(3));
 }
 
@@ -271,7 +298,10 @@ services:
       test: ["CMD", "true"]
 "#);
     assert_eq!(n.deployment.services["app"].readiness, Readiness::Healthy);
-    assert!(n.warnings.is_empty(), "a service with a healthcheck should not warn");
+    assert!(
+        n.warnings.is_empty(),
+        "a service with a healthcheck should not warn"
+    );
 }
 
 #[test]
@@ -289,13 +319,15 @@ fn readiness_defaults_to_running_and_warns_when_no_healthcheck_exists() {
 fn readiness_healthy_without_a_healthcheck_is_rejected_at_build_time() {
     // Otherwise every deploy of this release would sit in HEALTH CHECK until
     // the gate timed out, on every device in the fleet.
-    let err = norm(r#"
+    let err = norm(
+        r#"
 services:
   app:
     image: busybox
     x-via:
       readiness: healthy
-"#)
+"#,
+    )
     .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("never report healthy"), "{msg}");
@@ -314,7 +346,10 @@ services:
     x-via:
       readiness: ignored
 "#);
-    assert_eq!(n.deployment.services["migrate"].readiness, Readiness::Completed);
+    assert_eq!(
+        n.deployment.services["migrate"].readiness,
+        Readiness::Completed
+    );
     assert_eq!(n.deployment.services["flaky"].readiness, Readiness::Ignored);
 }
 
@@ -336,8 +371,14 @@ services:
     healthcheck:
       test: ["CMD", "pg_isready"]
 "#);
-    assert_eq!(n.deployment.services["app"].depends_on[0].condition, DependencyCondition::Healthy);
-    assert_eq!(n.deployment.services["worker"].depends_on[0].condition, DependencyCondition::Started);
+    assert_eq!(
+        n.deployment.services["app"].depends_on[0].condition,
+        DependencyCondition::Healthy
+    );
+    assert_eq!(
+        n.deployment.services["worker"].depends_on[0].condition,
+        DependencyCondition::Started
+    );
 
     let order = n.deployment.start_order().unwrap();
     let pos = |s: &str| order.iter().position(|x| *x == s).unwrap();
@@ -347,19 +388,32 @@ services:
 #[test]
 fn dangling_references_fail_at_build_time_not_on_the_device() {
     let cases = [
-        ("depends_on", "services:\n  app:\n    image: b\n    depends_on: [nope]\n"),
-        ("network", "services:\n  app:\n    image: b\n    networks: [nope]\n"),
-        ("volume", "services:\n  app:\n    image: b\n    volumes:\n      - nope:/data\n"),
+        (
+            "depends_on",
+            "services:\n  app:\n    image: b\n    depends_on: [nope]\n",
+        ),
+        (
+            "network",
+            "services:\n  app:\n    image: b\n    networks: [nope]\n",
+        ),
+        (
+            "volume",
+            "services:\n  app:\n    image: b\n    volumes:\n      - nope:/data\n",
+        ),
     ];
     for (label, yaml) in cases {
         let err = norm(yaml).unwrap_err();
-        assert!(matches!(err, Error::UnknownReference { .. }), "{label}: {err}");
+        assert!(
+            matches!(err, Error::UnknownReference { .. }),
+            "{label}: {err}"
+        );
     }
 }
 
 #[test]
 fn dependency_cycles_are_reported_with_the_path() {
-    let err = norm(r#"
+    let err = norm(
+        r#"
 services:
   a:
     image: b
@@ -367,7 +421,8 @@ services:
   b:
     image: b
     depends_on: [a]
-"#)
+"#,
+    )
     .unwrap_err();
     assert!(matches!(err, Error::DependencyCycle { .. }), "{err}");
 }
@@ -404,18 +459,23 @@ services:
     image: busybox
     network_mode: host
 "#);
-    assert_eq!(n.deployment.services["app"].network_mode.as_deref(), Some("host"));
+    assert_eq!(
+        n.deployment.services["app"].network_mode.as_deref(),
+        Some("host")
+    );
 }
 
 #[test]
 fn multiple_replicas_are_rejected_rather_than_silently_ignored() {
-    let err = norm(r#"
+    let err = norm(
+        r#"
 services:
   app:
     image: busybox
     deploy:
       replicas: 3
-"#)
+"#,
+    )
     .unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("replicas"), "{msg}");
@@ -451,7 +511,10 @@ fn a_typo_in_a_top_level_key_is_an_error() {
     // `deny_unknown_fields` is what turns `servics:` into a build failure
     // instead of an empty deployment.
     let err = norm("servics:\n  app:\n    image: busybox\n").unwrap_err();
-    assert!(matches!(err, Error::Yaml { .. } | Error::NoServices), "{err}");
+    assert!(
+        matches!(err, Error::Yaml { .. } | Error::NoServices),
+        "{err}"
+    );
 }
 
 #[test]
@@ -541,12 +604,20 @@ services:
 "#);
     let detector = &n.deployment.services["detector"];
     assert_eq!(detector.environment["SAMPLE_RATE"], "10");
-    assert!(!detector.environment.contains_key("CLOUD_API_TOKEN"), "an undefined key has no value yet");
     assert!(
-        !detector.environment.contains_key("VIA_TEST_SHOULD_NOT_LEAK"),
+        !detector.environment.contains_key("CLOUD_API_TOKEN"),
+        "an undefined key has no value yet"
+    );
+    assert!(
+        !detector
+            .environment
+            .contains_key("VIA_TEST_SHOULD_NOT_LEAK"),
         "the build host's environment must not reach the release"
     );
-    assert_eq!(detector.runtime_env, ["CLOUD_API_TOKEN", "VIA_TEST_SHOULD_NOT_LEAK"]);
+    assert_eq!(
+        detector.runtime_env,
+        ["CLOUD_API_TOKEN", "VIA_TEST_SHOULD_NOT_LEAK"]
+    );
 
     assert!(detector.wants_runtime_key("CLOUD_API_TOKEN"));
     assert!(!n.deployment.services["db"].wants_runtime_key("CLOUD_API_TOKEN"));
@@ -562,6 +633,12 @@ services:
       CLOUD_API_TOKEN:
       SAMPLE_RATE: 10
 "#);
-    assert_eq!(n.deployment.services["app"].runtime_env, ["CLOUD_API_TOKEN"]);
-    assert_eq!(n.deployment.services["app"].environment["SAMPLE_RATE"], "10");
+    assert_eq!(
+        n.deployment.services["app"].runtime_env,
+        ["CLOUD_API_TOKEN"]
+    );
+    assert_eq!(
+        n.deployment.services["app"].environment["SAMPLE_RATE"],
+        "10"
+    );
 }

@@ -44,6 +44,7 @@ via-bundle = { path = "crates/via-bundle", version = "0.0.1" }
 via-compose = { path = "crates/via-compose", version = "0.0.1" }
 via-core = { path = "crates/via-core", version = "0.0.1" }
 via-deploy = { path = "crates/via-deploy", version = "0.0.1" }
+via-image = { path = "crates/via-image", version = "0.0.1" }
 via-link = { path = "crates/via-link", version = "0.0.1" }
 via-runtime = { path = "crates/via-runtime", version = "0.0.1" }
 zstd = "0.13.3"

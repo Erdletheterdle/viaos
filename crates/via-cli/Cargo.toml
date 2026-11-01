@@ -15,12 +15,14 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 futures.workspace = true
+hex.workspace = true
 libc.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 rmcp.workspace = true
 schemars.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-tungstenite.workspace = true
 tracing.workspace = true
@@ -29,6 +31,7 @@ via-bundle.workspace = true
 via-compose.workspace = true
 via-core.workspace = true
 via-deploy.workspace = true
+via-image.workspace = true
 zstd = { workspace = true, features = ["zstdmt"] }
 
 [dev-dependencies]

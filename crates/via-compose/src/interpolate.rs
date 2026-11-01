@@ -76,13 +76,18 @@ pub fn parse_dotenv(body: &str) -> Vec<(String, String)> {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line).trim();
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let k = k.trim();
         if k.is_empty() {
             continue;
         }
         let v = v.trim();
-        let v = if v.len() >= 2 && ((v.starts_with('"') && v.ends_with('"')) || (v.starts_with('\'') && v.ends_with('\''))) {
+        let v = if v.len() >= 2
+            && ((v.starts_with('"') && v.ends_with('"'))
+                || (v.starts_with('\'') && v.ends_with('\'')))
+        {
             &v[1..v.len() - 1]
         } else {
             // An unquoted value ends at an inline comment.
@@ -122,11 +127,12 @@ pub fn interpolate(input: &str, vars: &Vars) -> Result<String, InterpolationErro
                 i += 2;
             }
             b'{' => {
-                let close = find_closing_brace(bytes, i + 1)
-                    .ok_or_else(|| InterpolationError::Unterminated {
+                let close = find_closing_brace(bytes, i + 1).ok_or_else(|| {
+                    InterpolationError::Unterminated {
                         offset: i,
                         snippet: input[i..(i + 24).min(input.len())].to_string(),
-                    })?;
+                    }
+                })?;
                 let expr = &input[i + 2..close];
                 out.push_str(&eval_expr(expr, vars)?);
                 i = close + 1;
@@ -134,7 +140,9 @@ pub fn interpolate(input: &str, vars: &Vars) -> Result<String, InterpolationErro
             c if c == b'_' || c.is_ascii_alphabetic() => {
                 let start = i + 1;
                 let mut end = start;
-                while end < bytes.len() && (bytes[end] == b'_' || bytes[end].is_ascii_alphanumeric()) {
+                while end < bytes.len()
+                    && (bytes[end] == b'_' || bytes[end].is_ascii_alphanumeric())
+                {
                     end += 1;
                 }
                 let name = &input[start..end];
@@ -173,9 +181,12 @@ fn find_closing_brace(bytes: &[u8], open: usize) -> Option<usize> {
 }
 
 fn eval_expr(expr: &str, vars: &Vars) -> Result<String, InterpolationError> {
-    for (sep, empty_counts_as_unset, is_error) in
-        [(":-", true, false), ("-", false, false), (":?", true, true), ("?", false, true)]
-    {
+    for (sep, empty_counts_as_unset, is_error) in [
+        (":-", true, false),
+        ("-", false, false),
+        (":?", true, true),
+        ("?", false, true),
+    ] {
         if let Some((name, rest)) = split_once_operator(expr, sep) {
             let value = vars.get(name);
             let unset = match value {
@@ -186,8 +197,12 @@ fn eval_expr(expr: &str, vars: &Vars) -> Result<String, InterpolationError> {
                 return Ok(value.unwrap_or("").to_string());
             }
             if is_error {
-                let hint = (!rest.is_empty()).then(|| interpolate(rest, vars).unwrap_or_else(|_| rest.to_string()));
-                return Err(InterpolationError::Missing { name: name.to_string(), hint });
+                let hint = (!rest.is_empty())
+                    .then(|| interpolate(rest, vars).unwrap_or_else(|_| rest.to_string()));
+                return Err(InterpolationError::Missing {
+                    name: name.to_string(),
+                    hint,
+                });
             }
             // Defaults may themselves reference variables.
             return interpolate(rest, vars);
@@ -227,7 +242,10 @@ mod tests {
     fn expands_both_syntaxes() {
         assert_eq!(interpolate("app:$TAG", &vars()).unwrap(), "app:1.8.3");
         assert_eq!(interpolate("app:${TAG}", &vars()).unwrap(), "app:1.8.3");
-        assert_eq!(interpolate("${TAG}-${TAG}", &vars()).unwrap(), "1.8.3-1.8.3");
+        assert_eq!(
+            interpolate("${TAG}-${TAG}", &vars()).unwrap(),
+            "1.8.3-1.8.3"
+        );
     }
 
     #[test]
@@ -240,9 +258,15 @@ mod tests {
 
     #[test]
     fn colon_dash_treats_empty_as_unset_but_dash_does_not() {
-        assert_eq!(interpolate("${EMPTY:-fallback}", &vars()).unwrap(), "fallback");
+        assert_eq!(
+            interpolate("${EMPTY:-fallback}", &vars()).unwrap(),
+            "fallback"
+        );
         assert_eq!(interpolate("${EMPTY-fallback}", &vars()).unwrap(), "");
-        assert_eq!(interpolate("${NOPE-fallback}", &vars()).unwrap(), "fallback");
+        assert_eq!(
+            interpolate("${NOPE-fallback}", &vars()).unwrap(),
+            "fallback"
+        );
     }
 
     #[test]
@@ -289,7 +313,9 @@ TRAILING=value # inline comment
 
     #[test]
     fn real_environment_wins_over_dotenv() {
-        let v = Vars::new().set("TAG", "from-env").with_dotenv("TAG=from-file");
+        let v = Vars::new()
+            .set("TAG", "from-env")
+            .with_dotenv("TAG=from-file");
         assert_eq!(interpolate("${TAG}", &v).unwrap(), "from-env");
     }
 }

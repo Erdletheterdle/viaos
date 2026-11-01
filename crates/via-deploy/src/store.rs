@@ -96,7 +96,10 @@ impl AgentState {
 
     /// Releases that must not be deleted (spec section 26).
     pub fn pinned(&self) -> Vec<ReleaseId> {
-        [self.current, self.previous, self.candidate].into_iter().flatten().collect()
+        [self.current, self.previous, self.candidate]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 }
 
@@ -144,8 +147,11 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AgentState::default()),
             Err(e) => Err(Error::io(&path, e)),
             Ok(bytes) => {
-                let state: AgentState = serde_json::from_slice(&bytes)
-                    .map_err(|e| Error::CorruptState { path: path.display().to_string(), source: e })?;
+                let state: AgentState =
+                    serde_json::from_slice(&bytes).map_err(|e| Error::CorruptState {
+                        path: path.display().to_string(),
+                        source: e,
+                    })?;
                 if state.schema_version != STATE_SCHEMA_VERSION {
                     return Err(Error::UnsupportedStateSchema {
                         found: state.schema_version,
@@ -217,7 +223,11 @@ impl Store {
             Ok(e) => e,
         };
         for entry in entries.flatten() {
-            if let Some(id) = entry.file_name().to_str().and_then(|n| n.parse::<u64>().ok()) {
+            if let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<u64>().ok())
+            {
                 out.push(ReleaseId(id));
             }
         }
@@ -271,7 +281,9 @@ impl Store {
     /// images without a network.
     pub fn has_blobs(&self, release: ReleaseId) -> bool {
         let dir = self.release_dir(release).join("blobs");
-        std::fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(false)
+        std::fs::read_dir(&dir)
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
     }
 
     /// Free bytes on the filesystem holding the store.
@@ -284,7 +296,9 @@ impl Store {
 }
 
 fn dir_size(dir: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
     entries
         .flatten()
         .filter_map(|e| e.metadata().ok())
@@ -329,7 +343,10 @@ mod tests {
         let (_d, s) = store();
         let state = s.load_state().unwrap();
         assert!(state.current.is_none());
-        assert!(state.converged(), "nothing desired yet means nothing to converge to");
+        assert!(
+            state.converged(),
+            "nothing desired yet means nothing to converge to"
+        );
     }
 
     #[test]
@@ -382,14 +399,20 @@ mod tests {
         };
         let removed = s.prune(&state).unwrap();
         assert_eq!(removed, vec![ReleaseId(41), ReleaseId(42), ReleaseId(43)]);
-        assert!(s.has_release(ReleaseId(44)), "the rollback target must survive pruning");
+        assert!(
+            s.has_release(ReleaseId(44)),
+            "the rollback target must survive pruning"
+        );
         assert!(s.has_release(ReleaseId(45)));
     }
 
     #[test]
     fn journal_appends_and_reads_back_in_order() {
         let (_d, s) = store();
-        for (i, event) in ["deploy_started", "images_loaded", "active"].iter().enumerate() {
+        for (i, event) in ["deploy_started", "images_loaded", "active"]
+            .iter()
+            .enumerate()
+        {
             s.journal(&JournalEntry {
                 at: format!("2026-08-22T13:0{i}:00Z"),
                 event: event.to_string(),
@@ -410,13 +433,20 @@ mod tests {
         let r = ReleaseId(44);
         std::fs::create_dir_all(s.release_dir(r).join("blobs")).unwrap();
         std::fs::write(s.release_dir(r).join("deployment.json"), b"{}").unwrap();
-        std::fs::write(s.release_dir(r).join("blobs").join("sha256-aa"), vec![0u8; 4096]).unwrap();
+        std::fs::write(
+            s.release_dir(r).join("blobs").join("sha256-aa"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
 
         assert!(s.has_blobs(r));
         let freed = s.drop_blobs(r).unwrap();
         assert_eq!(freed, 4096);
         assert!(!s.has_blobs(r));
-        assert!(s.has_release(r), "the release must still be known after its blobs go");
+        assert!(
+            s.has_release(r),
+            "the release must still be known after its blobs go"
+        );
     }
 
     #[test]

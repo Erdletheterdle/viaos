@@ -22,6 +22,12 @@ jobs:
       - uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: system-features = nixos-test benchmark big-parallel kvm
+      # The NixOS test boots a VM; runners have KVM but only root can use it.
+      - name: Let the build users use KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
       - run: nix build .#via .#via-server .#via-agent .#via-server-image
       # Boots the control plane's NixOS module in a VM: tokens, roles, MCP.
       - run: nix flake check
@@ -29,6 +35,7 @@ jobs:
   # One image per architecture, each built natively.
   images:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch: x86_64
@@ -41,6 +48,9 @@ jobs:
       # An image build needs more disk than a runner has free.
       - uses: jlumbroso/free-disk-space@main
       - uses: cachix/install-nix-action@v31
+      # systemd-repart builds the image in a user namespace, which Ubuntu's
+      # AppArmor policy forbids by default.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: nix build .#images.${{ matrix.arch }} -o image
       - run: nix build .#updates.${{ matrix.arch }} -o update
       - run: du -sh --apparent-size image/*.raw && du -sh image/*.raw update/*

@@ -51,7 +51,12 @@ use hub::Hub;
 #[command(name = "via-server", version, about = "viaos control plane")]
 struct Cli {
     /// Database and generated images live here.
-    #[arg(long, env = "VIA_DATA_DIR", default_value = "/var/lib/via-server", global = true)]
+    #[arg(
+        long,
+        env = "VIA_DATA_DIR",
+        default_value = "/var/lib/via-server",
+        global = true
+    )]
     data_dir: PathBuf,
     #[command(subcommand)]
     command: Option<Command>,
@@ -135,7 +140,8 @@ impl State {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,rmcp=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,rmcp=warn".into()),
         )
         .init();
     let cli = Cli::parse();
@@ -145,8 +151,12 @@ async fn main() -> Result<()> {
         Command::Token(t) => {
             let db = Db::open(&cli.data_dir.join("via.db"))?;
             match t {
-                TokenCommand::Create { name, role } => println!("{}", db.create_api_token(&name, role)?),
-                TokenCommand::List => println!("{}", serde_json::to_string_pretty(&db.api_tokens()?)?),
+                TokenCommand::Create { name, role } => {
+                    println!("{}", db.create_api_token(&name, role)?)
+                }
+                TokenCommand::List => {
+                    println!("{}", serde_json::to_string_pretty(&db.api_tokens()?)?)
+                }
                 TokenCommand::Revoke { name } => db.revoke_api_token(&name)?,
             }
             Ok(())
@@ -156,10 +166,14 @@ async fn main() -> Result<()> {
 
 async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
     if let Some(t) = &cli.admin_token {
-        anyhow::ensure!(t.len() >= 16, "VIA_ADMIN_TOKEN must be at least 16 characters");
+        anyhow::ensure!(
+            t.len() >= 16,
+            "VIA_ADMIN_TOKEN must be at least 16 characters"
+        );
     }
     for k in &cli.trusted_keys {
-        via_bundle::PublicKey::from_hex(k).with_context(|| format!("VIA_TRUSTED_KEYS: {k:?} is not a public key"))?;
+        via_bundle::PublicKey::from_hex(k)
+            .with_context(|| format!("VIA_TRUSTED_KEYS: {k:?} is not a public key"))?;
     }
     let public_url = cli
         .public_url
@@ -193,15 +207,27 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
     let people = Router::new()
         .nest_service("/mcp", mcp::service(state.clone()))
         .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(state.clone(), require_caller));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_caller,
+        ));
     let admin = Router::new()
-        .route("/v1/releases/{app}/{release}/{arch}", axum::routing::put(upload_release))
-        .route("/v1/os/{arch}/{version}/{file}", axum::routing::put(upload_os_file))
+        .route(
+            "/v1/releases/{app}/{release}/{arch}",
+            axum::routing::put(upload_release),
+        )
+        .route(
+            "/v1/os/{arch}/{version}/{file}",
+            axum::routing::put(upload_os_file),
+        )
         .route("/v1/base/{arch}", axum::routing::put(upload_base))
         .route("/v1/devices/{device}/tunnel/{port}", get(tunnel))
         .with_state(state.clone())
         .layer(middleware::from_fn(require_admin))
-        .layer(middleware::from_fn_with_state(state.clone(), require_caller));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_caller,
+        ));
     let app = Router::new()
         .route("/v1/enroll", post(enroll))
         .route("/v1/connect", get(connect))
@@ -219,7 +245,11 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
 }
 
 /// Authenticate an API token and attach the [`db::Caller`] to the request.
@@ -228,7 +258,10 @@ async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next:
         return (StatusCode::UNAUTHORIZED, "API token required").into_response();
     };
     let caller = if s.admin_token_hash.as_deref() == Some(db::hash(token).as_str()) {
-        Some(db::Caller { name: "admin".into(), role: db::Role::Admin })
+        Some(db::Caller {
+            name: "admin".into(),
+            role: db::Role::Admin,
+        })
     } else {
         s.db.api_caller(token).ok().flatten()
     };
@@ -280,7 +313,9 @@ async fn connect(
         Some(Ok(Some(id))) => id,
         _ => return (StatusCode::UNAUTHORIZED, "unknown device credential").into_response(),
     };
-    if let Err(e) = s.db.seen(&device, q.os_version.as_deref(), q.agent_version.as_deref()) {
+    if let Err(e) =
+        s.db.seen(&device, q.os_version.as_deref(), q.agent_version.as_deref())
+    {
         tracing::warn!("recording last-seen failed: {e}");
     }
     ws.on_upgrade(move |socket| async move {
@@ -297,13 +332,18 @@ async fn os_file(
     headers: HeaderMap,
     Path((arch, version, file)): Path<(String, String, String)>,
 ) -> Response {
-    if !matches!(bearer(&headers).map(|c| s.db.authenticate(c)), Some(Ok(Some(_)))) {
+    if !matches!(
+        bearer(&headers).map(|c| s.db.authenticate(c)),
+        Some(Ok(Some(_)))
+    ) {
         return (StatusCode::UNAUTHORIZED, "unknown device credential").into_response();
     }
     let Ok(release) = os::find(&s.os_dir, &arch, &version) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let known = file == "manifest.json" || file == "manifest.json.sig" || release.files.iter().any(|f| f == &file);
+    let known = file == "manifest.json"
+        || file == "manifest.json.sig"
+        || release.files.iter().any(|f| f == &file);
     if !known {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -347,14 +387,22 @@ async fn upload_release(
 ) -> Response {
     let result = async {
         let path = releases::bundle_path(&s.releases_dir(), &app, release, &arch)?;
-        anyhow::ensure!(!path.exists(), "{app} release {release} for {arch} already exists; releases are immutable");
+        anyhow::ensure!(
+            !path.exists(),
+            "{app} release {release} for {arch} already exists; releases are immutable"
+        );
         let digest = save_body(&path.with_extension("upload"), body).await?;
         tokio::fs::write(path.with_extension("sha256"), &digest).await?;
         tokio::fs::rename(path.with_extension("upload"), &path).await?;
         Ok(json!({ "app": app, "release": release, "arch": arch, "sha256": digest }))
     }
     .await;
-    s.db.audit(&caller.name, "upload_release", &json!({ "app": app, "release": release, "arch": arch }), result.is_ok());
+    s.db.audit(
+        &caller.name,
+        "upload_release",
+        &json!({ "app": app, "release": release, "arch": arch }),
+        result.is_ok(),
+    );
     uploaded(result)
 }
 
@@ -385,7 +433,12 @@ async fn upload_os_file(
     }
     .await;
     if file == "manifest.json" {
-        s.db.audit(&caller.name, "upload_os", &json!({ "arch": arch, "version": version }), result.is_ok());
+        s.db.audit(
+            &caller.name,
+            "upload_os",
+            &json!({ "arch": arch, "version": version }),
+            result.is_ok(),
+        );
     }
     uploaded(result)
 }
@@ -399,7 +452,10 @@ async fn upload_base(
     body: Body,
 ) -> Response {
     let result = async {
-        anyhow::ensure!(matches!(arch.as_str(), "x86_64" | "aarch64"), "arch is x86_64 or aarch64");
+        anyhow::ensure!(
+            matches!(arch.as_str(), "x86_64" | "aarch64"),
+            "arch is x86_64 or aarch64"
+        );
         let compressed = s.images_dir.join(format!("viaos-{arch}.raw.zst"));
         let digest = save_body(&compressed, body).await?;
         let raw = s.images_dir.join(format!("viaos-{arch}.raw"));
@@ -409,7 +465,12 @@ async fn upload_base(
         Ok(json!({ "arch": arch, "sha256_compressed": digest }))
     }
     .await;
-    s.db.audit(&caller.name, "upload_base", &json!({ "arch": arch }), result.is_ok());
+    s.db.audit(
+        &caller.name,
+        "upload_base",
+        &json!({ "arch": arch }),
+        result.is_ok(),
+    );
     uploaded(result)
 }
 
@@ -422,8 +483,15 @@ async fn tunnel(
     Path((device, port)): Path<(String, u16)>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let opened = s.db.resolve(&device).and_then(|d| s.hub.open(&d.id, &format!("tcp:{port}")));
-    s.db.audit(&caller.name, "tunnel", &json!({ "device": device, "port": port }), opened.is_ok());
+    let opened =
+        s.db.resolve(&device)
+            .and_then(|d| s.hub.open(&d.id, &format!("tcp:{port}")));
+    s.db.audit(
+        &caller.name,
+        "tunnel",
+        &json!({ "device": device, "port": port }),
+        opened.is_ok(),
+    );
     match opened {
         Ok(stream) => ws.on_upgrade(move |socket| bridge(socket, stream)),
         Err(e) => (StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
@@ -457,7 +525,11 @@ async fn bridge(socket: axum::extract::ws::WebSocket, stream: tokio::io::DuplexS
             match r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if ws_tx.send(Message::Binary(buf[..n].to_vec().into())).await.is_err() {
+                    if ws_tx
+                        .send(Message::Binary(buf[..n].to_vec().into()))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -473,11 +545,21 @@ async fn release_bundle(
     headers: HeaderMap,
     Path((app, release, arch)): Path<(String, u64, String)>,
 ) -> Response {
-    if !matches!(bearer(&headers).map(|c| s.db.authenticate(c)), Some(Ok(Some(_)))) {
+    if !matches!(
+        bearer(&headers).map(|c| s.db.authenticate(c)),
+        Some(Ok(Some(_)))
+    ) {
         return (StatusCode::UNAUTHORIZED, "unknown device credential").into_response();
     }
     match releases::bundle_path(&s.releases_dir(), &app, release, &arch) {
-        Ok(p) => serve_file(&p, &format!("{app}-{release}-{arch}.bundle"), "application/octet-stream").await,
+        Ok(p) => {
+            serve_file(
+                &p,
+                &format!("{app}-{release}-{arch}.bundle"),
+                "application/octet-stream",
+            )
+            .await
+        }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -492,7 +574,10 @@ async fn serve_file(path: &std::path::Path, name: &str, content_type: &str) -> R
         [
             (header::CONTENT_TYPE, content_type.to_string()),
             (header::CONTENT_LENGTH, len.to_string()),
-            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{name}\""),
+            ),
         ],
         body,
     )
@@ -507,5 +592,10 @@ async fn download(AxState(s): AxState<Arc<State>>, Path(id): Path<String>) -> Re
     }
     let name = std::fs::read_to_string(s.out_dir().join(format!("{id}.name")))
         .unwrap_or_else(|_| "viaos.raw.zst".into());
-    serve_file(&s.out_dir().join(format!("{id}.raw.zst")), &name, "application/zstd").await
+    serve_file(
+        &s.out_dir().join(format!("{id}.raw.zst")),
+        &name,
+        "application/zstd",
+    )
+    .await
 }
