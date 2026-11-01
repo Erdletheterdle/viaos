@@ -215,7 +215,7 @@ impl Updater {
 /// Whether the firmware is enforcing Secure Boot. The EFI variable is four
 /// bytes of attributes, then 1 or 0.
 pub fn secure_boot() -> bool {
-    std::fs::read("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-e098032b8c4b")
+    std::fs::read("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c")
         .is_ok_and(|v| v.get(4) == Some(&1))
 }
 

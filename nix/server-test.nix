@@ -1,4 +1,5 @@
-# The control plane as the NixOS module runs it: tokens, roles, MCP.
+# The control plane as the NixOS module runs it: behind Caddy, with tokens,
+# roles, MCP, WebSockets and a large upload going through the proxy.
 { self, pkgs }:
 pkgs.testers.runNixOSTest {
   name = "via-server";
@@ -6,9 +7,13 @@ pkgs.testers.runNixOSTest {
     imports = [ self.nixosModules.via-server ];
     services.via-server = {
       enable = true;
-      publicUrl = "http://machine:8471";
+      domain = "via.test";
     };
+    # No ACME in the sandbox: Caddy's own CA instead.
+    services.caddy.globalConfig = "local_certs";
+    networking.hosts."127.0.0.1" = [ "via.test" ];
     environment.systemPackages = [ pkgs.curl ];
+    virtualisation.diskSize = 2048;
   };
   testScript = ''
     import json
@@ -43,6 +48,23 @@ pkgs.testers.runNixOSTest {
 
     # Uploads and tunnels are admin-only.
     machine.fail(f"curl -sf -X PUT http://127.0.0.1:8471/v1/base/x86_64 -H 'Authorization: Bearer {viewer}' -d x")
+
+    # Through Caddy, over TLS: the API, a WebSocket upgrade (a device's
+    # connection; refused for want of a credential, but by via-server, not
+    # the proxy), and an upload bigger than any default body limit.
+    machine.wait_for_unit("caddy.service")
+    ca = "/var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
+    https = f"curl -sf --cacert {ca} https://via.test"
+    machine.wait_until_succeeds(f"{https}/healthz")
+    code = machine.succeed(
+        f"curl -s -o /dev/null -w '%{{http_code}}' --cacert {ca} --http1.1 https://via.test/v1/connect "
+        "-H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' "
+        "-H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='"
+    )
+    assert code == "401", code
+    machine.succeed("head -c 300M /dev/urandom > /tmp/big")
+    machine.succeed(f"{https}/v1/os/x86_64/9/viaos_9.efi -X PUT -H 'Authorization: Bearer {admin}' -T /tmp/big")
+    machine.succeed("cmp /tmp/big /var/lib/via-server/os/x86_64/9/viaos_9.efi || cmp /tmp/big $(find /var/lib/via-server -name viaos_9.efi | head -1)")
 
     machine.succeed("sudo -u via-server VIA_DATA_DIR=/var/lib/via-server via-server token revoke bo")
     machine.fail(f"curl -sf http://127.0.0.1:8471/mcp -H 'Authorization: Bearer {viewer}' -d '{{}}'")
