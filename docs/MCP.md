@@ -20,12 +20,45 @@ These are the acceptance tests. A tool exists because one of these needs it.
 | Server | Where | Tools |
 | --- | --- | --- |
 | device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `exec`, `os_update`, `deploy`, `sync_env` |
-| fleet | `via-server` at `/mcp` (HTTP, API token) | `list_fleets`, `create_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `delete_variable`, `audit_log`, `list_tokens`, `create_token`, `revoke_token` |
+| fleet | `via-server` at `/mcp` (HTTP, API token) | `list_fleets`, `device_metrics`, `create_fleet`, `update_fleet`, `update_device`, `delete_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `release_details`, `release_contents`, `os_version_details`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `update_variables`, `delete_variable`, `set_device_type`, `delete_device_type`, `audit_log`, `list_tokens`, `create_token`, `revoke_token` |
 | local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status`, `release_app` |
 
 The fleet server forwards device tools over each device's outbound
 connection, adding only a `device` argument, so a tool behaves the same
 through the control plane as over `ssh device via-agent mcp`.
+
+## Variables
+
+`set_variable` and `delete_variable` take the `app` and `key`, exactly one of
+`fleet` or `device`, and optionally a `service`; without one, the value is for
+every service that declares the name. `set_variable` also takes `value` and
+`secret`. It adds a `warning` to its result when the app's newest release doesn't
+give that name to that service. Each value is stored separately, so deleting the
+one for a service leaves the rest.
+
+`sync_env`, which the server calls, takes `apps` and `services`, and a name left
+out is removed. `list_variables` returns:
+
+```json
+{
+  "variables": [
+    { "scope": "fleet", "target": "lab", "app": "hello", "service": "web",
+      "key": "API_KEY", "value": null, "secret": true,
+      "updated_at": 1793622449, "updated_by": "admin" }
+  ],
+  "schemas": [
+    { "app": "hello", "release": "1", "variables": [
+      { "key": "API_KEY", "services": ["web"], "description": "...",
+        "default": null, "secret": true, "required": true }
+    ] }
+  ]
+}
+```
+
+`service` is null for a value that isn't aimed at one service, and `value` is
+null for a secret. `schemas` has each app's newest release, and its `variables`
+are what that release describes in `x-via` plus any bare `- KEY` it doesn't
+describe. [deploy.md](deploy.md#variables-and-secrets) has the precedence.
 
 ## Rules
 
@@ -37,7 +70,8 @@ through the control plane as over `ssh device via-agent mcp`.
 3. No tool returns a secret, with one exception: `create_token` returns the
    new token, once, because that is its job. Enrollment tokens are written
    straight into an image or onto a device; the tool returns a path or a
-   device id, never the token. Secret variables are write-only.
+   device id, never the token. Secret variables are write-only, and no
+   variable's value goes in the audit log.
 4. Every fleet call is written to the audit log with the token's name, its
    arguments and whether it succeeded.
 5. A `viewer` token may call only the read-only tools; the rest answer with

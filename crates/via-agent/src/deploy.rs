@@ -87,8 +87,16 @@ impl Deploys {
             Ok(rolled_back_to) => self.finish(|s| match rolled_back_to {
                 Some(prev) => {
                     s.state = "rolled_back".into();
+                    // Going back to the same release means the release was
+                    // fine and the values it was just given were not.
+                    s.error = Some(if prev == s.release.to_string() {
+                        "the changed variables failed the health gate; the last values that \
+                         passed were restored"
+                            .into()
+                    } else {
+                        "the release failed its health gate".into()
+                    });
                     s.rolled_back_to = Some(prev);
-                    s.error = Some("the release failed its health gate".into());
                 }
                 None => s.state = "running".into(),
             }),
@@ -108,7 +116,11 @@ impl Deploys {
     }
 
     /// Re-apply the running release with the variables now on disk. Only
-    /// services that declared a changed name are recreated. Returns the app
+    /// services whose environment actually changed are recreated: `apply`
+    /// compares each container's config hash and touches nothing else, so
+    /// neither a service's dependents nor its dependencies restart. It still
+    /// answers to the health gate, and failing it restores the last values
+    /// that passed. Returns the app
     /// and release, or None if nothing is running yet, or if a deploy is under
     /// way and the re-apply will follow it.
     pub fn reapply(&self, data_dir: PathBuf) -> Result<Option<(String, u64)>> {
@@ -131,8 +143,8 @@ impl Deploys {
             let result = async {
                 let store = Store::open(&data_dir)?;
                 let runtime = DockerRuntime::connect()?;
-                let outcome = Deployer::new(&store, &runtime, &SystemClock)
-                    .with_env(crate::env::load(&data_dir))
+                let outcome = crate::env::load(&data_dir)
+                    .configure(Deployer::new(&store, &runtime, &SystemClock))
                     .activate(current, &deployment, &ApplyContext::default())
                     .await?;
                 Ok::<_, anyhow::Error>(outcome.rolled_back_to.map(|r| r.to_string()))
@@ -167,9 +179,9 @@ impl Deploys {
         self.set(&app, release, "deploying");
         let store = Store::open(data_dir)?;
         let runtime = DockerRuntime::connect()?;
-        let outcome = Deployer::new(&store, &runtime, &SystemClock)
+        let outcome = crate::env::load(data_dir)
+            .configure(Deployer::new(&store, &runtime, &SystemClock))
             .trusting(trust)
-            .with_env(crate::env::load(data_dir))
             .deploy(&bundle, &ApplyContext::default())
             .await;
         let _ = tokio::fs::remove_file(&bundle).await;
@@ -179,23 +191,49 @@ impl Deploys {
 }
 
 /// Finish whatever a power cut interrupted: a release that was mid-deploy is
-/// either completed or rolled back before anything else runs.
-pub async fn recover(data_dir: &Path) {
+/// either completed or rolled back before anything else runs. True if there
+/// was one, in which case it went back to known-good values, and the values
+/// now on hand have yet to be tried.
+pub async fn recover(data_dir: &Path) -> bool {
     let result = async {
         let store = Store::open(data_dir)?;
         let runtime = DockerRuntime::connect()?;
         Ok::<_, anyhow::Error>(
-            Deployer::new(&store, &runtime, &SystemClock)
-                .with_env(crate::env::load(data_dir))
+            crate::env::load(data_dir)
+                .configure(Deployer::new(&store, &runtime, &SystemClock))
                 .recover()
                 .await?,
         )
     }
     .await;
     match result {
-        Ok(Some(r)) => tracing::warn!(release = %r, "recovered an interrupted deploy"),
-        Ok(None) => {}
-        Err(e) => tracing::error!("deploy recovery failed: {e:#}"),
+        Ok(Some(r)) => {
+            tracing::warn!(release = %r, "recovered an interrupted deploy");
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            tracing::error!("deploy recovery failed: {e:#}");
+            false
+        }
+    }
+}
+
+/// After a boot, bring the running release back to what its compose file says.
+pub async fn reconcile(data_dir: &Path) {
+    let result = async {
+        let store = Store::open(data_dir)?;
+        let runtime = DockerRuntime::connect()?;
+        Ok::<_, anyhow::Error>(
+            crate::env::load(data_dir)
+                .configure(Deployer::new(&store, &runtime, &SystemClock))
+                .reconcile()
+                .await?,
+        )
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::error!("couldn't bring the running release up: {e:#}");
     }
 }
 

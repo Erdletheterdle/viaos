@@ -15,9 +15,12 @@ use std::path::Path;
 use thiserror::Error as ThisError;
 use via_core::ReleaseId;
 
-pub use pipeline::{DeployOutcome, Deployer, Phase};
+pub use pipeline::{DeployOutcome, Deployer, Phase, runtime_context};
 pub use receive::{Expectation, INCOMING_DIR, Progress, Reception, digest_file};
-pub use store::{AgentState, JOURNAL_FILE, JournalEntry, RELEASES_DIR, STATE_FILE, Store};
+pub use store::{
+    APPLIED_ENV_FILE, AgentState, AppliedEnv, JOURNAL_FILE, JournalEntry, RELEASES_DIR, STATE_FILE,
+    Store,
+};
 
 /// Source of timestamps for the journal.
 ///

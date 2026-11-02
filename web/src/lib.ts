@@ -63,6 +63,11 @@ export async function signIn(token: string): Promise<Caller> {
   return res.json();
 }
 
+export async function authOptions(): Promise<{ github: { org: string } | null }> {
+  const res = await fetch("/v1/auth");
+  return res.ok ? res.json() : { github: null };
+}
+
 export async function signOut() {
   await fetch("/v1/session", { method: "DELETE" });
 }
@@ -77,9 +82,51 @@ export type Device = {
   enrolled_at: number;
   last_seen: number | null;
   online: boolean;
+  os_update?: OsUpdate;
+  /** Its own. */
+  tags: string[];
+  /** From the fleets it sits in. */
+  inherited_tags?: string[];
 };
 
-export type Fleet = { name: string; devices: number };
+export type OsUpdate = {
+  version: string;
+  from_version: string | null;
+  started_at: number;
+  finished_at: number | null;
+  state: string;
+  progress: number | null;
+  detail: string | null;
+  offline_since: number | null;
+};
+
+/** One reading: `memory_mb` for the device, and each service's. */
+export type MetricSample = { at: number; memory_mb: number; cpu_percent: number; services: Record<string, { memory_mb: number; cpu_percent: number }> };
+export type Metrics = {
+  interval_secs: number;
+  memory_total_mb: number | null;
+  samples: MetricSample[];
+  processes: { name: string; processes: number; mb: number }[];
+  disk: { device: string; total_mb: number; unallocated_mb: number; partitions: { device: string; label: string | null; size_mb: number; in_use_as: string | null; free_mb: number | null }[] } | null;
+  docker: { images_mb: number; containers_mb: number; volumes_mb: number; build_cache_mb: number } | null;
+  volumes: { name: string; declared: boolean; used_by: string[]; mb: number | null; containers?: number }[] | null;
+};
+
+export type Fleet = { name: string; parent: string | null; tags: string[]; devices: number };
+
+/** A fleet and those above it, outermost first. */
+export function lineage(fleets: Fleet[], name: string): string[] {
+  const out: string[] = [];
+  for (let f = fleets.find((x) => x.name === name); f && !out.includes(f.name); f = fleets.find((x) => x.name === f?.parent)) out.unshift(f.name);
+  return out;
+}
+
+/** A fleet and everything under it. */
+export function under(fleets: Fleet[], name: string): string[] {
+  const out = [name];
+  for (let i = 0; i < out.length; i++) for (const f of fleets) if (f.parent === out[i] && !out.includes(f.name)) out.push(f.name);
+  return out;
+}
 
 export type Release = {
   app: string;
@@ -91,6 +138,7 @@ export type OsVersion = { arch: string; version: string; files: string[]; size_m
 
 export type Variable = {
   app: string;
+  service?: string | null;
   key: string;
   scope: "fleet" | "device";
   target: string;
@@ -99,6 +147,22 @@ export type Variable = {
   updated_at: number;
   updated_by: string;
 };
+
+export type SchemaVariable = {
+  key: string;
+  services: string[];
+  description: string | null;
+  default: string | null;
+  secret: boolean;
+  required: boolean;
+};
+
+export type Schema = { app: string; release: string | number; variables: SchemaVariable[] };
+
+/** Newest first, comparing the numbers inside version strings as numbers. */
+export function byVersionDesc(a: string | number, b: string | number) {
+  return String(b).localeCompare(String(a), undefined, { numeric: true });
+}
 
 export type Health = {
   host: {
@@ -115,7 +179,7 @@ export type Health = {
   os: {
     version: string | null;
     secure_boot: boolean;
-    update: { version: string; state: string; progress?: number; error?: string } | null;
+    update: { version: string; state: string; progress_percent?: number; error?: string } | null;
   };
   engine: { version?: string; error?: string } | null;
   release: {
@@ -149,6 +213,12 @@ export function duration(secs: number | null | undefined): string {
   return `${Math.floor(secs / 86400)}d ${Math.floor((secs % 86400) / 3600)}h`;
 }
 
+export function bytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+  return n < 1073741824 ? `${(n / 1048576).toFixed(1)} MB` : `${(n / 1073741824).toFixed(2)} GB`;
+}
+
 export function gb(mb: number): string {
   return mb < 1024 ? `${mb} MB` : `${(mb / 1024).toFixed(1)} GB`;
 }
@@ -161,4 +231,23 @@ export function when(unix: number): string {
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+/** Whether tags satisfy a filter: the exact tag, or a bare key for any value of it. */
+export function hasTag(tags: string[], wanted: string): boolean {
+  return tags.some((t) => t === wanted || t.startsWith(`${wanted}=`));
+}
+
+/** A fleet's tags and those of the fleets above it. */
+export function fleetTags(fleets: Fleet[], name: string): string[] {
+  return [...new Set(lineage(fleets, name).flatMap((n) => fleets.find((f) => f.name === n)?.tags ?? []))];
+}
+
+/** Each tag, and each key that has values, for a filter to offer. */
+export function tagChoices(tags: string[]): { value: string; label: string; detail?: string }[] {
+  const keys = [...new Set(tags.filter((t) => t.includes("=")).map((t) => t.split("=")[0]))];
+  return [
+    ...keys.map((k) => ({ value: k, label: k, detail: "any value" })),
+    ...[...new Set(tags)].filter((t) => !keys.includes(t)).map((t) => ({ value: t, label: t })),
+  ].sort((a, b) => a.value.localeCompare(b.value));
 }

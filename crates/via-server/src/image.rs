@@ -13,20 +13,22 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 /// The architectures images exist for, as `uname -m` spells them.
-pub const ARCHES: &[&str] = &["x86_64", "aarch64"];
+pub const ARCHES: &[&str] = &["x86_64", "i686", "aarch64", "armv7l"];
 
-pub fn base_image(dir: &Path, arch: &str) -> Result<PathBuf> {
-    if !ARCHES.contains(&arch) {
-        bail!("no images for {arch:?}; supported: {}", ARCHES.join(", "));
+/// A device type's own base image, or else its architecture's.
+pub fn base_image(dir: &Path, t: &crate::db::DeviceType) -> Result<PathBuf> {
+    for name in [&t.id, &t.arch] {
+        let path = dir.join(format!("viaos-{name}.raw"));
+        if path.exists() {
+            return Ok(path);
+        }
     }
-    let path = dir.join(format!("viaos-{arch}.raw"));
-    if !path.exists() {
-        bail!(
-            "base image {} is missing; build it with `nix build .#images.{arch}`",
-            path.display()
-        );
-    }
-    Ok(path)
+    bail!(
+        "no base image for {}: upload one with `via base-image`, as viaos-{}.raw or viaos-{}.raw",
+        t.name,
+        t.id,
+        t.arch
+    );
 }
 
 /// Copy `base` to `out` (zstd-compressed), with `config` as `/viaos.toml` on

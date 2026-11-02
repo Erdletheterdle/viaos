@@ -19,6 +19,7 @@ use via_runtime::{DockerRuntime, LogOptions, Runtime};
 
 use crate::deploy::Deploys;
 use crate::host;
+use crate::metrics::Metrics;
 use crate::os::{self, Updater};
 
 const INSTRUCTIONS: &str = "\
@@ -35,10 +36,18 @@ pub struct Device {
     trust: TrustPolicy,
     updater: Updater,
     deploys: Deploys,
+    metrics: Metrics,
     tool_router: ToolRouter<Self>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
+pub struct MetricsArgs {
+    /// Only samples after this time, in unix seconds. Omit for the last hour.
+    #[serde(default)]
+    pub since: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct LogsArgs {
     /// Service name from `device_health`. Omit for every service.
     #[serde(default)]
@@ -76,7 +85,10 @@ pub struct DeployArgs {
 pub struct SyncEnvArgs {
     /// Every variable and secret this device should have, by app. Replaces
     /// what it holds, so a name left out is removed.
-    pub apps: crate::env::Env,
+    pub apps: crate::env::Apps,
+    /// Values for one service, by app then service, on top of `apps`.
+    #[serde(default)]
+    pub services: crate::env::ServiceApps,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -106,8 +118,13 @@ impl Device {
             trust,
             updater: Updater::default(),
             deploys: Deploys::default(),
+            metrics: Metrics::default(),
             tool_router: Self::tool_router() + Self::os_router(),
         }
+    }
+
+    pub fn start_metrics(&self, data_dir: PathBuf) {
+        self.metrics.start(data_dir);
     }
 
     fn store(&self) -> anyhow::Result<Store> {
@@ -195,22 +212,30 @@ impl Device {
     /// never values.
     pub fn sync_env(&self, a: SyncEnvArgs) -> anyhow::Result<Value> {
         let before = crate::env::load(&self.data_dir);
-        crate::env::save(&self.data_dir, &a.apps)?;
-        let current = self
-            .store()?
-            .load_state()?
-            .current
-            .and_then(|r| {
-                let rt = DockerRuntime::connect().ok()?;
-                let store = self.store().ok()?;
-                Deployer::new(&store, &rt, &SystemClock)
-                    .load_deployment(r)
-                    .ok()
-            })
-            .map(|d| d.project);
+        let after = crate::env::Env {
+            apps: a.apps,
+            services: a.services,
+        };
+        let store = self.store()?;
+        let current = store.load_state()?.current.and_then(|r| {
+            let rt = DockerRuntime::connect().ok()?;
+            let d = Deployer::new(&store, &rt, &SystemClock)
+                .load_deployment(r)
+                .ok()?;
+            Some((r, d))
+        });
+        // A release deployed before values were recorded per release: what is
+        // on disk now is what it is running with, and the only thing a failed
+        // change could go back to.
+        if let Some((r, d)) = &current {
+            if store.load_applied_env(*r).is_none() {
+                store.save_applied_env(*r, &before.for_app(&d.project))?;
+            }
+        }
+        crate::env::save(&self.data_dir, &after)?;
         let changed = current
             .as_ref()
-            .is_some_and(|app| before.get(app) != a.apps.get(app));
+            .is_some_and(|(_, d)| before.changes_for(&after, d));
         let reapplied = if changed {
             self.deploys.reapply(self.data_dir.clone())?
         } else {
@@ -219,6 +244,14 @@ impl Device {
         Ok(
             json!({ "stored": true, "reapplied": reapplied.map(|(app, r)| json!({ "app": app, "release": r })) }),
         )
+    }
+
+    /// Try the stored variables again after recovery restored known-good ones.
+    /// Services already running those values stay as they are.
+    pub fn retry_env(&self) {
+        if let Err(e) = self.deploys.reapply(self.data_dir.clone()) {
+            tracing::error!("re-applying variables after recovery failed: {e:#}");
+        }
     }
 
     pub fn deploy(&self, a: DeployArgs) -> anyhow::Result<Value> {
@@ -307,7 +340,7 @@ async fn release_and_services(
                         .iter()
                         .map(|s| json!({
                             "service": s.service,
-                            "container": d.services.get(&s.service).map(|svc| via_runtime::container_name(&d, svc)),
+                            "container": s.container_name,
                             "status": format!("{:?}", s.status),
                             "health": format!("{:?}", s.health),
                         }))
@@ -374,6 +407,27 @@ impl Device {
     )]
     async fn device_health(&self) -> Result<CallToolResult, ErrorData> {
         Ok(rendered(self.health().await))
+    }
+
+    #[tool(
+        name = "device_metrics",
+        description = "What this device is using: memory and CPU every few seconds for the last \
+                       hour, for the whole device and per service; memory by program; size of \
+                       each volume; what Docker holds; and every partition of the whole disk. \
+                       Reads only.",
+        annotations(
+            title = "Device metrics",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn device_metrics(
+        &self,
+        Parameters(a): Parameters<MetricsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(rendered(
+            self.metrics.report(self.data_dir.clone(), a.since),
+        ))
     }
 
     #[tool(

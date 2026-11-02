@@ -1,56 +1,55 @@
 @import "tailwindcss";
-@import "@fontsource-variable/bricolage-grotesque";
-@import "@fontsource-variable/instrument-sans";
+@import "@fontsource-variable/ibm-plex-sans";
 @import "@fontsource-variable/jetbrains-mono";
 
-/* viaos console. A logbook kept next to the machines: bone paper and ink by
-   day, carbon and hi-vis yellow at night. Rules rather than boxes, square
-   corners, and numbers set to line up. Every colour is a token here. */
+/* viaos console. Control-panel grey: painted enclosure by day, anthracite at
+   night. Colour is reserved for state, as on a plant HMI: when everything is
+   healthy the screen is nearly monochrome, so what's wrong is what you see.
+   Every colour is a token here. */
 
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
 :root {
-  --paper: oklch(0.955 0.014 90);
-  --sheet: oklch(0.982 0.008 90);
-  --ink: oklch(0.2 0.018 80);
-  --ink-2: oklch(0.43 0.018 80);
-  --ink-3: oklch(0.58 0.016 80);
-  --rule: oklch(0.86 0.014 85);
-  --rule-strong: oklch(0.2 0.018 80);
+  --paper: oklch(0.925 0.004 250);
+  --sheet: oklch(0.975 0.002 250);
+  --well: oklch(0.89 0.005 250);
+  --ink: oklch(0.22 0.008 250);
+  --ink-2: oklch(0.4 0.008 250);
+  --ink-3: oklch(0.49 0.008 250);
+  --rule: oklch(0.81 0.006 250);
+  --rule-strong: oklch(0.56 0.008 250);
 
-  /* What you can act on. Ink by day; the marker only highlights. */
-  --act: oklch(0.2 0.018 80);
-  --act-ink: oklch(0.975 0.01 90);
-  --marker: oklch(0.91 0.19 108);
-  --marker-ink: oklch(0.2 0.018 80);
+  --act: oklch(0.27 0.01 250);
+  --act-ink: oklch(0.97 0.002 250);
 
-  /* Status carries meaning and is never decoration. */
-  --ok: oklch(0.52 0.14 150);
+  --ok: oklch(0.5 0.13 150);
+  --info: oklch(0.5 0.14 250);
   --warn: oklch(0.62 0.15 70);
-  --bad: oklch(0.56 0.21 30);
-  --off: oklch(0.68 0.012 80);
+  --bad: oklch(0.52 0.2 28);
+  --off: oklch(0.62 0.008 250);
 
   color-scheme: light;
 }
 
-[data-theme="dark"] {
-  --paper: oklch(0.175 0.008 80);
-  --sheet: oklch(0.205 0.009 80);
-  --ink: oklch(0.93 0.012 90);
-  --ink-2: oklch(0.72 0.014 85);
-  --ink-3: oklch(0.56 0.013 85);
-  --rule: oklch(0.3 0.01 80);
-  --rule-strong: oklch(0.93 0.012 90);
+[data-theme="dark"],
+.tty {
+  --paper: oklch(0.19 0.006 250);
+  --sheet: oklch(0.225 0.006 250);
+  --well: oklch(0.16 0.006 250);
+  --ink: oklch(0.93 0.004 250);
+  --ink-2: oklch(0.76 0.006 250);
+  --ink-3: oklch(0.63 0.008 250);
+  --rule: oklch(0.32 0.007 250);
+  --rule-strong: oklch(0.5 0.008 250);
 
-  --act: oklch(0.91 0.19 108);
-  --act-ink: oklch(0.18 0.02 100);
-  --marker: oklch(0.91 0.19 108);
-  --marker-ink: oklch(0.18 0.02 100);
+  --act: oklch(0.9 0.004 250);
+  --act-ink: oklch(0.19 0.006 250);
 
-  --ok: oklch(0.76 0.17 150);
+  --ok: oklch(0.74 0.16 150);
+  --info: oklch(0.74 0.13 250);
   --warn: oklch(0.8 0.15 75);
-  --bad: oklch(0.7 0.2 32);
-  --off: oklch(0.5 0.012 80);
+  --bad: oklch(0.7 0.19 28);
+  --off: oklch(0.5 0.008 250);
 
   color-scheme: dark;
 }
@@ -58,6 +57,7 @@
 @theme inline {
   --color-paper: var(--paper);
   --color-sheet: var(--sheet);
+  --color-well: var(--well);
   --color-ink: var(--ink);
   --color-ink-2: var(--ink-2);
   --color-ink-3: var(--ink-3);
@@ -65,14 +65,12 @@
   --color-rule-strong: var(--rule-strong);
   --color-act: var(--act);
   --color-act-ink: var(--act-ink);
-  --color-marker: var(--marker);
-  --color-marker-ink: var(--marker-ink);
   --color-ok: var(--ok);
+  --color-info: var(--info);
   --color-warn: var(--warn);
   --color-bad: var(--bad);
   --color-off: var(--off);
-  --font-display: "Bricolage Grotesque Variable", ui-sans-serif, sans-serif;
-  --font-sans: "Instrument Sans Variable", ui-sans-serif, sans-serif;
+  --font-sans: "IBM Plex Sans Variable", ui-sans-serif, sans-serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
 }
 
@@ -82,72 +80,162 @@ html {
   font-family: var(--font-sans);
   font-size: 15px;
   -webkit-font-smoothing: antialiased;
+  -webkit-text-size-adjust: 100%;
   font-variant-numeric: tabular-nums;
+  scrollbar-color: var(--rule-strong) transparent;
 }
 
 body {
   min-height: 100dvh;
 }
 
+* {
+  scrollbar-width: thin;
+}
+
 ::selection {
-  background: var(--marker);
-  color: var(--marker-ink);
+  background: var(--act);
+  color: var(--act-ink);
 }
 
 /* In a layer, so a field's own focus style can replace it. */
 @layer base {
   :focus-visible {
-    outline: 2px solid var(--act);
+    outline: 2px solid var(--ink);
     outline-offset: 2px;
+  }
+  input:-webkit-autofill {
+    -webkit-text-fill-color: var(--ink);
+    box-shadow: 0 0 0 100px var(--well) inset;
+    caret-color: var(--ink);
   }
 }
 
-/* Small capitals in the mono face: column heads and field labels. */
-.label {
-  font-family: var(--font-mono);
-  font-size: 0.68rem;
-  font-weight: 500;
-  letter-spacing: 0.09em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-}
+/* In a layer, so a utility on the same element wins. */
+@layer components {
+  /* Engraved-plate capitals: column heads, field labels, panel titles. */
+  .label {
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    font-weight: 500;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
 
-/* A stroke of highlighter behind the words. */
-.marked {
-  background: linear-gradient(transparent 12%, var(--marker) 12%, var(--marker) 92%, transparent 92%);
-  color: var(--marker-ink);
-  padding-inline: 0.18em;
-  box-decoration-break: clone;
+  /* Every row of data, whatever it holds: the same height unless its content
+     really needs more lines. */
+  .row {
+    display: flex;
+    align-items: center;
+    min-height: 2.5rem;
+    padding-block: 0.25rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  @media (width < 40rem) {
+    .row {
+      min-height: 2.75rem;
+    }
+  }
+
+  .side-group {
+    margin-block: 0.25rem;
+  }
+  .side-group + .side-group {
+    margin-top: calc(-0.25rem - 1px);
+  }
+
+  /* A sidebar entry. Depth never moves the left edge. */
+  .side {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    height: 2rem;
+    padding-inline: 0.75rem;
+    font-size: 0.875rem;
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+  .side:hover {
+    background: var(--well);
+    color: var(--ink);
+  }
+  .side[aria-current="page"] {
+    background: var(--act);
+    color: var(--act-ink);
+    font-weight: 600;
+  }
+  @media (width < 64rem) {
+    .side {
+      height: 2.75rem;
+    }
+  }
+
+  .tab {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    height: 2.5rem;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    font-size: 0.875rem;
+    color: var(--ink-2);
+    white-space: nowrap;
+  }
+  .tab:hover {
+    color: var(--ink);
+  }
+  .tab[aria-current="page"],
+  .tab[aria-selected="true"] {
+    border-color: var(--ink);
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  /* A row of tabs that scrolls sideways on a phone. */
+  .strip {
+    display: flex;
+    gap: 1.25rem;
+    overflow: auto hidden;
+    scrollbar-width: none;
+  }
+
+  /* An LED bargraph: the track and the fill share one mask. */
+  .bargraph {
+    height: 0.5rem;
+    background: var(--well);
+    mask-image: repeating-linear-gradient(90deg, #000 0 5px, transparent 5px 7px);
+  }
+
+  .check {
+    background: var(--well);
+    border: 1px solid var(--rule-strong);
+  }
+  .check svg {
+    opacity: 0;
+  }
+  input:checked + .check {
+    background: var(--act);
+    border-color: var(--act);
+    color: var(--act-ink);
+  }
+  input:checked + .check svg {
+    opacity: 1;
+  }
+  input:focus-visible + .check {
+    outline: 2px solid var(--ink);
+    outline-offset: 2px;
+  }
 }
 
 /* Terminals and logs stay dark in either theme: light on black is what they
    are in every other tool an operator has open. */
 .tty {
-  background: #0f0e0c;
-  color: #e3e0d8;
-  --tty-dim: oklch(0.58 0.01 85);
+  background: oklch(0.15 0.005 250);
+  color: var(--ink);
+  border: 1px solid oklch(0.32 0.007 250);
 }
 
 dialog::backdrop {
-  background: oklch(0.15 0.01 80 / 0.55);
-}
-
-@media (prefers-reduced-motion: no-preference) {
-  .rise {
-    animation: rise 0.28s cubic-bezier(0.2, 0.7, 0.2, 1) both;
-  }
-  @keyframes rise {
-    from {
-      opacity: 0;
-      transform: translateY(6px);
-    }
-  }
-  .live {
-    animation: pulse 2.4s ease-in-out infinite;
-  }
-  @keyframes pulse {
-    50% {
-      opacity: 0.45;
-    }
-  }
+  background: oklch(0.12 0.006 250 / 0.6);
 }

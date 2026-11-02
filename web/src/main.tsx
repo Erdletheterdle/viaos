@@ -1,17 +1,17 @@
-import { QueryCache, QueryClient, QueryClientProvider, useQuery, useQueryClient } from "@tanstack/react-query";
-import { createContext, StrictMode, useContext, useEffect, useState } from "react";
+import { QueryCache, QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
+import { createContext, StrictMode, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
-import { BrowserRouter, Link, NavLink, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import "./index.css";
-import { SignedOut, signOut, whoami, type Caller } from "./lib";
+import { SignedOut, whoami, type Caller } from "./lib";
 import { Access } from "./pages/access";
 import { Audit } from "./pages/audit";
+import { AppPage, AppsPage, OsPage, OsVersionPage, ReleasePage } from "./pages/catalog";
 import { DevicePage } from "./pages/device";
-import { Enroll } from "./pages/enroll";
-import { FleetPage } from "./pages/fleet";
+import { FleetPage, FleetsPage } from "./pages/fleet";
 import { Login } from "./pages/login";
-import { Releases } from "./pages/releases";
-import { Variables } from "./pages/variables";
+import { Sidebar } from "./sidebar";
+import { Button, Menu } from "./ui";
 
 const client = new QueryClient({
   queryCache: new QueryCache({
@@ -47,7 +47,7 @@ function storedTheme(): Theme {
 }
 applyTheme(storedTheme());
 
-function ThemeSwitch() {
+export function ThemeSwitch() {
   const [theme, setTheme] = useState<Theme>(storedTheme);
   useEffect(() => {
     applyTheme(theme);
@@ -61,9 +61,9 @@ function ThemeSwitch() {
   }, [theme]);
   const next: Record<Theme, Theme> = { auto: "light", light: "dark", dark: "auto" };
   return (
-    <button className="label cursor-pointer hover:text-ink" onClick={() => setTheme(next[theme])} title="Change theme">
+    <Button tone="quiet" size="sm" onClick={() => setTheme(next[theme])} title="Change theme">
       {theme}
-    </button>
+    </Button>
   );
 }
 
@@ -76,55 +76,16 @@ function Mark({ className = "" }: { className?: string }) {
 }
 export { Mark };
 
-const nav = [
-  ["/", "Fleet"],
-  ["/enroll", "Enroll"],
-  ["/releases", "Releases"],
-  ["/variables", "Variables"],
-  ["/audit", "Audit"],
-  ["/access", "Access"],
-] as const;
-
-function Masthead({ me }: { me: Caller }) {
-  const qc = useQueryClient();
+function Shell({ me, children }: { me: Caller; children: ReactNode }) {
+  const [menu, setMenu] = useState(false);
+  const close = useCallback(() => setMenu(false), []);
   return (
-    <header className="sticky top-0 z-20 border-b-[1.5px] border-rule-strong bg-paper">
-      <div className="mx-auto flex max-w-[92rem] flex-wrap items-center gap-x-8 gap-y-1 px-4 py-2.5 sm:px-8">
-        <Link to="/" className="flex items-center gap-2 font-display text-xl font-bold tracking-tight">
-          <Mark className="size-5" />
-          viaos
-        </Link>
-        <nav className="order-3 -mx-1 flex w-full gap-5 overflow-x-auto px-1 text-sm sm:order-none sm:w-auto">
-          {nav.map(([to, label]) => (
-            <NavLink
-              key={to}
-              to={to}
-              end={to === "/"}
-              className={({ isActive }) => (isActive ? "font-semibold" : "text-ink-2 hover:text-ink")}
-            >
-              {({ isActive }) => <span className={isActive ? "marked" : ""}>{label}</span>}
-            </NavLink>
-          ))}
-        </nav>
-        <div className="ml-auto flex items-center gap-4">
-          <span className="label">
-            {me.name}
-            {me.role === "viewer" && " · viewer"}
-          </span>
-          <ThemeSwitch />
-          <button
-            className="label cursor-pointer hover:text-ink"
-            onClick={async () => {
-              await signOut();
-              qc.setQueryData(["session"], null);
-              qc.clear();
-            }}
-          >
-            Sign out
-          </button>
-        </div>
+    <Menu.Provider value={() => setMenu(true)}>
+      <div className="min-h-dvh lg:grid lg:grid-cols-[13.5rem_minmax(0,1fr)]">
+        <Sidebar me={me} open={menu} onClose={close} />
+        <main className="min-w-0 px-4 pb-6 sm:px-5">{children}</main>
       </div>
-    </header>
+    </Menu.Provider>
   );
 }
 
@@ -135,19 +96,30 @@ function App() {
   return (
     <Me.Provider value={session.data}>
       <BrowserRouter>
-        <Masthead me={session.data} />
-        <main className="mx-auto max-w-[92rem] px-4 pt-9 pb-20 sm:px-8">
+        <Shell me={session.data}>
           <Routes>
-            <Route path="/" element={<FleetPage />} />
-            <Route path="/devices/:name" element={<DevicePage />} />
-            <Route path="/enroll" element={<Enroll />} />
-            <Route path="/releases" element={<Releases />} />
-            <Route path="/variables" element={<Variables />} />
+            <Route path="/" element={<FleetsPage />} />
+            <Route path="/fleets/:fleet" element={<FleetPage />} />
+            <Route path="/fleets/:fleet/:tab" element={<FleetPage />} />
+            <Route path="/fleets/:fleet/releases/:app/:release" element={<ReleasePage />} />
+            <Route path="/fleets/:fleet/releases/:app/:release/:view" element={<ReleasePage />} />
+            <Route path="/fleets/:fleet/os/:version" element={<OsVersionPage />} />
+            <Route path="/fleets/:fleet/devices/:device/releases/:app/:release" element={<ReleasePage />} />
+            <Route path="/fleets/:fleet/devices/:device/releases/:app/:release/:view" element={<ReleasePage />} />
+            <Route path="/fleets/:fleet/devices/:device" element={<DevicePage />} />
+            <Route path="/fleets/:fleet/devices/:device/:tab" element={<DevicePage />} />
+            <Route path="/fleets/:fleet/devices/:device/:tab/:container" element={<DevicePage />} />
+            <Route path="/apps" element={<AppsPage />} />
+            <Route path="/apps/:app" element={<AppPage />} />
+            <Route path="/apps/:app/releases/:release" element={<ReleasePage />} />
+            <Route path="/apps/:app/releases/:release/:view" element={<ReleasePage />} />
+            <Route path="/os" element={<OsPage />} />
+            <Route path="/os/:version" element={<OsVersionPage />} />
             <Route path="/audit" element={<Audit />} />
             <Route path="/access" element={<Access />} />
-            <Route path="*" element={<FleetPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
-        </main>
+        </Shell>
       </BrowserRouter>
     </Me.Provider>
   );

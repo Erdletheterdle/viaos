@@ -58,7 +58,27 @@ in
     environmentFile = mkOption {
       type = types.nullOr types.path;
       default = null;
-      description = "Extra environment, e.g. VIA_ADMIN_TOKEN=... or VIA_SECRET_KEY=..., kept out of the store.";
+      description = "Extra environment, e.g. VIA_ADMIN_TOKEN=..., VIA_SECRET_KEY=... or VIA_GITHUB_CLIENT_SECRET=..., kept out of the store.";
+    };
+    github = {
+      clientId = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = ''
+          Client ID of a GitHub OAuth app, to let people sign in to the console
+          with GitHub. Put VIA_GITHUB_CLIENT_SECRET in environmentFile.
+        '';
+      };
+      org = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Only members of this organisation can sign in. Its owners are admins; other members are viewers.";
+      };
+      adminTeam = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Slug of a team in the organisation whose members are also admins.";
+      };
     };
   };
 
@@ -81,6 +101,13 @@ in
       }
       // lib.optionalAttrs (cfg.trustedKeys != [ ]) {
         VIA_TRUSTED_KEYS = lib.concatStringsSep "," cfg.trustedKeys;
+      }
+      // lib.optionalAttrs (cfg.github.clientId != null) {
+        VIA_GITHUB_CLIENT_ID = cfg.github.clientId;
+        VIA_GITHUB_ORG = cfg.github.org;
+      }
+      // lib.optionalAttrs (cfg.github.adminTeam != null) {
+        VIA_GITHUB_ADMIN_TEAM = cfg.github.adminTeam;
       };
       serviceConfig = {
         ExecStart = "${lib.getExe cfg.package} serve";

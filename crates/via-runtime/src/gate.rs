@@ -58,6 +58,13 @@ pub fn evaluate(readiness: &Readiness, state: &ServiceState) -> Verdict {
             status => Verdict::Pending(format!("{status:?}")),
         },
 
+        // Nothing says it is meant to keep running, so finishing is fine, as it
+        // is to `docker compose up`. Crashing isn't.
+        Readiness::RunningOrFinished => match &state.status {
+            ContainerStatus::Exited { code: 0 } => Verdict::Ready,
+            _ => evaluate(&Readiness::Running, state),
+        },
+
         Readiness::Completed => match &state.status {
             ContainerStatus::Exited { code: 0 } => Verdict::Ready,
             ContainerStatus::Exited { code } => {
@@ -143,7 +150,8 @@ pub async fn wait_for_ready(
                         .or_insert_with(Instant::now);
                     // A completed job has nothing left to destabilize, so the
                     // stability window applies only to long-running services.
-                    let needs_stability = service.readiness != Readiness::Completed;
+                    let needs_stability =
+                        service.readiness != Readiness::Completed && state.status.is_running();
                     if needs_stability && since.elapsed() < stable {
                         all_ready = false;
                         verdicts.insert(

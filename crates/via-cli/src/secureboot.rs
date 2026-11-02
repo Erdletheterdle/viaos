@@ -1,11 +1,10 @@
 //! UEFI Secure Boot: the operator's own keys, and signing what devices boot.
 //!
-//! `via secure-boot keygen <dir>` makes a PK, KEK and db. Their `.auth`
-//! files go onto every base image's ESP under `loader/keys/auto/`, and
-//! systemd-boot enrolls them the first time the device boots with its
-//! firmware in setup mode. From then on the firmware runs only EFI binaries
-//! signed with the db key: systemd-boot and the UKIs `via base-image
-//! --secure-boot` and `via os-release --secure-boot` sign. The UKI carries
+//! A PK, KEK and db, made once (see `keys`). Their `.auth` files go onto every
+//! base image's ESP under `loader/keys/auto/`, and systemd-boot enrolls them
+//! the first time the device boots with its firmware in setup mode. From then
+//! on the firmware runs only EFI binaries signed with the db key: systemd-boot
+//! and the UKIs `via base-image` and `via os-release` always sign. The UKI carries
 //! the kernel, initrd, command line and the verity root hash of /nix/store,
 //! so the signature covers everything the device runs.
 //!
@@ -90,9 +89,9 @@ pub fn keygen(dir: &Path) -> Result<Value> {
     }
     Ok(json!({
         "dir": dir,
-        "next": "Pass --secure-boot to `via base-image` and `via os-release`. Devices enroll these \
-                 keys on first boot if their firmware is in setup mode. Keep the .key files \
-                 off the server, like the update signing key.",
+        "next": "`via base-image` and `via os-release` sign with these. Devices enroll them on \
+                 first boot if their firmware is in setup mode. Keep the .key files off the \
+                 server, like the update signing key.",
     }))
 }
 

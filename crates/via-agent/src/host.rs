@@ -132,6 +132,206 @@ fn statvfs(path: &str) -> Option<(u64, u64, u64)> {
     ))
 }
 
+/// The disk the system lives on and every partition of it, including the
+/// ones nothing here mounts directly: the A/B OS slots.
+#[derive(Debug, Serialize)]
+pub struct WholeDisk {
+    pub device: String,
+    pub total_mb: u64,
+    /// Space no partition claims.
+    pub unallocated_mb: u64,
+    pub partitions: Vec<Partition>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Partition {
+    pub device: String,
+    pub label: Option<String>,
+    pub size_mb: u64,
+    /// Where it's mounted, or the mapped device using it such as `usr`.
+    pub in_use_as: Option<String>,
+    /// Only for what is mounted here: how much of it is free.
+    pub free_mb: Option<u64>,
+}
+
+fn sectors_mb(path: &std::path::Path) -> Option<u64> {
+    let sectors: u64 = fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    Some(sectors * 512 / 1_048_576)
+}
+
+pub fn whole_disk() -> Option<WholeDisk> {
+    let mounts = fs::read_to_string("/proc/self/mounts").ok()?;
+    // /var on viaos, where / is a tmpfs; / on anything else this runs on.
+    let source = ["/var", "/"].iter().find_map(|wanted| {
+        mounts.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            let (dev, mount) = (f.next()?, f.next()?);
+            (mount == *wanted && dev.starts_with("/dev/")).then(|| dev.to_string())
+        })
+    })?;
+    let part = source.strip_prefix("/dev/")?;
+    // /sys/class/block/vda6 links to .../block/vda/vda6.
+    let real = fs::read_link(format!("/sys/class/block/{part}")).ok()?;
+    let disk = real.parent()?.file_name()?.to_str()?.to_string();
+    let root = std::path::PathBuf::from("/sys/block").join(&disk);
+    let total_mb = sectors_mb(&root.join("size"))?;
+
+    let mut labels = std::collections::HashMap::new();
+    for e in fs::read_dir("/dev/disk/by-partlabel")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if let (Ok(target), Some(label)) = (fs::read_link(e.path()), e.file_name().to_str()) {
+            if let Some(dev) = target.file_name().and_then(|n| n.to_str()) {
+                labels.insert(dev.to_string(), decode_label(label));
+            }
+        }
+    }
+
+    let mut partitions = Vec::new();
+    for e in fs::read_dir(&root).ok()?.flatten() {
+        if !e.path().join("partition").exists() {
+            continue;
+        }
+        let device = e.file_name().to_string_lossy().into_owned();
+        let size_mb = sectors_mb(&e.path().join("size")).unwrap_or(0);
+        let mount = mounts.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            let (dev, mount) = (f.next()?, f.next()?);
+            (dev == format!("/dev/{device}")).then(|| mount.to_string())
+        });
+        let free_mb = mount
+            .as_deref()
+            .and_then(statvfs)
+            .map(|(_, _, free)| free / 1_048_576);
+        // Not mounted itself, but held by something like a verity mapping.
+        let held = fs::read_dir(e.path().join("holders"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .find_map(|h| {
+                fs::read_to_string(h.path().join("dm/name"))
+                    .ok()
+                    .map(|n| n.trim().to_string())
+            });
+        partitions.push(Partition {
+            label: labels.get(&device).cloned(),
+            in_use_as: mount.or(held),
+            free_mb,
+            size_mb,
+            device,
+        });
+    }
+    partitions.sort_by_key(|p| natural(&p.device));
+    let allocated: u64 = partitions.iter().map(|p| p.size_mb).sum();
+    Some(WholeDisk {
+        device: disk,
+        total_mb,
+        unallocated_mb: total_mb.saturating_sub(allocated),
+        partitions,
+    })
+}
+
+/// Udev escapes characters in link names as `\\x2d`.
+fn decode_label(link: &str) -> String {
+    let mut out = String::new();
+    let mut rest = link;
+    while let Some(i) = rest.find("\\x") {
+        out.push_str(&rest[..i]);
+        let hex = rest
+            .get(i + 2..i + 4)
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(b) => {
+                out.push(b as char);
+                rest = &rest[i + 4..];
+            }
+            None => {
+                out.push_str("\\x");
+                rest = &rest[i + 2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `vda10` after `vda9`.
+fn natural(device: &str) -> (usize, String) {
+    (device.len(), device.to_string())
+}
+
+/// Memory by program, the biggest first. Threads aren't counted twice, and
+/// kernel threads hold nothing here.
+#[derive(Debug, Serialize)]
+pub struct ProcessMemory {
+    pub name: String,
+    pub processes: u32,
+    pub mb: f64,
+}
+
+pub fn top_processes(limit: usize) -> Vec<ProcessMemory> {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+    let mut by_name: std::collections::HashMap<String, (u32, u64)> = Default::default();
+    for e in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let name = e.file_name();
+        if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Some(rss) = fs::read_to_string(e.path().join("statm"))
+            .ok()
+            .and_then(|s| parse_rss(&s))
+        else {
+            continue;
+        };
+        if rss == 0 {
+            continue;
+        }
+        let comm = fs::read_to_string(e.path().join("comm")).unwrap_or_default();
+        let entry = by_name.entry(comm.trim().to_string()).or_default();
+        entry.0 += 1;
+        entry.1 += rss * page;
+    }
+    let mut out: Vec<ProcessMemory> = by_name
+        .into_iter()
+        .map(|(name, (processes, bytes))| ProcessMemory {
+            name,
+            processes,
+            mb: (bytes as f64 / 104_857.6).round() / 10.0,
+        })
+        .collect();
+    out.sort_by(|a, b| b.mb.total_cmp(&a.mb));
+    out.truncate(limit);
+    out
+}
+
+/// The second field of `/proc/<pid>/statm`, in pages.
+fn parse_rss(statm: &str) -> Option<u64> {
+    statm.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Memory in use, in MB, and the whole.
+pub fn memory_mb() -> Option<(u64, u64)> {
+    let m = memory()?;
+    Some((m.total_mb - m.available_mb, m.total_mb))
+}
+
+/// Total and idle jiffies across all CPUs, for comparing with a later reading.
+pub fn cpu_jiffies() -> Option<(u64, u64)> {
+    parse_cpu(fs::read_to_string("/proc/stat").ok()?.lines().next()?)
+}
+
+fn parse_cpu(line: &str) -> Option<(u64, u64)> {
+    let v: Vec<u64> = line
+        .strip_prefix("cpu")?
+        .split_whitespace()
+        .filter_map(|n| n.parse().ok())
+        .collect();
+    let idle = v.get(3)? + v.get(4).unwrap_or(&0);
+    Some((v.iter().sum(), idle))
+}
+
 fn temperatures() -> Vec<Temperature> {
     let Ok(entries) = fs::read_dir("/sys/class/thermal") else {
         return Vec::new();
@@ -158,4 +358,37 @@ fn percent(part: u64, whole: u64) -> f64 {
         return 0.0;
     }
     (part as f64 * 1000.0 / whole as f64).round() / 10.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_what_proc_says() {
+        assert_eq!(parse_rss("1000 250 30 4 0 50 0"), Some(250));
+        assert_eq!(parse_rss("nope"), None);
+        assert_eq!(parse_cpu("cpu  10 0 5 80 5 0 0 0 0 0"), Some((100, 85)));
+        assert_eq!(parse_cpu("intr 1"), None);
+    }
+
+    #[test]
+    fn partition_labels_are_unescaped() {
+        assert_eq!(decode_label("viaos_1"), "viaos_1");
+        assert_eq!(decode_label("usr\\x2dx86"), "usr-x86");
+        assert_eq!(decode_label("odd\\xzz"), "odd\\xzz");
+    }
+
+    #[test]
+    fn partitions_sort_as_numbers() {
+        let mut v = ["vda10", "vda2", "vda1"];
+        v.sort_by_key(|d| natural(d));
+        assert_eq!(v, ["vda1", "vda2", "vda10"]);
+    }
+
+    #[test]
+    fn this_machine_reads_without_falling_over() {
+        assert!(!top_processes(5).is_empty());
+        assert!(memory_mb().is_some());
+    }
 }

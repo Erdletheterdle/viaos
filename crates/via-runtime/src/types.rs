@@ -1,8 +1,9 @@
 //! Runtime-facing types, independent of any particular container engine.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
-use via_core::{Deployment, ReleaseId, Service};
+use via_core::{ReleaseId, Service};
 
 /// What engine the agent is talking to, reported for device inventory
 /// (spec section 7).
@@ -59,10 +60,6 @@ pub struct ServiceState {
     pub container_name: Option<String>,
     pub status: ContainerStatus,
     pub health: HealthStatus,
-    /// Config hash recorded when the container was created. When this differs
-    /// from the desired hash, the container is stale and must be replaced.
-    pub config_hash: Option<String>,
-    pub release: Option<u64>,
     pub image: Option<String>,
 }
 
@@ -74,8 +71,6 @@ impl ServiceState {
             container_name: None,
             status: ContainerStatus::Absent,
             health: HealthStatus::None,
-            config_hash: None,
-            release: None,
             image: None,
         }
     }
@@ -92,17 +87,11 @@ pub struct ApplyReport {
     /// Containers removed because they belonged to the project but no longer
     /// to the deployment.
     pub removed_orphans: Vec<String>,
-    pub networks_created: Vec<String>,
-    pub volumes_created: Vec<String>,
 }
 
 impl ApplyReport {
     pub fn changed(&self) -> bool {
-        !self.created.is_empty()
-            || !self.replaced.is_empty()
-            || !self.removed_orphans.is_empty()
-            || !self.networks_created.is_empty()
-            || !self.volumes_created.is_empty()
+        !self.created.is_empty() || !self.replaced.is_empty() || !self.removed_orphans.is_empty()
     }
 
     pub fn summary(&self) -> String {
@@ -131,6 +120,10 @@ impl ApplyReport {
 #[derive(Clone, Debug, Default)]
 pub struct ApplyContext {
     pub release: Option<ReleaseId>,
+    /// Where this release's compose file and project files are laid out. The
+    /// path is the same for every release of an app, so Compose sees the same
+    /// bind mounts and doesn't replace a container only for a new directory.
+    pub project_dir: Option<PathBuf>,
     /// Values applied to every service in the deployment.
     ///
     /// Application variables and secrets land here: they describe the device's
@@ -261,63 +254,4 @@ pub enum ExecChunk {
     Exit {
         code: Option<i64>,
     },
-}
-
-/// Names Via gives to the Docker objects it owns.
-///
-/// Centralized so that recognizing "things Via created" is one rule rather
-/// than a pattern repeated at every call site.
-pub struct Naming;
-
-impl Naming {
-    pub fn container(project: &str, service: &str) -> String {
-        format!("{project}-{service}")
-    }
-
-    /// Implicit network every service joins when it declares none, so services
-    /// resolve each other by name exactly as they do under Compose.
-    pub fn default_network(project: &str) -> String {
-        format!("{project}_default")
-    }
-
-    pub fn network(project: &str, declared: &str) -> String {
-        format!("{project}_{declared}")
-    }
-
-    pub fn volume(project: &str, declared: &str) -> String {
-        format!("{project}_{declared}")
-    }
-}
-
-/// Networks a service should actually be attached to.
-///
-/// Returns `None` when `network_mode` takes over, in which case Docker ignores
-/// network attachment entirely.
-pub fn resolved_networks(deployment: &Deployment, service: &Service) -> Option<Vec<String>> {
-    if service.network_mode.is_some() {
-        return None;
-    }
-    if service.networks.is_empty() {
-        return Some(vec![Naming::default_network(&deployment.project)]);
-    }
-    Some(
-        service
-            .networks
-            .iter()
-            .map(|n| match deployment.networks.get(n) {
-                // An external network is referenced by its real name; Via did
-                // not create it and must not rename it.
-                Some(net) if net.external => n.clone(),
-                _ => Naming::network(&deployment.project, n),
-            })
-            .collect(),
-    )
-}
-
-/// Whether the deployment needs the implicit default network.
-pub fn needs_default_network(deployment: &Deployment) -> bool {
-    deployment
-        .services
-        .values()
-        .any(|s| s.network_mode.is_none() && s.networks.is_empty())
 }

@@ -4,6 +4,33 @@ The control plane is one binary with one SQLite file. It needs a public
 HTTPS address that devices can reach. Devices dial out to it, so they can
 be behind NAT; the server cannot be.
 
+## Compose
+
+A device runs your file with the official `docker compose`, so it means what it
+means on your laptop: `extends`, `include`, profiles, `env_file`, `configs`,
+`secrets`, replicas, `network_mode: service:x` and the rest. There is no Via
+parser to disagree with it. `via` and the OS pin the same Compose from the same
+nixpkgs.
+
+`via release` runs `docker compose config`, `build` and `pull`, then packs:
+
+- the file Compose flattened, with `${VARS}` left for the device,
+- the local files it reads: bind mount sources under the project, `env_file`s,
+  `configs` and `secrets` from files, and `.env`, all covered by the signature,
+- the images, because a device doesn't pull.
+
+On the device it runs from `/var/lib/via/apps/<app>/` as `docker compose -p <app>`,
+so `docker compose ls` and `ps` work there too. What differs from your laptop:
+
+- `up` never pulls or builds. A release brought its images.
+- A file in a bind mount that a container wrote stays across releases. A file the
+  release carries is overwritten by the next one.
+- A path outside the project, like `../data:/data`, fails the build. An absolute
+  path means that path on the device.
+- `up` runs again when the device boots, so an app comes back even without a
+  `restart:`. A service without one still won't restart if it crashes; the build
+  warns.
+
 ## 1. Run it
 
 On NixOS, with Caddy getting the certificate:
@@ -74,21 +101,20 @@ provisioning image made from then on writes that key into the device's
 are not signed by it. Keep the private key off the server: it belongs in
 CI or on the machine you release from.
 
-## 4. Secure Boot (optional)
+## 4. Signing
 
-```bash
-via secure-boot keygen ~/.config/via/secure-boot
-export VIA_SECURE_BOOT_KEYS=~/.config/via/secure-boot
-```
+There is nothing to set up. `via` makes its keys in `~/.config/via` the first
+time it needs them, and signs everything it publishes: the server refuses an OS
+version that isn't signed, so every version can go on every device. Back up
+that directory, and give the server `signing.key.pub` as `VIA_TRUSTED_KEYS`.
 
-With that set, `via base-image` signs systemd-boot and the UKI on the
-image and puts the keys on its boot partition; `via os-release` signs each
-update's UKI. A device whose firmware is in setup mode (clear the keys in
-its firmware menu once) enrolls them on first boot, reboots, and from then
-on runs only what these keys signed. The UKI holds the kernel, initrd,
-command line and the root hash of the dm-verity /nix/store, so that is the
-whole OS. `device_status` shows `secure_boot`, and a device enforcing it
-refuses an OS update that was not signed for it.
+Secure Boot uses the same images. `via base-image` signs systemd-boot and the
+UKI and puts the keys on the boot partition. A device whose firmware is in
+setup mode (clear the keys in its firmware menu once) enrolls them on first
+boot, reboots, and from then on runs only what these keys signed. The UKI holds
+the kernel, initrd, command line and the root hash of the dm-verity /nix/store,
+so that is the whole OS. A device left out of setup mode with Secure Boot off
+just boots them. Losing the keys means re-imaging devices that enrolled them.
 
 The keys replace the firmware's own, Microsoft's included. Hardware whose
 graphics or network card loads a Microsoft-signed option ROM at boot will
@@ -99,7 +125,6 @@ off the server.
 
 ```bash
 export VIA_SERVER=https://via.example.com VIA_TOKEN=<token>
-export VIA_SIGNING_KEY=~/.config/via/signing.key
 nix build .#images.x86_64 -o image && via base-image image/viaos_1.raw --arch x86_64
 nix build .#images.aarch64 -o image-arm && via base-image image-arm/viaos_1.raw --arch aarch64
 ```
@@ -130,24 +155,121 @@ services:
 ```
 
 Set values on the console's Variables page (or with `set_variable`), for a
-whole fleet or one device; a device's value beats its fleet's. Online devices
-re-apply at once, and only services that listed the name are recreated.
-Offline devices catch up when they reconnect. A service never receives a name
-it did not list, and a device page warns when a running release is missing one.
+whole fleet or one device, and for every service that declares the name or just
+one of them. The strongest value wins, weakest first:
+
+1. the release's default (below)
+2. fleet
+3. fleet, for one service
+4. device
+5. device, for one service
+
+A device's value always beats a fleet's, even one aimed at a service. A service
+never receives a name it did not declare, however the value was aimed.
+
+Online devices re-apply at once and offline ones catch up when they reconnect.
+Only containers whose environment actually changed are replaced. Every other
+container keeps running with the same ID, including ones that `depends_on` the
+replaced service, because each container is compared on its own and nothing
+cascades. A value set for one service leaves the rest alone, and so does moving
+a value between layers without changing it. The change still answers to the
+health gate: if it fails, the device puts back the last values that passed,
+replacing only those containers again, and `deploy.state` in `device_health`
+says `rolled_back`. The value you set stays on the server, and the device tries
+again the next time it changes. A device page warns when a running release is
+missing a name.
 
 Mark a value secret and it is encrypted on the server and never shown again.
 The key is `secret.key` in the data directory, or `VIA_SECRET_KEY`: back it up
 separately from the database, because without it the secrets are gone, and
 with it a stolen backup is readable. Devices receive plaintext over their TLS
-connection and keep it readable by root only in `/var/lib/via/env.json`, so a
-release restarts, rolls back and recovers with no network. Don't give Claude a
-real secret: it would pass through the conversation. Use the console.
+connection and keep it readable by root only, in `/var/lib/via/env.json` and, as
+the last values that passed the gate, in each release's `applied-env.json`, so
+a release restarts, rolls back and recovers with no network. Don't give Claude
+a real secret: it would pass through the conversation. Use the console.
+
+### Describing them in the release
+
+A top-level `x-via` in the compose file says what a release takes. Every field
+is optional, and a plain `docker compose up` ignores it:
+
+```yaml
+x-via:
+  variables:
+    API_KEY: { description: "Key for the upstream API", secret: true, services: [web] }
+    LOG_LEVEL: { description: "How much to say", default: "info" }
+```
+
+- `services` gives the name to those services, the same as each listing a bare
+  `- KEY`. Services that list it, or use `${KEY}`, get it as well.
+- `default` is the weakest value. It is written into the release, so a device
+  applies it offline. A name with a default never counts as missing.
+- `required` defaults to true, or false if there is a default. An optional name
+  with no value isn't reported as missing.
+- `secret: true` tells the console to ask for a secret. It can't have a default,
+  because a release holds no secrets; the build refuses it. It doesn't stop
+  someone setting a plain value.
+
+`${KEY}` anywhere in a service works as it does in Compose, including `:-`
+defaults and `:?` errors, and its value comes from the app's variables. A value
+set for one service reaches that container's environment; `${KEY}` is read once
+for the whole file, so it takes the app's value.
+
+Bad names and a secret with a default fail the build. A release with
+no `x-via` still works, and its bare names are reported as required. `via-server`
+reads this from the release's `deployment.json` when a bundle is uploaded and
+keeps it beside the bundle; it never parses compose or runs anything from a
+bundle. `list_variables` returns each app's newest release's description under
+`schemas`.
 
 ## The web console
 
-It is the server's own address, with nothing more to install. Sign in with an
-API token; viewers can look but not change anything, and only admins get
-terminals. It calls the same tools Claude does, so the audit log covers both.
+It is the server's own address, with nothing more to install. Navigation is one
+hierarchy, Fleets > fleet > device, with Apps and OS beside it, and the sidebar
+opens out as you go. Sign in with an API token or GitHub; viewers can look but
+not change anything, and only admins get terminals. It calls the same tools
+Claude does, so the audit log covers both.
+
+### Fleets inside fleets
+
+Fleets nest as deep as you like, so a level can mean a customer, a site or a
+house. A fleet's variables reach everything under it, and the nearer fleet wins,
+with the device above them all. A deploy or OS update sent to a fleet covers
+everything under it too, and the preview lists which devices that is. Tags, such
+as `customer:acme`, are labels for finding fleets from the Fleets page and change
+nothing else. Names stay unique across the whole tree. Each fleet's Settings page
+moves it, tags it, or deletes it once it's empty.
+
+### Signing in with GitHub
+
+1. Create an OAuth app under your organisation's settings. Its callback URL is
+   `<public url>/v1/auth/github/callback`.
+2. Give the server `VIA_GITHUB_CLIENT_ID`, `VIA_GITHUB_CLIENT_SECRET` and
+   `VIA_GITHUB_ORG` (with the NixOS module: `github.clientId`, `github.org`, and
+   the secret in `environmentFile`).
+3. If the organisation restricts OAuth apps, an owner approves this one.
+
+Only active members of the organisation get in. Its owners are admins, and so is
+anyone on the team named by `VIA_GITHUB_ADMIN_TEAM`; other members are viewers.
+A session lasts 12 hours, so someone removed from the organisation loses access
+within that time. For GitHub Enterprise Server, set `VIA_GITHUB_URL`.
+
+### Hardware
+
+What Enroll offers comes from the server, so adding a board needs no console
+change:
+
+```bash
+via-server device-type set rock-5b --name "Rock 5B" --arch aarch64 --detail "RK3588, UEFI"
+via-server device-type list
+via-server device-type remove rock-5b
+```
+
+A type uses `viaos-<id>.raw` if one was uploaded with `via base-image
+--device-type <id>`, and otherwise the base image for its architecture.
+Enroll marks a type with neither as `no image`. The arm64 base image serves both
+Raspberry Pi and generic UEFI boards. Registering a type doesn't build an OS for
+it: x86_64 and aarch64 are the architectures this repository builds.
 
 To work on it:
 

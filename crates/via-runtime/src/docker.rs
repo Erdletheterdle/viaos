@@ -1,36 +1,57 @@
 //! Docker implementation of [`Runtime`].
 //!
-//! Talks to the Docker Engine API directly rather than shelling out to the
-//! `docker` binary (spec section 17): shelling out means parsing human output,
-//! and it makes the agent depend on a CLI that may not exist on a
-//! container-only host.
+//! `docker compose` decides what runs and starts it (see [`crate::compose`]).
+//! The Engine API is for reading what it started: it answers in structured
+//! data, and logs and stats come as streams.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::LogOutput;
-use bollard::models::{
-    ContainerCreateBody, ContainerStateStatusEnum, DeviceMapping as DockerDevice, EndpointSettings,
-    HealthConfig, HealthStatusEnum, HostConfig, Mount as DockerMount, MountTmpfsOptions, MountType,
-    NetworkCreateRequest, NetworkingConfig, PortBinding, RestartPolicy as DockerRestartPolicy,
-    RestartPolicyNameEnum, VolumeCreateRequest,
-};
+use bollard::models::{ContainerStateStatusEnum, ContainerSummary, HealthStatusEnum};
 use bollard::query_parameters as qp;
 use futures::StreamExt;
-use tokio::time::{Duration, Instant, sleep};
-use via_core::{Deployment, Mount, Readiness, RestartPolicy, Service};
+use via_core::{Deployment, LABEL_LEGACY_PROJECT, LABEL_ONE_OFF, LABEL_PROJECT, LABEL_SERVICE};
 
-use crate::plan::*;
 use crate::types::*;
 use crate::{Error, Runtime};
 
-/// Nanoseconds per second, the unit Docker's healthcheck fields use.
-const NANOS: i64 = 1_000_000_000;
+/// What `docker stats` counts as in use: page cache the kernel can drop at
+/// once isn't memory the service is holding on to.
+fn memory_in_use(usage: u64, inactive_file: Option<u64>) -> u64 {
+    usage.saturating_sub(inactive_file.unwrap_or(0))
+}
 
-/// How often to re-poll while waiting on a dependency or a health gate.
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// One reading of one service. The CPU counters only mean something compared
+/// with an earlier reading.
+#[derive(Debug, Clone)]
+pub struct ServiceStats {
+    pub service: String,
+    pub memory_bytes: u64,
+    pub cpu_total_ns: u64,
+    pub system_cpu_ns: u64,
+    pub online_cpus: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct VolumeUsage {
+    /// The name Docker knows it by; see [`Deployment::volume_name`].
+    pub name: String,
+    pub bytes: u64,
+    /// How many containers use it.
+    pub containers: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DiskUsage {
+    pub images_bytes: u64,
+    pub containers_bytes: u64,
+    pub volumes_bytes: u64,
+    pub build_cache_bytes: u64,
+    pub volumes: Vec<VolumeUsage>,
+}
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -51,16 +72,95 @@ impl DockerRuntime {
         &self.docker
     }
 
-    /// Containers Via owns for a project, whether or not they are running.
-    async fn project_containers(
-        &self,
-        project: &str,
-    ) -> Result<Vec<bollard::models::ContainerSummary>, Error> {
-        let mut filters = HashMap::new();
-        filters.insert(
-            "label".to_string(),
-            vec![format!("{LABEL_PROJECT}={project}")],
-        );
+    /// What each running service of a deployment is using now. Cheap enough to
+    /// call every few seconds: `one_shot` skips Docker's usual one-second wait
+    /// for a second CPU reading, and the caller compares samples itself.
+    pub async fn service_stats(&self, deployment: &Deployment) -> Result<Vec<ServiceStats>, Error> {
+        let mut out = Vec::new();
+        let containers = self.containers(&deployment.project).await?;
+        for service in deployment.services.keys() {
+            let mut total: Option<ServiceStats> = None;
+            for name in containers_of(&containers, service) {
+                let options = qp::StatsOptionsBuilder::new()
+                    .stream(false)
+                    .one_shot(true)
+                    .build();
+                let mut stream = self.docker.stats(&name, Some(options));
+                // A container that just went away isn't in the answer.
+                let Some(Ok(stats)) = stream.next().await else {
+                    continue;
+                };
+                let memory = stats.memory_stats.unwrap_or_default();
+                let Some(usage) = memory.usage else {
+                    continue;
+                };
+                let inactive = memory.stats.as_ref().and_then(|s| {
+                    s.get("inactive_file")
+                        .or_else(|| s.get("total_inactive_file"))
+                        .copied()
+                });
+                let cpu = stats.cpu_stats.unwrap_or_default();
+                let total = total.get_or_insert(ServiceStats {
+                    service: service.clone(),
+                    memory_bytes: 0,
+                    cpu_total_ns: 0,
+                    system_cpu_ns: cpu.system_cpu_usage.unwrap_or(0),
+                    online_cpus: cpu.online_cpus.unwrap_or(1),
+                });
+                total.memory_bytes += memory_in_use(usage, inactive);
+                total.cpu_total_ns += cpu.cpu_usage.and_then(|c| c.total_usage).unwrap_or(0);
+            }
+            out.extend(total);
+        }
+        Ok(out)
+    }
+
+    /// How much disk Docker is holding. This can walk every volume, so it isn't
+    /// for calling often.
+    pub async fn disk_usage(&self) -> Result<DiskUsage, Error> {
+        let options = qp::DataUsageOptionsBuilder::new().verbose(true).build();
+        let df = self.docker.df(Some(options)).await.map_err(Error::docker)?;
+        let bytes = |v: Option<i64>| v.unwrap_or(0).max(0) as u64;
+        let (volume_total, items) = df
+            .volume_usage
+            .map(|v| (v.total_size, v.items.unwrap_or_default()))
+            .unwrap_or((None, Vec::new()));
+        let volumes = items
+            .iter()
+            .filter_map(|v| {
+                Some(VolumeUsage {
+                    name: v["Name"].as_str()?.to_string(),
+                    bytes: v["UsageData"]["Size"].as_i64().unwrap_or(0).max(0) as u64,
+                    containers: v["UsageData"]["RefCount"].as_i64().unwrap_or(0).max(0) as u64,
+                })
+            })
+            .collect();
+        Ok(DiskUsage {
+            images_bytes: bytes(df.image_usage.and_then(|u| u.total_size)),
+            containers_bytes: bytes(df.container_usage.and_then(|u| u.total_size)),
+            volumes_bytes: bytes(volume_total),
+            build_cache_bytes: bytes(df.build_cache_usage.and_then(|u| u.total_size)),
+            volumes,
+        })
+    }
+
+    /// A project's containers, stopped ones too, without `docker compose run`
+    /// one-offs.
+    async fn containers(&self, project: &str) -> Result<Vec<ContainerSummary>, Error> {
+        let mut containers = self
+            .labelled_containers(&format!("{LABEL_PROJECT}={project}"))
+            .await?;
+        containers.retain(|c| {
+            c.labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_ONE_OFF))
+                .is_none_or(|v| v != "True")
+        });
+        Ok(containers)
+    }
+
+    async fn labelled_containers(&self, label: &str) -> Result<Vec<ContainerSummary>, Error> {
+        let filters = HashMap::from([("label".to_string(), vec![label.to_string()])]);
         let options = qp::ListContainersOptionsBuilder::new()
             .all(true)
             .filters(&filters)
@@ -69,6 +169,54 @@ impl DockerRuntime {
             .list_containers(Some(options))
             .await
             .map_err(Error::docker)
+    }
+
+    /// Remove what viaos started before it ran Compose, which would otherwise
+    /// hold the same ports. Its volumes stay: they have the names Compose uses.
+    async fn retire_legacy(&self, project: &str) -> Result<(), Error> {
+        let label = format!("{LABEL_LEGACY_PROJECT}={project}");
+        for container in self.labelled_containers(&label).await? {
+            let Some(id) = container.id else { continue };
+            let options = qp::RemoveContainerOptionsBuilder::new().force(true).build();
+            match self.docker.remove_container(&id, Some(options)).await {
+                Ok(()) => {}
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(e) => return Err(Error::docker(e)),
+            }
+        }
+        let filters = HashMap::from([("label".to_string(), vec![label])]);
+        let options = qp::ListNetworksOptionsBuilder::new()
+            .filters(&filters)
+            .build();
+        let networks = self
+            .docker
+            .list_networks(Some(options))
+            .await
+            .map_err(Error::docker)?;
+        for network in networks {
+            if let Some(id) = network.id {
+                self.docker
+                    .remove_network(&id)
+                    .await
+                    .map_err(Error::docker)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Each service's container ids.
+    async fn ids(&self, project: &str) -> Result<BTreeMap<String, BTreeSet<String>>, Error> {
+        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for c in self.containers(project).await? {
+            if let (Some(service), Some(id)) =
+                (c.labels.as_ref().and_then(|l| l.get(LABEL_SERVICE)), c.id)
+            {
+                out.entry(service.clone()).or_default().insert(id);
+            }
+        }
+        Ok(out)
     }
 
     async fn inspect_service(&self, name: &str) -> Result<Option<ServiceState>, Error> {
@@ -118,373 +266,8 @@ impl DockerRuntime {
             container_name: inspect.name.map(|n| n.trim_start_matches('/').to_string()),
             status,
             health,
-            config_hash: labels.get(LABEL_CONFIG_HASH).cloned(),
-            release: labels.get(LABEL_RELEASE).and_then(|r| r.parse().ok()),
             image: inspect.config.and_then(|c| c.image),
         }))
-    }
-
-    /// Create the networks a deployment needs, skipping external ones.
-    async fn ensure_networks(
-        &self,
-        deployment: &Deployment,
-        report: &mut ApplyReport,
-    ) -> Result<(), Error> {
-        let existing: Vec<String> = self
-            .docker
-            .list_networks(None::<qp::ListNetworksOptions>)
-            .await
-            .map_err(Error::docker)?
-            .into_iter()
-            .filter_map(|n| n.name)
-            .collect();
-
-        let mut wanted: Vec<(String, Option<&via_core::Network>)> = Vec::new();
-        if needs_default_network(deployment) {
-            wanted.push((Naming::default_network(&deployment.project), None));
-        }
-        for (name, net) in &deployment.networks {
-            if net.external {
-                // Via did not create it and must never create or delete it.
-                if !existing.iter().any(|e| e == name) {
-                    return Err(Error::MissingExternalNetwork { name: name.clone() });
-                }
-                continue;
-            }
-            wanted.push((Naming::network(&deployment.project, name), Some(net)));
-        }
-
-        for (full_name, spec) in wanted {
-            if existing.iter().any(|e| e == &full_name) {
-                continue;
-            }
-            let request = NetworkCreateRequest {
-                name: full_name.clone(),
-                driver: spec
-                    .and_then(|s| s.driver.clone())
-                    .or_else(|| Some("bridge".into())),
-                internal: spec.map(|s| s.internal),
-                options: spec.map(|s| s.driver_opts.clone().into_iter().collect()),
-                labels: Some(merge_labels(
-                    object_labels(&deployment.project),
-                    spec.map(|s| &s.labels),
-                )),
-                ..Default::default()
-            };
-            self.docker
-                .create_network(request)
-                .await
-                .map_err(Error::docker)?;
-            report.networks_created.push(full_name);
-        }
-        Ok(())
-    }
-
-    /// Create named volumes that do not yet exist.
-    ///
-    /// Existing volumes are never touched: their whole purpose is to outlive
-    /// releases (spec section 19).
-    async fn ensure_volumes(
-        &self,
-        deployment: &Deployment,
-        report: &mut ApplyReport,
-    ) -> Result<(), Error> {
-        let existing: Vec<String> = self
-            .docker
-            .list_volumes(None::<qp::ListVolumesOptions>)
-            .await
-            .map_err(Error::docker)?
-            .volumes
-            .unwrap_or_default()
-            .into_iter()
-            .map(|v| v.name)
-            .collect();
-
-        // Anonymous volumes are synthesized by the normalizer and appear only
-        // on a mount, never in `volumes:`.
-        let mut wanted: Vec<(String, Option<&via_core::Volume>)> = Vec::new();
-        for (name, vol) in &deployment.volumes {
-            if vol.external {
-                if !existing.iter().any(|e| e == name) {
-                    return Err(Error::MissingExternalVolume { name: name.clone() });
-                }
-                continue;
-            }
-            wanted.push((Naming::volume(&deployment.project, name), Some(vol)));
-        }
-        for svc in deployment.services.values() {
-            for m in &svc.mounts {
-                if let Mount::Volume { source, .. } = m {
-                    if !deployment.volumes.contains_key(source) {
-                        let full = Naming::volume(&deployment.project, source);
-                        if !wanted.iter().any(|(n, _)| n == &full) {
-                            wanted.push((full, None));
-                        }
-                    }
-                }
-            }
-        }
-
-        for (full_name, spec) in wanted {
-            if existing.iter().any(|e| e == &full_name) {
-                continue;
-            }
-            let options = VolumeCreateRequest {
-                name: Some(full_name.clone()),
-                driver: spec.and_then(|s| s.driver.clone()),
-                driver_opts: spec.map(|s| s.driver_opts.clone().into_iter().collect()),
-                labels: Some(merge_labels(
-                    object_labels(&deployment.project),
-                    spec.map(|s| &s.labels),
-                )),
-                ..Default::default()
-            };
-            self.docker
-                .create_volume(options)
-                .await
-                .map_err(Error::docker)?;
-            report.volumes_created.push(full_name);
-        }
-        Ok(())
-    }
-
-    /// Wait until a service satisfies a `depends_on` condition.
-    async fn wait_for_condition(
-        &self,
-        deployment: &Deployment,
-        dep: &via_core::Dependency,
-        deadline: Instant,
-    ) -> Result<(), Error> {
-        use via_core::DependencyCondition::*;
-        let Some(service) = deployment.services.get(&dep.service) else {
-            return Ok(());
-        };
-        let name = container_name(deployment, service);
-
-        loop {
-            let state = self.inspect_service(&name).await?;
-            let satisfied = match (&dep.condition, &state) {
-                (Started, Some(s)) => {
-                    s.status.is_running() || matches!(s.status, ContainerStatus::Exited { .. })
-                }
-                (Healthy, Some(s)) => s.health == HealthStatus::Healthy,
-                (CompletedSuccessfully, Some(s)) => {
-                    matches!(s.status, ContainerStatus::Exited { code: 0 })
-                }
-                (_, None) => false,
-            };
-            if satisfied {
-                return Ok(());
-            }
-            // A dependency that has already failed will never be satisfied, so
-            // fail now rather than burning the whole gate timeout.
-            if let Some(s) = &state {
-                if let ContainerStatus::Exited { code } = s.status {
-                    if code != 0 && !matches!(dep.condition, Started) {
-                        return Err(Error::DependencyFailed {
-                            service: dep.service.clone(),
-                            reason: format!("exited with code {code}"),
-                        });
-                    }
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(Error::DependencyTimeout {
-                    service: dep.service.clone(),
-                    condition: format!("{:?}", dep.condition),
-                });
-            }
-            sleep(POLL_INTERVAL).await;
-        }
-    }
-
-    async fn remove_container(&self, name: &str) -> Result<(), Error> {
-        let options = qp::RemoveContainerOptionsBuilder::new()
-            .force(true)
-            .v(false)
-            .build();
-        match self.docker.remove_container(name, Some(options)).await {
-            Ok(()) => Ok(()),
-            Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404, ..
-            }) => Ok(()),
-            Err(e) => Err(Error::docker(e)),
-        }
-    }
-
-    /// Build the container specification for a service.
-    fn container_config(
-        &self,
-        deployment: &Deployment,
-        service: &Service,
-        ctx: &ApplyContext,
-        hash: &str,
-    ) -> ContainerCreateBody {
-        let mut mounts = Vec::new();
-        for m in &service.mounts {
-            mounts.push(match m {
-                Mount::Volume {
-                    source,
-                    target,
-                    read_only,
-                } => DockerMount {
-                    typ: Some(MountType::VOLUME),
-                    // Volumes declared in the manifest are namespaced by
-                    // project; external ones keep their real name.
-                    source: Some(match deployment.volumes.get(source) {
-                        Some(v) if v.external => source.clone(),
-                        _ => Naming::volume(&deployment.project, source),
-                    }),
-                    target: Some(target.clone()),
-                    read_only: Some(*read_only),
-                    ..Default::default()
-                },
-                Mount::Bind {
-                    source,
-                    target,
-                    read_only,
-                } => DockerMount {
-                    typ: Some(MountType::BIND),
-                    source: Some(source.clone()),
-                    target: Some(target.clone()),
-                    read_only: Some(*read_only),
-                    ..Default::default()
-                },
-                Mount::Tmpfs { target, size_bytes } => DockerMount {
-                    typ: Some(MountType::TMPFS),
-                    target: Some(target.clone()),
-                    tmpfs_options: Some(MountTmpfsOptions {
-                        size_bytes: size_bytes.map(|s| s as i64),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-            });
-        }
-
-        let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-        let mut exposed = Vec::new();
-        for p in &service.ports {
-            let key = format!("{}/{}", p.container_port, p.protocol);
-            exposed.push(key.clone());
-            port_bindings
-                .entry(key)
-                .or_insert_with(|| Some(Vec::new()))
-                .as_mut()
-                .unwrap()
-                .push(PortBinding {
-                    host_ip: p.host_ip.clone(),
-                    // An empty host port asks Docker for an ephemeral one,
-                    // which is what Compose's bare `- "80"` means.
-                    host_port: Some(p.host_port.map(|h| h.to_string()).unwrap_or_default()),
-                });
-        }
-
-        let restart_policy = Some(match &service.restart {
-            RestartPolicy::No => DockerRestartPolicy {
-                name: Some(RestartPolicyNameEnum::NO),
-                maximum_retry_count: None,
-            },
-            RestartPolicy::Always => DockerRestartPolicy {
-                name: Some(RestartPolicyNameEnum::ALWAYS),
-                maximum_retry_count: None,
-            },
-            RestartPolicy::UnlessStopped => DockerRestartPolicy {
-                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
-                maximum_retry_count: None,
-            },
-            RestartPolicy::OnFailure { max_retries } => DockerRestartPolicy {
-                name: Some(RestartPolicyNameEnum::ON_FAILURE),
-                maximum_retry_count: max_retries.map(|r| r as i64),
-            },
-        });
-
-        let healthcheck = service.healthcheck.as_ref().map(|hc| HealthConfig {
-            test: Some(hc.test.clone()),
-            interval: hc.interval_secs.map(|s| s as i64 * NANOS),
-            timeout: hc.timeout_secs.map(|s| s as i64 * NANOS),
-            retries: hc.retries.map(|r| r as i64),
-            start_period: hc.start_period_secs.map(|s| s as i64 * NANOS),
-            start_interval: None,
-        });
-
-        let networking_config = resolved_networks(deployment, service).map(|nets| {
-            let mut endpoints = HashMap::new();
-            for n in nets {
-                endpoints.insert(
-                    n,
-                    EndpointSettings {
-                        // The service name must resolve on the network, or
-                        // `depends_on` peers cannot address each other the way
-                        // they do under Compose.
-                        aliases: Some(vec![service.name.clone()]),
-                        ..Default::default()
-                    },
-                );
-            }
-            NetworkingConfig {
-                endpoints_config: Some(endpoints),
-            }
-        });
-
-        let host_config = HostConfig {
-            mounts: (!mounts.is_empty()).then_some(mounts),
-            port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
-            restart_policy,
-            network_mode: service.network_mode.clone(),
-            privileged: Some(service.privileged),
-            cap_add: (!service.cap_add.is_empty()).then(|| service.cap_add.clone()),
-            cap_drop: (!service.cap_drop.is_empty()).then(|| service.cap_drop.clone()),
-            devices: (!service.devices.is_empty()).then(|| {
-                service
-                    .devices
-                    .iter()
-                    .map(|d| DockerDevice {
-                        path_on_host: Some(d.host_path.clone()),
-                        path_in_container: Some(d.effective_container_path().to_string()),
-                        cgroup_permissions: Some(d.permissions.clone()),
-                    })
-                    .collect()
-            }),
-            extra_hosts: (!service.extra_hosts.is_empty()).then(|| service.extra_hosts.clone()),
-            dns: (!service.dns.is_empty()).then(|| service.dns.clone()),
-            group_add: (!service.group_add.is_empty()).then(|| service.group_add.clone()),
-            sysctls: (!service.sysctls.is_empty())
-                .then(|| service.sysctls.clone().into_iter().collect()),
-            init: service.init,
-            pid_mode: service.pid.clone(),
-            ipc_mode: service.ipc.clone(),
-            shm_size: service.shm_size_bytes.map(|s| s as i64),
-            readonly_rootfs: Some(service.read_only),
-            ..Default::default()
-        };
-
-        ContainerCreateBody {
-            image: Some(service.image.reference.clone()),
-            cmd: service.command.clone(),
-            entrypoint: service.entrypoint.clone(),
-            env: Some(env_list(service, ctx)),
-            labels: Some(
-                container_labels(deployment, service, ctx, hash)
-                    .into_iter()
-                    .collect(),
-            ),
-            hostname: service
-                .hostname
-                .clone()
-                .or_else(|| Some(service.name.clone())),
-            user: service.user.clone(),
-            working_dir: service.working_dir.clone(),
-            tty: Some(service.tty),
-            open_stdin: Some(service.stdin_open),
-            stop_signal: service.stop_signal.clone(),
-            stop_timeout: service.stop_grace_period_secs.map(|s| s as i64),
-            exposed_ports: (!exposed.is_empty()).then_some(exposed),
-            healthcheck,
-            host_config: Some(host_config),
-            networking_config,
-            ..Default::default()
-        }
     }
 }
 
@@ -540,11 +323,11 @@ impl Runtime for DockerRuntime {
         deployment: &Deployment,
         ctx: &ApplyContext,
     ) -> Result<ApplyReport, Error> {
-        let mut report = ApplyReport::default();
-
-        // Refuse to start anything if an image is missing. A bundle is
-        // self-contained by definition, so a missing image means the release
-        // is broken, not that something should be fetched.
+        let Some(dir) = &ctx.project_dir else {
+            return Err(Error::NoComposeFile);
+        };
+        // A missing image means the release is broken, and saying which beats
+        // whatever a failed `up` would. A release brings its images.
         for image in deployment.required_images() {
             if !self.image_present(&image.reference).await? {
                 return Err(Error::ImageNotLoaded {
@@ -553,116 +336,42 @@ impl Runtime for DockerRuntime {
             }
         }
 
-        self.ensure_networks(deployment, &mut report).await?;
-        self.ensure_volumes(deployment, &mut report).await?;
+        self.retire_legacy(&deployment.project).await?;
+        let before = self.ids(&deployment.project).await?;
+        crate::compose::up(deployment, ctx, dir).await?;
+        let after = self.ids(&deployment.project).await?;
 
-        let order = deployment
-            .start_order()
-            .map_err(|c| Error::DependencyCycle {
-                path: c.to_string(),
-            })?;
-        let deadline = Instant::now() + Duration::from_secs(deployment.health_gate.timeout_secs);
-
-        for service_name in &order {
-            let service = &deployment.services[*service_name];
-            let name = container_name(deployment, service);
-            let hash = config_hash(deployment, service, ctx);
-
-            for dep in &service.depends_on {
-                self.wait_for_condition(deployment, dep, deadline).await?;
-            }
-
-            let existing = self.inspect_service(&name).await?;
-            let up_to_date = existing
-                .as_ref()
-                .is_some_and(|s| s.config_hash.as_deref() == Some(hash.as_str()));
-
-            if up_to_date {
-                let state = existing.as_ref().unwrap();
-                // Configuration matches; only start it if it is not already up.
-                // Leaving a healthy container alone is what makes reconciling
-                // on a timer safe.
-                match state.status {
-                    ContainerStatus::Running | ContainerStatus::Restarting => {
-                        report.unchanged.push(service.name.clone());
-                    }
-                    ContainerStatus::Exited { code: 0 }
-                        if service.readiness == Readiness::Completed =>
-                    {
-                        report.unchanged.push(service.name.clone());
-                    }
-                    _ => {
-                        self.docker
-                            .start_container(&name, None::<qp::StartContainerOptions>)
-                            .await
-                            .map_err(Error::docker)?;
-                        report.unchanged.push(service.name.clone());
-                        report.started.push(service.name.clone());
-                    }
-                }
-                continue;
-            }
-
-            let replacing = existing.is_some();
-            if replacing {
-                self.remove_container(&name).await?;
-            }
-
-            let config = self.container_config(deployment, service, ctx, &hash);
-            let options = qp::CreateContainerOptionsBuilder::new().name(&name).build();
-            self.docker
-                .create_container(Some(options), config)
-                .await
-                .map_err(Error::docker)?;
-            self.docker
-                .start_container(&name, None::<qp::StartContainerOptions>)
-                .await
-                .map_err(Error::docker)?;
-
-            if replacing {
-                report.replaced.push(service.name.clone());
-            } else {
-                report.created.push(service.name.clone());
-            }
-            report.started.push(service.name.clone());
-        }
-
-        // Anything labeled for this project but no longer in the deployment is
-        // an orphan from a previous release and must go, or a removed service
-        // would keep running forever.
-        for container in self.project_containers(&deployment.project).await? {
-            let labels = container.labels.unwrap_or_default();
-            let Some(service) = labels.get(LABEL_SERVICE) else {
-                continue;
-            };
-            if deployment.services.contains_key(service) {
-                continue;
-            }
-            if let Some(names) = container.names {
-                if let Some(name) = names.first() {
-                    let name = name.trim_start_matches('/');
-                    self.remove_container(name).await?;
-                    report.removed_orphans.push(service.clone());
-                }
+        let mut report = ApplyReport::default();
+        for (service, ids) in &after {
+            match before.get(service) {
+                None => report.created.push(service.clone()),
+                Some(old) if old == ids => report.unchanged.push(service.clone()),
+                Some(_) => report.replaced.push(service.clone()),
             }
         }
-
+        report.removed_orphans = before
+            .into_keys()
+            .filter(|s| !after.contains_key(s))
+            .collect();
         Ok(report)
     }
 
     async fn service_states(&self, deployment: &Deployment) -> Result<Vec<ServiceState>, Error> {
+        let containers = self.containers(&deployment.project).await?;
         let mut states = Vec::new();
-        for (name, service) in &deployment.services {
-            let container = container_name(deployment, service);
-            match self.inspect_service(&container).await? {
-                Some(mut s) => {
-                    if s.service.is_empty() {
-                        s.service = name.clone();
-                    }
-                    states.push(s);
+        for name in deployment.services.keys() {
+            // With replicas, a service is as well as its worst container.
+            let mut worst: Option<ServiceState> = None;
+            for container in containers_of(&containers, name) {
+                let Some(mut state) = self.inspect_service(&container).await? else {
+                    continue;
+                };
+                state.service = name.clone();
+                if worst.as_ref().is_none_or(|w| trouble(&state) > trouble(w)) {
+                    worst = Some(state);
                 }
-                None => states.push(ServiceState::absent(name)),
             }
+            states.push(worst.unwrap_or_else(|| ServiceState::absent(name)));
         }
         Ok(states)
     }
@@ -682,44 +391,44 @@ impl Runtime for DockerRuntime {
         // Docker reads `tail` as a string so that "all" can mean all.
         let tail = options.tail.to_string();
 
+        let containers = self.containers(&deployment.project).await?;
         let mut services = Vec::new();
         let mut streams = Vec::new();
-        for (name, service) in &deployment.services {
+        for name in deployment.services.keys() {
             if !options.services.is_empty() && !options.services.contains(name) {
                 continue;
             }
-            let container = container_name(deployment, service);
             // A service with no container is skipped rather than failing the
             // whole request: one service that has not started must not hide
             // the output of the ones that did -- which is usually where the
             // reason it did not start is written.
-            if self.inspect_service(&container).await?.is_none() {
-                continue;
+            for container in containers_of(&containers, name) {
+                let params = qp::LogsOptionsBuilder::new()
+                    .follow(options.follow)
+                    .stdout(true)
+                    .stderr(true)
+                    // The device's clock, taken from the engine. An operator
+                    // correlating a log line with a device event needs the
+                    // device's idea of when it happened, not the control plane's.
+                    .timestamps(true)
+                    .tail(&tail)
+                    .build();
+
+                let chunks = self.docker.logs(&container, Some(params)).map(|item| {
+                    item.map(|output| match output {
+                        LogOutput::StdErr { message } => (LogSource::Stderr, message.to_vec()),
+                        LogOutput::StdOut { message }
+                        | LogOutput::StdIn { message }
+                        | LogOutput::Console { message } => (LogSource::Stdout, message.to_vec()),
+                    })
+                    .map_err(Error::docker)
+                });
+
+                streams.push(crate::logs::lines(name.clone(), chunks).boxed());
+                if services.last() != Some(name) {
+                    services.push(name.clone());
+                }
             }
-
-            let params = qp::LogsOptionsBuilder::new()
-                .follow(options.follow)
-                .stdout(true)
-                .stderr(true)
-                // The device's clock, taken from the engine. An operator
-                // correlating a log line with a device event needs the
-                // device's idea of when it happened, not the control plane's.
-                .timestamps(true)
-                .tail(&tail)
-                .build();
-
-            let chunks = self.docker.logs(&container, Some(params)).map(|item| {
-                item.map(|output| match output {
-                    LogOutput::StdErr { message } => (LogSource::Stderr, message.to_vec()),
-                    LogOutput::StdOut { message }
-                    | LogOutput::StdIn { message }
-                    | LogOutput::Console { message } => (LogSource::Stdout, message.to_vec()),
-                })
-                .map_err(Error::docker)
-            });
-
-            services.push(name.clone());
-            streams.push(crate::logs::lines(name.clone(), chunks).boxed());
         }
 
         Ok(Logs {
@@ -734,22 +443,33 @@ impl Runtime for DockerRuntime {
                 reason: "no command was given to run".into(),
             });
         }
-        let service =
-            deployment
-                .services
-                .get(&options.service)
-                .ok_or_else(|| Error::NoSuchService {
-                    service: options.service.clone(),
-                })?;
-        let container = container_name(deployment, service);
-        // A service that is not running is an error rather than an empty
-        // stream: "the command produced no output" and "there was nothing to
-        // run it in" are opposite answers to a debugging question.
-        if self.inspect_service(&container).await?.is_none() {
+        if !deployment.services.contains_key(&options.service) {
             return Err(Error::NoSuchService {
                 service: options.service.clone(),
             });
         }
+        // A service that is not running is an error rather than an empty
+        // stream: "the command produced no output" and "there was nothing to
+        // run it in" are opposite answers to a debugging question.
+        let containers = self.containers(&deployment.project).await?;
+        let mut container = None;
+        for candidate in containers_of(&containers, &options.service) {
+            let running = self
+                .inspect_service(&candidate)
+                .await?
+                .is_some_and(|s| s.status.is_running());
+            if running || container.is_none() {
+                container = Some(candidate);
+            }
+            if running {
+                break;
+            }
+        }
+        let Some(container) = container else {
+            return Err(Error::NoSuchService {
+                service: options.service.clone(),
+            });
+        };
 
         let created = self
             .docker
@@ -815,62 +535,39 @@ impl Runtime for DockerRuntime {
     }
 
     async fn stop(&self, deployment: &Deployment) -> Result<(), Error> {
-        // Reverse dependency order, so dependents stop before what they need.
-        let order = deployment
-            .start_order()
-            .map_err(|c| Error::DependencyCycle {
-                path: c.to_string(),
-            })?;
-        for service_name in order.iter().rev() {
-            let service = &deployment.services[*service_name];
-            let name = container_name(deployment, service);
-            let options = qp::StopContainerOptionsBuilder::new()
-                .t(service.stop_grace_period_secs.unwrap_or(10) as i32)
-                .build();
-            match self.docker.stop_container(&name, Some(options)).await {
-                Ok(()) => {}
-                Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 404, ..
-                }) => {}
-                Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 304, ..
-                }) => {}
-                Err(e) => return Err(Error::docker(e)),
-            }
-        }
-        Ok(())
+        crate::compose::stop(&deployment.project).await
     }
 
     async fn remove(&self, deployment: &Deployment, remove_volumes: bool) -> Result<(), Error> {
-        self.stop(deployment).await?;
-        for container in self.project_containers(&deployment.project).await? {
-            if let Some(names) = container.names {
-                if let Some(name) = names.first() {
-                    self.remove_container(name.trim_start_matches('/')).await?;
-                }
-            }
-        }
-        if remove_volumes {
-            for name in deployment.volumes.keys() {
-                let full = Naming::volume(&deployment.project, name);
-                let _ = self
-                    .docker
-                    .remove_volume(&full, None::<qp::RemoveVolumeOptions>)
-                    .await;
-            }
-        }
-        Ok(())
+        crate::compose::down(&deployment.project, remove_volumes).await
     }
 }
 
-fn merge_labels(
-    mut base: std::collections::BTreeMap<String, String>,
-    extra: Option<&std::collections::BTreeMap<String, String>>,
-) -> HashMap<String, String> {
-    if let Some(extra) = extra {
-        for (k, v) in extra {
-            base.insert(k.clone(), v.clone());
-        }
+/// The names of one service's containers.
+fn containers_of(containers: &[ContainerSummary], service: &str) -> Vec<String> {
+    containers
+        .iter()
+        .filter(|c| {
+            c.labels
+                .as_ref()
+                .and_then(|l| l.get(LABEL_SERVICE))
+                .is_some_and(|s| s == service)
+        })
+        .filter_map(|c| c.names.as_ref()?.first())
+        .map(|n| n.trim_start_matches('/').to_string())
+        .collect()
+}
+
+/// How much is wrong with a container, to pick which one speaks for a service.
+fn trouble(state: &ServiceState) -> u8 {
+    match (state.status, state.health) {
+        (ContainerStatus::Dead, _) => 7,
+        (ContainerStatus::Exited { code }, _) if code != 0 => 6,
+        (ContainerStatus::Restarting, _) => 5,
+        (_, HealthStatus::Unhealthy) => 4,
+        (ContainerStatus::Paused | ContainerStatus::Created | ContainerStatus::Absent, _) => 3,
+        (_, HealthStatus::Starting) => 2,
+        (ContainerStatus::Exited { .. }, _) => 1,
+        _ => 0,
     }
-    base.into_iter().collect()
 }

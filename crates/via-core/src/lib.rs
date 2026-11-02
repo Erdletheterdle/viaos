@@ -6,14 +6,13 @@
 //!
 //! ```text
 //! via-core
-//!    ├── via-compose    compose.yaml  -> core::Deployment
-//!    ├── via-bundle     core::Deployment <-> bundle file
-//!    └── via-runtime    core::Deployment -> containers
+//!    ├── via-compose    what `docker compose config` says -> core::Deployment
+//!    ├── via-bundle     a compose file, its files and images <-> bundle file
+//!    └── via-runtime    `docker compose up`, and reading what it started
 //! ```
 //!
-//! The important consequence is that `via-runtime` does not depend on
-//! `via-compose`. The agent applies a [`Deployment`], and Compose is only ever
-//! an authoring format the CLI translates at build time (spec sections 15, 16).
+//! A [`Deployment`] describes a release for people and for the health gate.
+//! What runs is the compose file, under the official `docker compose`.
 
 mod deployment;
 mod digest;
@@ -23,9 +22,9 @@ mod platform;
 mod release;
 
 pub use deployment::{
-    DEPLOYMENT_SCHEMA_VERSION, Dependency, DependencyCondition, DependencyCycle, Deployment,
-    DeviceMapping, HealthCheck, HealthGate, ImageRef, Mount, Network, PortMapping, Protocol,
-    Readiness, RestartPolicy, Service, Volume,
+    DEPLOYMENT_SCHEMA_VERSION, Dependency, DependencyCondition, Deployment, HealthCheck,
+    HealthGate, ImageRef, Mount, Network, OLDEST_DEPLOYMENT_SCHEMA, PortMapping, Protocol,
+    Readiness, RestartPolicy, Service, VariableSpec, Volume,
 };
 pub use digest::Digest;
 pub use error::Error;
@@ -33,12 +32,16 @@ pub use id::{AppName, DeviceId, ReleaseId, ServiceName};
 pub use platform::Platform;
 pub use release::{ArtifactRef, ReleaseRef, ReleaseTarget};
 
-/// Label applied to every Docker object Via creates, carrying the project name.
-///
-/// The agent uses these to recognize what it owns. Anything unlabeled was not
-/// created by Via and is never removed by it.
-pub const LABEL_PROJECT: &str = "via.project";
-/// Label carrying the service name within a project.
-pub const LABEL_SERVICE: &str = "via.service";
-/// Label carrying the release number a container was created for.
-pub const LABEL_RELEASE: &str = "via.release";
+/// The labels `docker compose` puts on what it creates.
+pub const LABEL_PROJECT: &str = "com.docker.compose.project";
+pub const LABEL_SERVICE: &str = "com.docker.compose.service";
+pub const LABEL_ONE_OFF: &str = "com.docker.compose.oneoff";
+
+/// The label on containers made before viaos ran Compose. See `via_runtime`.
+pub const LABEL_LEGACY_PROJECT: &str = "via.project";
+
+/// The `docker` to run. A build of `via` and of the OS each set `VIA_DOCKER` to
+/// the same pinned package, so a file reads the same on both.
+pub fn docker_program() -> std::ffi::OsString {
+    std::env::var_os("VIA_DOCKER").unwrap_or_else(|| "docker".into())
+}

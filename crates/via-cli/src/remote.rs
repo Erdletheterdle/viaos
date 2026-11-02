@@ -158,7 +158,7 @@ pub fn keygen(path: &Path) -> Result<Value> {
 
 /// Sign an OS update (the output of `nix build .#updates.<arch>`) and upload
 /// it. The manifest goes last: it is what publishes the version.
-pub fn os_release(remote: &Remote, dir: &Path, key: Option<&Path>) -> Result<Value> {
+pub fn os_release(remote: &Remote, dir: &Path, key: &Path) -> Result<Value> {
     let manifest_path = dir.join("manifest.json");
     let manifest_bytes = std::fs::read(&manifest_path)
         .with_context(|| format!("reading {}", manifest_path.display()))?;
@@ -177,20 +177,15 @@ pub fn os_release(remote: &Remote, dir: &Path, key: Option<&Path>) -> Result<Val
         eprintln!("uploading {name}");
         remote.put_file(&format!("{base}/{name}"), &dir.join(name))?;
     }
-    let signed = match key {
-        Some(k) => {
-            let key =
-                SigningKey::read_from(k).with_context(|| format!("reading {}", k.display()))?;
-            let sig = serde_json::to_vec(&key.sign_manifest(&manifest_bytes))?;
-            let tmp = std::env::temp_dir().join(format!("via-os-sig-{}", std::process::id()));
-            std::fs::write(&tmp, sig)?;
-            let r = remote.put_file(&format!("{base}/manifest.json.sig"), &tmp);
-            let _ = std::fs::remove_file(&tmp);
-            r?;
-            Some(key.key_id().to_string())
-        }
-        None => None,
-    };
+    let signer =
+        SigningKey::read_from(key).with_context(|| format!("reading {}", key.display()))?;
+    let sig = serde_json::to_vec(&signer.sign_manifest(&manifest_bytes))?;
+    let tmp = std::env::temp_dir().join(format!("via-os-sig-{}", std::process::id()));
+    std::fs::write(&tmp, sig)?;
+    let r = remote.put_file(&format!("{base}/manifest.json.sig"), &tmp);
+    let _ = std::fs::remove_file(&tmp);
+    r?;
+    let signed = signer.key_id().to_string();
     remote.put_file(&format!("{base}/manifest.json"), &manifest_path)?;
     Ok(json!({
         "arch": arch,
@@ -201,32 +196,20 @@ pub fn os_release(remote: &Remote, dir: &Path, key: Option<&Path>) -> Result<Val
 }
 
 /// Upload a raw viaos image as the base that provisioning images are made
-/// from, compressed on the way. With Secure Boot keys, a copy of it is
-/// signed first.
-pub fn base_image(
-    remote: &Remote,
-    raw: &Path,
-    arch: &str,
-    secure_boot: Option<&Path>,
-) -> Result<Value> {
+/// from, compressed on the way. A copy of it is signed for Secure Boot first.
+pub fn base_image(remote: &Remote, raw: &Path, arch: &str, secure_boot: &Path) -> Result<Value> {
     let tmp = std::env::temp_dir().join(format!("via-base-{}.raw.zst", std::process::id()));
     let signed = std::env::temp_dir().join(format!("via-base-{}.raw", std::process::id()));
     let result = (|| {
-        let raw = match secure_boot {
-            Some(keys) => {
-                let status = std::process::Command::new("cp")
-                    .args(["--reflink=auto", "--sparse=always", "--no-preserve=mode"])
-                    .arg(raw)
-                    .arg(&signed)
-                    .status()?;
-                anyhow::ensure!(status.success(), "copying {} failed", raw.display());
-                crate::secureboot::sign_image(keys, &signed)?;
-                signed.as_path()
-            }
-            None => raw,
-        };
-        let mut src =
-            std::fs::File::open(raw).with_context(|| format!("opening {}", raw.display()))?;
+        let status = std::process::Command::new("cp")
+            .args(["--reflink=auto", "--sparse=always", "--no-preserve=mode"])
+            .arg(raw)
+            .arg(&signed)
+            .status()?;
+        anyhow::ensure!(status.success(), "copying {} failed", raw.display());
+        crate::secureboot::sign_image(secure_boot, &signed)?;
+        let mut src = std::fs::File::open(&signed)
+            .with_context(|| format!("opening {}", signed.display()))?;
         let mut enc = zstd::Encoder::new(std::fs::File::create(&tmp)?, 3)?;
         enc.multithread(std::thread::available_parallelism().map_or(1, |n| n.get() as u32))?;
         std::io::copy(&mut src, &mut enc)?;

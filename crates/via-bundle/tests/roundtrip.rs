@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-use via_bundle::{BundleWriter, Error, UnpackedBundle, peek_manifest};
+use via_bundle::{BundleWriter, Error, UnpackedBundle, peek_deployment, peek_manifest};
 use via_core::{AppName, Deployment, Digest, ImageRef, Platform, ReleaseId, Service};
 
 /// Build an archive shaped like `docker save` output: an OCI layout with
@@ -196,6 +196,29 @@ fn manifest_can_be_read_without_unpacking_the_blobs() {
 }
 
 #[test]
+fn the_deployment_can_be_read_without_unpacking_the_blobs() {
+    let mut w = writer();
+    let archive = make_docker_archive(&[image("app:v44", &["layer"])]);
+    w.add_docker_archive(&archive[..], |n| n.map(str::to_string))
+        .unwrap();
+    let mut deployment = deployment_with(&[("app", "app:v44")]);
+    deployment
+        .services
+        .get_mut("app")
+        .unwrap()
+        .runtime_env
+        .push("TOKEN".into());
+    let bytes = w.finish(Vec::new(), &deployment, None).unwrap();
+
+    let read = peek_deployment(bytes.as_slice()).unwrap();
+    assert_eq!(read.services["app"].runtime_env, ["TOKEN"]);
+    assert_eq!(read.variable_schema()[0].key, "TOKEN");
+
+    // Not an archive at all.
+    assert!(peek_deployment(&b"nope"[..]).is_err());
+}
+
+#[test]
 fn shared_layers_are_stored_once() {
     // Two images on the same base: the base layer must not be paid for twice.
     let archive = make_docker_archive(&[
@@ -379,4 +402,155 @@ fn a_docker_load_archive_can_be_regenerated_from_the_bundle() {
         names.iter().any(|n| n.starts_with("blobs/sha256/")),
         "{names:?}"
     );
+}
+
+mod project_files {
+    use std::io::Read;
+
+    use via_bundle::{BundleWriter, UnpackedBundle};
+    use via_core::{AppName, Deployment, Platform, ReleaseId};
+
+    fn bundle(compose: Option<&str>, files: &[(&str, &str)]) -> (Vec<u8>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = BundleWriter::new(
+            AppName::parse("app").unwrap(),
+            ReleaseId(1),
+            Platform::new("linux", "amd64"),
+        )
+        .unwrap();
+        for (path, text) in files {
+            let source = dir.path().join(path.replace('/', "_"));
+            std::fs::write(&source, text).unwrap();
+            writer.add_project_file(path, &source).unwrap();
+        }
+        let d = Deployment::new("app", Platform::new("linux", "amd64"));
+        (writer.finish(Vec::new(), &d, compose).unwrap(), dir)
+    }
+
+    /// The same bundle, with `edit` applied to its entries.
+    fn rewrite(
+        bundle: &[u8],
+        edit: impl Fn(&str, Vec<u8>) -> Option<(String, Vec<u8>)>,
+    ) -> Vec<u8> {
+        let mut out = tar::Builder::new(Vec::new());
+        let decoder = zstd::Decoder::new(bundle).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap();
+            let Some((name, bytes)) = edit(&name, bytes) else {
+                continue;
+            };
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            out.append_data(&mut header, name, bytes.as_slice())
+                .unwrap();
+        }
+        zstd::encode_all(out.into_inner().unwrap().as_slice(), 3).unwrap()
+    }
+
+    #[test]
+    fn they_land_where_the_compose_file_looks() {
+        let (bytes, _keep) = bundle(Some("services: {}\n"), &[("conf/a.conf", "hello")]);
+        let dest = tempfile::tempdir().unwrap();
+        let unpacked = UnpackedBundle::unpack(bytes.as_slice(), dest.path()).unwrap();
+        assert_eq!(unpacked.compose_source.as_deref(), Some("services: {}\n"));
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("project/conf/a.conf")).unwrap(),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn a_changed_file_is_refused() {
+        let (bytes, _keep) = bundle(Some("x"), &[("a.conf", "hello")]);
+        let tampered = rewrite(&bytes, |name, b| {
+            Some((
+                name.to_string(),
+                if name == "project/a.conf" {
+                    b"evil".to_vec()
+                } else {
+                    b
+                },
+            ))
+        });
+        let dest = tempfile::tempdir().unwrap();
+        assert!(UnpackedBundle::unpack(tampered.as_slice(), dest.path()).is_err());
+    }
+
+    #[test]
+    fn a_file_the_manifest_does_not_list_is_refused() {
+        let (bytes, _keep) = bundle(Some("x"), &[("a.conf", "hello")]);
+        let added = rewrite(&bytes, |name, b| {
+            let name = if name == "project/a.conf" {
+                "project/b.conf"
+            } else {
+                name
+            };
+            Some((name.to_string(), b))
+        });
+        let dest = tempfile::tempdir().unwrap();
+        assert!(UnpackedBundle::unpack(added.as_slice(), dest.path()).is_err());
+    }
+
+    #[test]
+    fn a_missing_file_is_refused() {
+        let (bytes, _keep) = bundle(Some("x"), &[("a.conf", "hello")]);
+        let cut = rewrite(&bytes, |name, b| {
+            (name != "project/a.conf").then(|| (name.to_string(), b))
+        });
+        let dest = tempfile::tempdir().unwrap();
+        assert!(UnpackedBundle::unpack(cut.as_slice(), dest.path()).is_err());
+    }
+
+    #[test]
+    fn a_path_climbing_out_cannot_be_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("x");
+        std::fs::write(&source, "x").unwrap();
+        let mut writer = BundleWriter::new(
+            AppName::parse("app").unwrap(),
+            ReleaseId(1),
+            Platform::new("linux", "amd64"),
+        )
+        .unwrap();
+        for path in ["../x", "/etc/x", "a/../../x", ""] {
+            assert!(writer.add_project_file(path, &source).is_err(), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_compose_file_the_manifest_does_not_vouch_for_is_refused() {
+        let (bytes, _keep) = bundle(None, &[]);
+        let mut with_compose = rewrite(&bytes, |name, b| Some((name.to_string(), b)));
+        let dest = tempfile::tempdir().unwrap();
+        assert!(UnpackedBundle::unpack(with_compose.as_slice(), dest.path()).is_ok());
+
+        let decoded = zstd::decode_all(with_compose.as_slice()).unwrap();
+        let mut archive = tar::Archive::new(decoded.as_slice());
+        let mut out = tar::Builder::new(Vec::new());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let header = entry.header().clone();
+            let name = entry.path().unwrap().into_owned();
+            out.append_data(&mut header.clone(), name, &mut entry)
+                .unwrap();
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_cksum();
+        out.append_data(&mut header, "compose.yaml", b"evil\n".as_slice())
+            .unwrap();
+        with_compose = zstd::encode_all(out.into_inner().unwrap().as_slice(), 3).unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let err = UnpackedBundle::unpack(with_compose.as_slice(), dest.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("compose file"), "{err}");
+    }
 }

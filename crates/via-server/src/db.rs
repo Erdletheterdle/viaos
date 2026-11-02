@@ -47,16 +47,18 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 -- Variables and secrets for apps. `scope` is 'fleet' (target: its name) or
 -- 'device' (target: its id). A secret's value is ciphertext; see secrets.rs.
+-- `service` is one service of the app, or NULL for every service that declares
+-- the name; VARIABLES_IDENTITY makes a row unique.
 CREATE TABLE IF NOT EXISTS variables (
     scope TEXT NOT NULL,
     target TEXT NOT NULL,
     app TEXT NOT NULL,
+    service TEXT,
     key TEXT NOT NULL,
     value BLOB NOT NULL,
     secret INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    updated_by TEXT NOT NULL,
-    PRIMARY KEY (scope, target, app, key)
+    updated_by TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS api_tokens (
     name        TEXT PRIMARY KEY,
@@ -65,7 +67,44 @@ CREATE TABLE IF NOT EXISTS api_tokens (
     created_at  INTEGER NOT NULL,
     last_used   INTEGER
 );
+CREATE TABLE IF NOT EXISTS os_updates (
+    device_id     TEXT PRIMARY KEY,
+    version       TEXT NOT NULL,
+    from_version  TEXT,
+    started_at    INTEGER NOT NULL,
+    finished_at   INTEGER,
+    state         TEXT NOT NULL,
+    progress      INTEGER,
+    detail        TEXT,
+    offline_since INTEGER
+);
+CREATE TABLE IF NOT EXISTS fleet_tags (
+    fleet_id  INTEGER NOT NULL REFERENCES fleets(id),
+    tag       TEXT NOT NULL,
+    PRIMARY KEY (fleet_id, tag)
+);
+CREATE TABLE IF NOT EXISTS device_tags (
+    device_id TEXT NOT NULL REFERENCES devices(id),
+    tag       TEXT NOT NULL,
+    PRIMARY KEY (device_id, tag)
+);
+CREATE TABLE IF NOT EXISTS device_types (
+    id      TEXT PRIMARY KEY,
+    name    TEXT NOT NULL,
+    arch    TEXT NOT NULL,
+    detail  TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash  TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    expires_at  INTEGER NOT NULL
+);
 ";
+
+/// How a console session's token starts, so it is never looked up as an API
+/// token and an API token is never looked up as a session.
+pub const SESSION_PREFIX: &str = "vis_";
 
 /// What a person (or their Claude) may do through the API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, clap::ValueEnum)]
@@ -101,6 +140,17 @@ pub struct Caller {
     pub role: Role,
 }
 
+/// Hardware the server can make images for. Its base image is
+/// `viaos-<id>.raw`, or the one for its architecture if it has none of its
+/// own, so a board can be added without building anything new.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceType {
+    pub id: String,
+    pub name: String,
+    pub arch: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiToken {
     pub name: String,
@@ -116,6 +166,10 @@ pub struct Db {
 #[derive(Debug, Clone, Serialize)]
 pub struct Fleet {
     pub name: String,
+    /// The fleet this one sits under, if any.
+    pub parent: Option<String>,
+    pub tags: Vec<String>,
+    /// Devices directly in this fleet, not those in fleets under it.
     pub devices: u64,
 }
 
@@ -129,6 +183,8 @@ pub struct Device {
     pub agent_version: Option<String>,
     pub enrolled_at: i64,
     pub last_seen: Option<i64>,
+    /// Its own. See [`check_tag`].
+    pub tags: Vec<String>,
 }
 
 /// What a device reports about itself when it enrolls.
@@ -162,6 +218,25 @@ impl Db {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(SCHEMA)?;
+        let nested = conn
+            .prepare("SELECT 1 FROM pragma_table_info('fleets') WHERE name = 'parent_id'")?
+            .exists([])?;
+        if !nested {
+            conn.execute_batch(
+                "ALTER TABLE fleets ADD COLUMN parent_id INTEGER REFERENCES fleets(id)",
+            )?;
+        }
+        // What a new server can image from the OS builds in this repository.
+        // The arm64 image carries both Pi firmware and a UEFI loader.
+        let types: i64 = conn.query_row("SELECT count(*) FROM device_types", [], |r| r.get(0))?;
+        if types == 0 {
+            conn.execute_batch(
+                "INSERT INTO device_types (id, name, arch, detail) VALUES
+                 ('pc', 'PC', 'x86_64', 'Industrial boxes, NUCs, anything with UEFI'),
+                 ('raspberry-pi', 'Raspberry Pi', 'aarch64', 'Pi 4, 400, CM4'),
+                 ('arm64-uefi', 'Generic ARM64', 'aarch64', 'Boards and VMs with UEFI firmware');",
+            )?;
+        }
         // Added after the first release of the schema.
         let has_actor: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('audit') WHERE name = 'actor'")?
@@ -169,6 +244,36 @@ impl Db {
         if !has_actor {
             conn.execute_batch("ALTER TABLE audit ADD COLUMN actor TEXT")?;
         }
+        // The first `variables` had (scope, target, app, key) as its primary
+        // key, which no ALTER can widen, and that would allow only one value
+        // per name. Rows move across unchanged, so sealed values still open.
+        let has_service: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('variables') WHERE name = 'service'")?
+            .exists([])?;
+        if !has_service {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE variables RENAME TO variables_before_service;
+                 CREATE TABLE variables (
+                     scope TEXT NOT NULL,
+                     target TEXT NOT NULL,
+                     app TEXT NOT NULL,
+                     service TEXT,
+                     key TEXT NOT NULL,
+                     value BLOB NOT NULL,
+                     secret INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL,
+                     updated_by TEXT NOT NULL
+                 );
+                 INSERT INTO variables
+                     (scope, target, app, service, key, value, secret, updated_at, updated_by)
+                     SELECT scope, target, app, NULL, key, value, secret, updated_at, updated_by
+                     FROM variables_before_service;
+                 DROP TABLE variables_before_service;
+                 COMMIT;",
+            )?;
+        }
+        conn.execute_batch(VARIABLES_IDENTITY)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -187,16 +292,194 @@ impl Db {
     pub fn fleets(&self) -> Result<Vec<Fleet>> {
         let c = self.conn.lock().unwrap();
         let mut q = c.prepare(
-            "SELECT f.name, COUNT(d.id) FROM fleets f
+            "SELECT f.name, p.name, COUNT(d.id),
+                    (SELECT group_concat(tag, char(10)) FROM
+                       (SELECT tag FROM fleet_tags WHERE fleet_id = f.id ORDER BY tag))
+             FROM fleets f
+             LEFT JOIN fleets p ON p.id = f.parent_id
              LEFT JOIN devices d ON d.fleet_id = f.id GROUP BY f.id ORDER BY f.name",
         )?;
         let rows = q.query_map([], |r| {
+            let tags: Option<String> = r.get(3)?;
             Ok(Fleet {
                 name: r.get(0)?,
-                devices: r.get::<_, i64>(1)? as u64,
+                parent: r.get(1)?,
+                devices: r.get::<_, i64>(2)? as u64,
+                tags: tags
+                    .map(|t| t.split('\n').map(String::from).collect())
+                    .unwrap_or_default(),
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The start of a device's update. Each device keeps only its latest.
+    pub fn begin_os_update(
+        &self,
+        device_id: &str,
+        version: &str,
+        from: Option<&str>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT OR REPLACE INTO os_updates (device_id, version, from_version, started_at, state)
+             VALUES (?1, ?2, ?3, ?4, 'started')",
+            params![device_id, version, from, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_os_update(&self, u: &crate::os_track::OsUpdate) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE os_updates SET finished_at = ?2, state = ?3, progress = ?4, detail = ?5,
+             offline_since = ?6 WHERE device_id = ?1",
+            params![
+                u.device_id,
+                u.finished_at,
+                u.state,
+                u.progress,
+                u.detail,
+                u.offline_since
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn os_updates_where(&self, clause: &str) -> Result<Vec<crate::os_track::OsUpdate>> {
+        let c = self.conn.lock().unwrap();
+        let mut q = c.prepare(&format!(
+            "SELECT device_id, version, from_version, started_at, finished_at, state, progress,
+                    detail, offline_since FROM os_updates {clause}"
+        ))?;
+        let rows = q.query_map([], |r| {
+            Ok(crate::os_track::OsUpdate {
+                device_id: r.get(0)?,
+                version: r.get(1)?,
+                from_version: r.get(2)?,
+                started_at: r.get(3)?,
+                finished_at: r.get(4)?,
+                state: r.get(5)?,
+                progress: r.get(6)?,
+                detail: r.get(7)?,
+                offline_since: r.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn active_os_updates(&self) -> Result<Vec<crate::os_track::OsUpdate>> {
+        self.os_updates_where("WHERE finished_at IS NULL")
+    }
+
+    pub fn os_updates(&self) -> Result<Vec<crate::os_track::OsUpdate>> {
+        self.os_updates_where("")
+    }
+
+    /// Delete a fleet that holds nothing. Unused enrollment tokens go with it,
+    /// so an image made for it can no longer join.
+    pub fn delete_fleet(&self, name: &str) -> Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let id = fleet_id(&c, name)?;
+        let devices: i64 = c.query_row(
+            "SELECT COUNT(*) FROM devices WHERE fleet_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(devices == 0, "{name:?} still has devices");
+        let children: i64 = c.query_row(
+            "SELECT COUNT(*) FROM fleets WHERE parent_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(children == 0, "{name:?} still has fleets under it");
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM fleet_tags WHERE fleet_id = ?1", [id])?;
+        tx.execute("DELETE FROM enrollment_tokens WHERE fleet_id = ?1", [id])?;
+        tx.execute(
+            "DELETE FROM variables WHERE scope = 'fleet' AND target = ?1",
+            [name],
+        )?;
+        tx.execute("DELETE FROM fleets WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A fleet and the fleets above it, outermost first.
+    pub fn fleet_lineage(&self, name: &str) -> Result<Vec<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut q = c.prepare(
+            "WITH RECURSIVE up(id, name, parent_id, depth) AS (
+               SELECT id, name, parent_id, 0 FROM fleets WHERE name = ?1
+               UNION ALL
+               SELECT f.id, f.name, f.parent_id, up.depth + 1 FROM fleets f JOIN up ON f.id = up.parent_id
+             ) SELECT name FROM up ORDER BY depth DESC",
+        )?;
+        let rows = q.query_map([name], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// A fleet and every fleet under it.
+    pub fn fleets_under(&self, name: &str) -> Result<Vec<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut q = c.prepare(&format!(
+            "SELECT name FROM fleets WHERE id IN ({FLEET_TREE})"
+        ))?;
+        let rows = q.query_map([name], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Move a fleet under another, or to the top with `None`. Devices stay in
+    /// it, and from then on inherit from where it now sits.
+    pub fn set_fleet_parent(&self, name: &str, parent: Option<&str>) -> Result<()> {
+        if let Some(p) = parent {
+            anyhow::ensure!(
+                !self.fleet_lineage(p)?.iter().any(|f| f == name),
+                "{name:?} can't go under {p:?}: {p:?} is inside it"
+            );
+        }
+        let c = self.conn.lock().unwrap();
+        let id = fleet_id(&c, name)?;
+        let parent = parent.map(|p| fleet_id(&c, p)).transpose()?;
+        c.execute(
+            "UPDATE fleets SET parent_id = ?2 WHERE id = ?1",
+            params![id, parent],
+        )?;
+        Ok(())
+    }
+
+    /// Replace a device's own tags. It also has its fleets', which aren't these.
+    pub fn set_device_tags(&self, id: &str, tags: &[String]) -> Result<()> {
+        for t in tags {
+            check_tag(t)?;
+        }
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM device_tags WHERE device_id = ?1", [id])?;
+        for t in tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO device_tags (device_id, tag) VALUES (?1, ?2)",
+                params![id, t],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_fleet_tags(&self, name: &str, tags: &[String]) -> Result<()> {
+        for t in tags {
+            check_tag(t)?;
+        }
+        let mut c = self.conn.lock().unwrap();
+        let id = fleet_id(&c, name)?;
+        let tx = c.transaction()?;
+        tx.execute("DELETE FROM fleet_tags WHERE fleet_id = ?1", [id])?;
+        for t in tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO fleet_tags (fleet_id, tag) VALUES (?1, ?2)",
+                params![id, t],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Mint a single-use token for `fleet`. The caller must put the token
@@ -304,10 +587,11 @@ impl Db {
         Ok(())
     }
 
+    /// Every device, or those in a fleet and the fleets under it.
     pub fn devices(&self, fleet: Option<&str>) -> Result<Vec<Device>> {
         let c = self.conn.lock().unwrap();
         let mut q = c.prepare(&format!(
-            "{DEVICE_SELECT} WHERE (?1 IS NULL OR f.name = ?1) ORDER BY f.name, d.name"
+            "{DEVICE_SELECT} WHERE (?1 IS NULL OR d.fleet_id IN ({FLEET_TREE})) ORDER BY f.name, d.name"
         ))?;
         let rows = q.query_map([fleet], device_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -377,6 +661,82 @@ impl Db {
         Ok(())
     }
 
+    pub fn device_types(&self) -> Result<Vec<DeviceType>> {
+        let c = self.conn.lock().unwrap();
+        let mut q =
+            c.prepare("SELECT id, name, arch, detail FROM device_types ORDER BY arch DESC, name")?;
+        let rows = q.query_map([], |r| {
+            Ok(DeviceType {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                arch: r.get(2)?,
+                detail: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Add a device type, or change one.
+    pub fn set_device_type(&self, t: &DeviceType) -> Result<()> {
+        valid_name(&t.id)?;
+        anyhow::ensure!(!t.name.trim().is_empty(), "a device type needs a name");
+        anyhow::ensure!(
+            crate::image::ARCHES.contains(&t.arch.as_str()),
+            "arch is one of {}",
+            crate::image::ARCHES.join(", ")
+        );
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO device_types (id, name, arch, detail) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (id) DO UPDATE SET name = ?2, arch = ?3, detail = ?4",
+            params![t.id, t.name.trim(), t.arch, t.detail.trim()],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_device_type(&self, id: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        let n = c.execute("DELETE FROM device_types WHERE id = ?1", [id])?;
+        anyhow::ensure!(n == 1, "no device type {id:?}");
+        Ok(())
+    }
+
+    /// Start a console session for someone an outside provider vouched for.
+    pub fn create_session(&self, name: &str, role: Role, ttl_secs: i64) -> Result<String> {
+        let token = format!("{SESSION_PREFIX}{}", random_secret());
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now()])?;
+        c.execute(
+            "INSERT INTO sessions (token_hash, name, role, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![hash(&token), name, role.as_str(), now() + ttl_secs],
+        )?;
+        Ok(token)
+    }
+
+    /// Who a console session belongs to, while it lasts.
+    pub fn session_caller(&self, token: &str) -> Result<Option<Caller>> {
+        let c = self.conn.lock().unwrap();
+        let row: Option<(String, String)> = c
+            .query_row(
+                "SELECT name, role FROM sessions WHERE token_hash = ?1 AND expires_at > ?2",
+                params![hash(token), now()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.and_then(|(name, role)| {
+            Some(Caller {
+                name,
+                role: Role::parse(&role)?,
+            })
+        }))
+    }
+
+    pub fn delete_session(&self, token: &str) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM sessions WHERE token_hash = ?1", [hash(token)])?;
+        Ok(())
+    }
+
     /// Who an API token belongs to, if anyone.
     pub fn api_caller(&self, token: &str) -> Result<Option<Caller>> {
         let c = self.conn.lock().unwrap();
@@ -406,12 +766,19 @@ impl Db {
     }
 }
 
+/// A row is one name at one place for one service. NULLs count as different in
+/// a plain unique index, and "every service" must only exist once.
+const VARIABLES_IDENTITY: &str = "CREATE UNIQUE INDEX IF NOT EXISTS variables_identity
+    ON variables (scope, target, app, key, IFNULL(service, ''));";
+
 /// One stored variable. A secret's `value` is ciphertext.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Variable {
     pub scope: String,
     pub target: String,
     pub app: String,
+    /// One service of the app, or every service that declares the name.
+    pub service: Option<String>,
     pub key: String,
     pub value: Vec<u8>,
     pub secret: bool,
@@ -422,9 +789,10 @@ pub struct Variable {
 impl Db {
     pub fn set_variable(&self, v: &Variable) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO variables (scope, target, app, key, value, secret, updated_at, updated_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT (scope, target, app, key) DO UPDATE SET
+            "INSERT INTO variables
+                 (scope, target, app, key, value, secret, updated_at, updated_by, service)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT (scope, target, app, key, IFNULL(service, '')) DO UPDATE SET
                value = ?5, secret = ?6, updated_at = ?7, updated_by = ?8",
             params![
                 v.scope,
@@ -434,17 +802,26 @@ impl Db {
                 v.value,
                 v.secret,
                 v.updated_at,
-                v.updated_by
+                v.updated_by,
+                v.service
             ],
         )?;
         Ok(())
     }
 
     /// Whether anything was there to delete.
-    pub fn delete_variable(&self, scope: &str, target: &str, app: &str, key: &str) -> Result<bool> {
+    pub fn delete_variable(
+        &self,
+        scope: &str,
+        target: &str,
+        app: &str,
+        service: Option<&str>,
+        key: &str,
+    ) -> Result<bool> {
         let n = self.conn.lock().unwrap().execute(
-            "DELETE FROM variables WHERE scope = ?1 AND target = ?2 AND app = ?3 AND key = ?4",
-            params![scope, target, app, key],
+            "DELETE FROM variables WHERE scope = ?1 AND target = ?2 AND app = ?3 AND key = ?4
+             AND service IS ?5",
+            params![scope, target, app, key, service],
         )?;
         Ok(n > 0)
     }
@@ -452,8 +829,8 @@ impl Db {
     pub fn variables(&self) -> Result<Vec<Variable>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
-            "SELECT scope, target, app, key, value, secret, updated_at, updated_by
-             FROM variables ORDER BY app, key, scope, target",
+            "SELECT scope, target, app, key, value, secret, updated_at, updated_by, service
+             FROM variables ORDER BY app, key, scope, target, service",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(Variable {
@@ -465,6 +842,7 @@ impl Db {
                 secret: r.get(5)?,
                 updated_at: r.get(6)?,
                 updated_by: r.get(7)?,
+                service: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -490,8 +868,32 @@ impl Db {
 }
 
 const DEVICE_SELECT: &str = "
-    SELECT d.id, d.name, f.name, d.arch, d.os_version, d.agent_version, d.enrolled_at, d.last_seen
+    SELECT d.id, d.name, f.name, d.arch, d.os_version, d.agent_version, d.enrolled_at, d.last_seen,
+           (SELECT group_concat(tag, char(10)) FROM
+              (SELECT tag FROM device_tags WHERE device_id = d.id ORDER BY tag))
     FROM devices d JOIN fleets f ON f.id = d.fleet_id";
+
+/// A tag is `key` or `key=value`, on a fleet or a device. The key is a plain
+/// name; the value can be anything on one line, like a site's name.
+fn check_tag(tag: &str) -> Result<()> {
+    let (key, value) = match tag.split_once('=') {
+        Some((key, value)) => (key, Some(value)),
+        None => (tag, None),
+    };
+    let key_ok = !key.is_empty()
+        && key.len() <= 63
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_:./".contains(c));
+    let value_ok = value.is_none_or(|v| {
+        !v.is_empty() && v.len() <= 200 && v.trim() == v && !v.chars().any(char::is_control)
+    });
+    anyhow::ensure!(
+        key_ok && value_ok,
+        "{tag:?} isn't a tag: use key or key=value, where the key is 1-63 letters, digits, or - _ : . /"
+    );
+    Ok(())
+}
 
 fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
     Ok(Device {
@@ -503,8 +905,18 @@ fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
         agent_version: r.get(5)?,
         enrolled_at: r.get(6)?,
         last_seen: r.get(7)?,
+        tags: r
+            .get::<_, Option<String>>(8)?
+            .map(|t| t.split('\n').map(String::from).collect())
+            .unwrap_or_default(),
     })
 }
+
+/// The ids of the fleet named by `?1` and every fleet under it.
+const FLEET_TREE: &str = "WITH RECURSIVE tree(id) AS (
+       SELECT id FROM fleets WHERE name = ?1
+       UNION ALL SELECT f.id FROM fleets f JOIN tree ON f.parent_id = tree.id
+     ) SELECT id FROM tree";
 
 fn fleet_id(c: &Connection, name: &str) -> Result<i64> {
     c.query_row("SELECT id FROM fleets WHERE name = ?1", [name], |r| {
@@ -528,6 +940,96 @@ fn valid_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn variable(service: Option<&str>, value: &str) -> Variable {
+        Variable {
+            scope: "fleet".into(),
+            target: "lab".into(),
+            app: "hello".into(),
+            service: service.map(Into::into),
+            key: "TOKEN".into(),
+            value: value.as_bytes().to_vec(),
+            secret: false,
+            updated_at: 0,
+            updated_by: "t".into(),
+        }
+    }
+
+    #[test]
+    fn a_name_has_one_value_per_service_and_one_for_all() {
+        let (_d, db) = db();
+        db.set_variable(&variable(None, "a")).unwrap();
+        db.set_variable(&variable(None, "b")).unwrap();
+        db.set_variable(&variable(Some("web"), "c")).unwrap();
+        db.set_variable(&variable(Some("web"), "d")).unwrap();
+        db.set_variable(&variable(Some("db"), "e")).unwrap();
+        let held: Vec<(Option<String>, Vec<u8>)> = db
+            .variables()
+            .unwrap()
+            .into_iter()
+            .map(|v| (v.service, v.value))
+            .collect();
+        assert_eq!(
+            held,
+            [
+                (None, b"b".to_vec()),
+                (Some("db".to_string()), b"e".to_vec()),
+                (Some("web".to_string()), b"d".to_vec()),
+            ]
+        );
+
+        assert!(
+            db.delete_variable("fleet", "lab", "hello", Some("web"), "TOKEN")
+                .unwrap()
+        );
+        assert!(
+            !db.delete_variable("fleet", "lab", "hello", Some("web"), "TOKEN")
+                .unwrap(),
+            "already gone"
+        );
+        assert_eq!(db.variables().unwrap().len(), 2, "the others stay");
+        assert!(
+            db.delete_variable("fleet", "lab", "hello", None, "TOKEN")
+                .unwrap()
+        );
+        assert_eq!(db.variables().unwrap()[0].service.as_deref(), Some("db"));
+    }
+
+    #[test]
+    fn a_database_from_before_services_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("via.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE variables (
+                     scope TEXT NOT NULL, target TEXT NOT NULL, app TEXT NOT NULL,
+                     key TEXT NOT NULL, value BLOB NOT NULL, secret INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL, updated_by TEXT NOT NULL,
+                     PRIMARY KEY (scope, target, app, key)
+                 );
+                 INSERT INTO variables VALUES
+                     ('fleet', 'lab', 'hello', 'TOKEN', x'0102', 1, 5, 'admin');",
+            )
+            .unwrap();
+        }
+        // Twice: the migration must be safe to meet again on every start.
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            let vars = db.variables().unwrap();
+            assert_eq!(vars.len(), 1);
+            let v = &vars[0];
+            assert_eq!(v.service, None);
+            assert_eq!(v.key, "TOKEN");
+            assert_eq!(v.value, vec![1, 2]);
+            assert!(v.secret);
+            assert_eq!((v.updated_at, v.updated_by.as_str()), (5, "admin"));
+        }
+        // And the old identity is gone, so a service can have its own value.
+        let db = Db::open(&path).unwrap();
+        db.set_variable(&variable(Some("web"), "x")).unwrap();
+        assert_eq!(db.variables().unwrap().len(), 2);
+    }
+
     fn db() -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("via.db")).unwrap();
@@ -542,6 +1044,162 @@ mod tests {
             os_version: Some("1".into()),
             agent_version: None,
         }
+    }
+
+    #[test]
+    fn fleets_nest_to_any_depth_and_never_in_a_loop() {
+        let (_d, db) = db();
+        for f in ["acme", "site", "house", "other"] {
+            db.create_fleet(f).unwrap();
+        }
+        db.set_fleet_parent("site", Some("acme")).unwrap();
+        db.set_fleet_parent("house", Some("site")).unwrap();
+        assert_eq!(
+            db.fleet_lineage("house").unwrap(),
+            ["acme", "site", "house"]
+        );
+        let mut under = db.fleets_under("acme").unwrap();
+        under.sort();
+        assert_eq!(under, ["acme", "house", "site"]);
+
+        assert!(db.set_fleet_parent("acme", Some("house")).is_err());
+        assert!(db.set_fleet_parent("acme", Some("acme")).is_err());
+        assert!(db.set_fleet_parent("house", Some("nope")).is_err());
+
+        let token = db.mint_token("house", None, 60, None).unwrap();
+        let (device, _, _) = db.enroll(&enrollment(&token)).unwrap();
+        assert_eq!(db.devices(Some("acme")).unwrap()[0].id, device.id);
+        assert!(db.devices(Some("other")).unwrap().is_empty());
+
+        // Move it out, and it's no longer under its old parent.
+        db.set_fleet_parent("house", None).unwrap();
+        assert!(db.devices(Some("acme")).unwrap().is_empty());
+        assert_eq!(db.fleet_lineage("house").unwrap(), ["house"]);
+    }
+
+    #[test]
+    fn an_os_update_is_kept_until_the_next_one() {
+        let (_d, db) = db();
+        db.begin_os_update("d1", "2", Some("1")).unwrap();
+        let mut u = db.active_os_updates().unwrap().remove(0);
+        assert_eq!(
+            (u.state.as_str(), u.from_version.as_deref()),
+            ("started", Some("1"))
+        );
+        u.state = "done".into();
+        u.finished_at = Some(5);
+        db.save_os_update(&u).unwrap();
+        assert!(db.active_os_updates().unwrap().is_empty());
+        assert_eq!(db.os_updates().unwrap()[0].state, "done");
+        db.begin_os_update("d1", "3", Some("2")).unwrap();
+        let all = db.os_updates().unwrap();
+        assert_eq!(
+            (all.len(), all[0].version.as_str(), all[0].finished_at),
+            (1, "3", None)
+        );
+    }
+
+    #[test]
+    fn only_an_empty_fleet_can_be_deleted() {
+        let (_d, db) = db();
+        for f in ["acme", "site"] {
+            db.create_fleet(f).unwrap();
+        }
+        db.set_fleet_parent("site", Some("acme")).unwrap();
+        db.set_fleet_tags("site", &["x".into()]).unwrap();
+        assert!(
+            db.delete_fleet("acme")
+                .unwrap_err()
+                .to_string()
+                .contains("under it")
+        );
+        let token = db.mint_token("site", None, 60, None).unwrap();
+        db.delete_fleet("site").unwrap();
+        assert!(
+            db.enroll(&enrollment(&token)).is_err(),
+            "its images can't join"
+        );
+        db.delete_fleet("acme").unwrap();
+        assert!(db.fleets().unwrap().is_empty());
+        assert!(db.delete_fleet("acme").is_err());
+
+        db.create_fleet("full").unwrap();
+        let token = db.mint_token("full", None, 60, None).unwrap();
+        db.enroll(&enrollment(&token)).unwrap();
+        assert!(
+            db.delete_fleet("full")
+                .unwrap_err()
+                .to_string()
+                .contains("devices")
+        );
+    }
+
+    #[test]
+    fn tags_are_a_key_and_maybe_a_value() {
+        for good in [
+            "eu",
+            "customer:acme",
+            "site=Dallas North",
+            "type=rock-5b",
+            "a=b=c",
+        ] {
+            assert!(check_tag(good).is_ok(), "{good}");
+        }
+        for bad in ["", "=x", "has space", "k=", "k= x", "k=a\nb", "k =v"] {
+            assert!(check_tag(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fleets_carry_tags() {
+        let (_d, db) = db();
+        db.create_fleet("acme").unwrap();
+        db.set_fleet_tags("acme", &["customer:acme".into(), "eu".into(), "eu".into()])
+            .unwrap();
+        let f = db.fleets().unwrap();
+        assert_eq!(f[0].tags, ["customer:acme", "eu"]);
+        assert_eq!(f[0].parent, None);
+        db.set_fleet_tags("acme", &[]).unwrap();
+        assert!(db.fleets().unwrap()[0].tags.is_empty());
+        assert!(db.set_fleet_tags("acme", &["has space".into()]).is_err());
+    }
+
+    #[test]
+    fn device_types_can_be_added_and_seeds_stay_removed() {
+        let (d, db) = db();
+        assert_eq!(db.device_types().unwrap().len(), 3);
+        let t = DeviceType {
+            id: "rock-5b".into(),
+            name: "Rock 5B".into(),
+            arch: "aarch64".into(),
+            detail: String::new(),
+        };
+        db.set_device_type(&t).unwrap();
+        assert!(db.device_types().unwrap().contains(&t));
+        assert!(
+            db.set_device_type(&DeviceType {
+                arch: "sparc".into(),
+                ..t.clone()
+            })
+            .is_err()
+        );
+        db.delete_device_type("pc").unwrap();
+        drop(db);
+        let db = Db::open(&d.path().join("via.db")).unwrap();
+        assert!(!db.device_types().unwrap().iter().any(|t| t.id == "pc"));
+    }
+
+    #[test]
+    fn a_session_ends_when_it_expires() {
+        let (_d, db) = db();
+        let live = db.create_session("github/a", Role::Viewer, 60).unwrap();
+        let dead = db.create_session("github/b", Role::Admin, -1).unwrap();
+        assert_eq!(db.session_caller(&live).unwrap().unwrap().name, "github/a");
+        assert!(db.session_caller(&dead).unwrap().is_none());
+        // A session is not an API token, and the other way round.
+        assert!(db.api_caller(&live).unwrap().is_none());
+        let api = db.create_api_token("ana", Role::Admin).unwrap();
+        assert!(db.session_caller(&api).unwrap().is_none());
     }
 
     #[test]

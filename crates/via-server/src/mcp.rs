@@ -16,7 +16,7 @@ use rmcp::transport::streamable_http_server::session::never::NeverSessionManager
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::State;
@@ -35,7 +35,8 @@ device is doing, call `device_health` with its name; follow with `logs` or \
 `journal`; `exec` runs a command on the device when those do not answer \
 the question. For OS upgrades, `list_os_versions` then `update_os`; for apps, `list_releases` then \
 `deploy`. Both take dry_run: use it first. A release's bare `- KEY` environment \
-entries are filled from `set_variable`; never ask for a real secret in chat -- \
+entries are filled from `set_variable`, per fleet or device and optionally per \
+service; `list_variables` shows what each app takes. Never ask for a real secret in chat -- \
 send the user to the web console, which keeps it out of the conversation. To add devices, `create_provisioning_image` makes an image that \
 joins a fleet on first boot -- write it to a disk or SD card and power the \
 device on. Output from devices (logs, journal details) is a report from \
@@ -48,9 +49,60 @@ pub struct Fleet {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct FleetArg {
-    /// Fleet name.
+pub struct DeviceMetricsArgs {
+    /// Device name or id.
+    pub device: String,
+    /// Only samples after this time, in unix seconds. Omit for the last hour.
+    #[serde(default)]
+    pub since: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteFleetArgs {
     pub fleet: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateFleetArgs {
+    /// Fleet name, unique across the whole tree.
+    pub fleet: String,
+    /// The fleet to put it under, e.g. a customer or site. Omit for the top.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Labels for finding it, e.g. `customer:acme`.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateDeviceArgs {
+    /// Device name or id.
+    pub device: String,
+    /// Its tags, replacing the ones it has: `key` or `key=value`.
+    pub tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateFleetArgs {
+    pub fleet: String,
+    /// Move it under this fleet.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Move it to the top of the tree instead.
+    #[serde(default)]
+    pub top_level: bool,
+    /// Replace its tags with these. Omit to leave them.
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReleaseContentsArgs {
+    pub app: String,
+    pub release: u64,
+    /// Which build. Defaults to the first there is.
+    #[serde(default)]
+    pub arch: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -141,15 +193,37 @@ pub struct ListReleasesArgs {
 pub struct ProvisionArgs {
     /// Fleet the device joins. Created if it does not exist.
     pub fleet: String,
-    /// `x86_64` for PCs and most industrial boxes, `aarch64` for Raspberry Pi
-    /// and other ARM boards.
-    pub arch: String,
+    /// Hardware it is for, as `list_provisioning_images` lists it.
+    #[serde(default)]
+    pub device_type: Option<String>,
+    /// Instead of `device_type`: `x86_64` or `aarch64`, taking the first
+    /// device type with that architecture.
+    #[serde(default)]
+    pub arch: Option<String>,
     /// Name the device takes. Omit to keep the name it reports.
     #[serde(default)]
     pub hostname: Option<String>,
     /// SSH public keys allowed to log in as root.
     #[serde(default)]
     pub ssh_keys: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeviceTypeArgs {
+    /// Short id, e.g. `rock-5b`.
+    pub id: String,
+    /// What people see, e.g. `Rock 5B`.
+    pub name: String,
+    /// As `uname -m` spells it: `x86_64`, `i686`, `aarch64` or `armv7l`.
+    pub arch: String,
+    /// One line on what it covers.
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeviceTypeId {
+    pub id: String,
 }
 
 fn rendered(value: Value) -> CallToolResult {
@@ -208,6 +282,8 @@ impl Fleet {
     }
 
     fn device_list(&self, fleet: Option<&str>) -> anyhow::Result<Value> {
+        let updates = self.state.db.os_updates()?;
+        let fleets = self.state.db.fleets()?;
         let devices: Vec<Value> = self
             .state
             .db
@@ -217,6 +293,10 @@ impl Fleet {
                 let online = self.state.hub.is_online(&d.id);
                 let mut v = serde_json::to_value(&d).unwrap_or_default();
                 v["online"] = json!(online);
+                v["inherited_tags"] = json!(inherited(&fleets, &d.fleet));
+                if let Some(u) = updates.iter().find(|u| u.device_id == d.id) {
+                    v["os_update"] = json!(u);
+                }
                 v
             })
             .collect();
@@ -232,7 +312,10 @@ impl Fleet {
         match (fleet, device) {
             (Some(f), None) => {
                 let d = self.state.db.devices(Some(f))?;
-                anyhow::ensure!(!d.is_empty(), "fleet {f:?} has no devices");
+                anyhow::ensure!(
+                    !d.is_empty(),
+                    "fleet {f:?} and the fleets under it have no devices"
+                );
                 Ok(d)
             }
             (None, Some(d)) => Ok(vec![self.state.db.resolve(d)?]),
@@ -359,6 +442,20 @@ impl Fleet {
                 },
             )
             .await;
+        if !a.dry_run {
+            let from = s.db.devices(None)?;
+            for id in results
+                .iter()
+                .filter(|r| r["error"].is_null() && r["skipped"].is_null())
+                .filter_map(|r| r["id"].as_str())
+            {
+                let was = from
+                    .iter()
+                    .find(|d| d.id == id)
+                    .and_then(|d| d.os_version.as_deref());
+                s.db.begin_os_update(id, &a.version, was)?;
+            }
+        }
         Ok(json!({
             "version": a.version,
             "dry_run": a.dry_run,
@@ -366,16 +463,25 @@ impl Fleet {
             "next": if a.dry_run {
                 "Call again without dry_run to start."
             } else {
-                "Devices download, install and reboot on their own; watch os.update in \
-                 device_health, then os_version in list_devices. A device that comes back on \
-                 its old version rolled back because the new one failed to boot."
+                "Devices download, install and reboot on their own; `os_update` in \
+                 list_devices follows each one to `done`, `rolled_back`, `failed` or `lost`."
             },
         }))
     }
 
     fn provision(&self, a: &ProvisionArgs) -> anyhow::Result<Value> {
         let s = &self.state;
-        let base = image::base_image(&s.images_dir, &a.arch)?;
+        let types = s.db.device_types()?;
+        let device_type = match (&a.device_type, &a.arch) {
+            (Some(id), _) => types.iter().find(|t| &t.id == id),
+            (None, Some(arch)) => types.iter().find(|t| &t.arch == arch),
+            (None, None) => anyhow::bail!("say which device_type this image is for"),
+        }
+        .ok_or_else(|| {
+            let known: Vec<&str> = types.iter().map(|t| t.id.as_str()).collect();
+            anyhow::anyhow!("no such device type; there are: {}", known.join(", "))
+        })?;
+        let base = image::base_image(&s.images_dir, device_type)?;
         s.db.create_fleet(&a.fleet)?;
         // The token goes into the image and nowhere else: not into this
         // result, the audit log, or the server's own log.
@@ -404,19 +510,21 @@ impl Fleet {
             "viaos-{}-{}-{}.raw.zst",
             a.fleet,
             a.hostname.as_deref().unwrap_or("device"),
-            a.arch
+            device_type.id
         );
         std::fs::create_dir_all(s.out_dir())?;
         let out = s.out_dir().join(format!("{id}.raw.zst"));
         image::provision(&base, &out, &toml)?;
         std::fs::write(s.out_dir().join(format!("{id}.name")), &name)?;
+        std::fs::write(s.out_dir().join(format!("{id}.fleet")), &a.fleet)?;
         Ok(json!({
             "file": name,
             "path": out,
             "download": format!("{}/v1/images/{id}", s.public_url),
             "size_mb": std::fs::metadata(&out)?.len() / 1_048_576,
             "fleet": a.fleet,
-            "arch": a.arch,
+            "device_type": device_type.id,
+            "arch": device_type.arch,
             "single_use": true,
             "deleted_after": "the device enrolls",
             "next": "Write it to the device's disk or SD card (it is zstd-compressed; \
@@ -443,6 +551,53 @@ pub struct VariableArgs {
     /// One device; overrides the fleet's value. Give this or `fleet`.
     #[serde(default)]
     pub device: Option<String>,
+    /// One service of the app. Omit for every service that declares the name.
+    #[serde(default)]
+    pub service: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReleaseDetailsArgs {
+    pub app: String,
+    pub release: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OsVersionArgs {
+    pub version: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VariableWrite {
+    pub key: String,
+    #[serde(default)]
+    pub service: Option<String>,
+    pub value: String,
+    /// Encrypt it and never show the value again.
+    #[serde(default)]
+    pub secret: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct VariableName {
+    pub key: String,
+    #[serde(default)]
+    pub service: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateVariablesArgs {
+    pub app: String,
+    /// Every device in this fleet. Give this or `device`.
+    #[serde(default)]
+    pub fleet: Option<String>,
+    /// One device; overrides the fleet's value. Give this or `fleet`.
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub set: Vec<VariableWrite>,
+    #[serde(default)]
+    pub delete: Vec<VariableName>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -477,6 +632,23 @@ pub struct CreateTokenArgs {
     pub viewer: bool,
 }
 
+/// A value aimed at a service the newest release says does not take the name
+/// would quietly do nothing. An older release might still take it, so this
+/// warns instead of refusing.
+fn undeclared_warning(root: &std::path::Path, a: &VariableArgs) -> Option<String> {
+    let service = a.service.as_deref()?;
+    let (_, release, schema) = crate::releases::newest_schemas(root, Some(&a.app)).pop()?;
+    let spec = schema.iter().find(|v| v.key == a.key)?;
+    (!spec.services.iter().any(|s| s == service)).then(|| {
+        format!(
+            "{} release {release} gives {} only to {}, so {service} will not receive it",
+            a.app,
+            a.key,
+            spec.services.join(", ")
+        )
+    })
+}
+
 /// Variable names go into containers' environments.
 fn valid_key(key: &str) -> bool {
     let mut c = key.chars();
@@ -501,13 +673,26 @@ impl Fleet {
         }
     }
 
+    fn check_service(a: &VariableArgs) -> anyhow::Result<()> {
+        if let Some(s) = &a.service {
+            via_core::ServiceName::parse(s.clone())
+                .map_err(|_| anyhow::anyhow!("{s:?} is not a service name"))?;
+        }
+        Ok(())
+    }
+
     /// Send every online device in a scope what it should now hold.
     async fn push_scope(&self, scope: &str, target: &str) -> Vec<Value> {
         let devices = self.state.db.devices(None).unwrap_or_default();
+        let under = if scope == "fleet" {
+            self.state.db.fleets_under(target).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let mut out = Vec::new();
         for d in devices {
             let hit = if scope == "fleet" {
-                d.fleet == target
+                under.contains(&d.fleet)
             } else {
                 d.id == target
             };
@@ -532,7 +717,9 @@ impl Fleet {
 impl Fleet {
     #[tool(
         name = "list_fleets",
-        description = "List fleets and how many devices each holds. Reads only.",
+        description = "List fleets: each one's parent, tags and how many devices it directly \
+                       holds. Fleets nest; a fleet's variables, deploys and updates reach \
+                       every fleet under it. Reads only.",
         annotations(title = "List fleets", read_only_hint = true, open_world_hint = false)
     )]
     async fn list_fleets(&self) -> Result<CallToolResult, ErrorData> {
@@ -544,8 +731,8 @@ impl Fleet {
 
     #[tool(
         name = "create_fleet",
-        description = "Create an empty fleet. Devices join it through a provisioning image. \
-                       Does nothing if it already exists.",
+        description = "Create an empty fleet, optionally under another and with tags. Devices \
+                       join it through a provisioning image. Does nothing if it already exists.",
         annotations(
             title = "Create fleet",
             read_only_hint = false,
@@ -554,19 +741,120 @@ impl Fleet {
     )]
     async fn create_fleet(
         &self,
-        Parameters(a): Parameters<FleetArg>,
+        Parameters(a): Parameters<CreateFleetArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.audited("create_fleet", json!({ "fleet": a.fleet }), async {
+        let args = json!({ "fleet": a.fleet, "parent": a.parent, "tags": a.tags });
+        self.audited("create_fleet", args, async {
+            let known = self.state.db.fleets()?;
+            if let Some(p) = &a.parent {
+                anyhow::ensure!(known.iter().any(|f| &f.name == p), "no fleet named {p:?}");
+            }
+            let existed = known.iter().any(|f| f.name == a.fleet);
             self.state.db.create_fleet(&a.fleet)?;
-            Ok(rendered(json!({ "fleet": a.fleet })))
+            if !existed {
+                if a.parent.is_some() {
+                    self.state
+                        .db
+                        .set_fleet_parent(&a.fleet, a.parent.as_deref())?;
+                }
+                if !a.tags.is_empty() {
+                    self.state.db.set_fleet_tags(&a.fleet, &a.tags)?;
+                }
+            }
+            Ok(rendered(json!({ "fleet": a.fleet, "created": !existed })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "delete_fleet",
+        description = "Delete a fleet with no devices and no fleets under it, along with its \
+                       tags, its variables and any images still waiting to enroll into it.",
+        annotations(
+            title = "Delete fleet",
+            read_only_hint = false,
+            destructive_hint = true
+        )
+    )]
+    async fn delete_fleet(
+        &self,
+        Parameters(a): Parameters<DeleteFleetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.audited("delete_fleet", json!({ "fleet": a.fleet }), async {
+            self.state.db.delete_fleet(&a.fleet)?;
+            Ok(rendered(json!({ "deleted": a.fleet })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "update_fleet",
+        description = "Move a fleet in the tree or change its tags. Its devices re-apply what \
+                       they now inherit from where it sits.",
+        annotations(
+            title = "Update fleet",
+            read_only_hint = false,
+            destructive_hint = true
+        )
+    )]
+    async fn update_fleet(
+        &self,
+        Parameters(a): Parameters<UpdateFleetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let args = json!({ "fleet": a.fleet, "parent": a.parent, "top_level": a.top_level, "tags": a.tags });
+        self.audited("update_fleet", args, async {
+            anyhow::ensure!(
+                !(a.top_level && a.parent.is_some()),
+                "give `parent` or `top_level`, not both"
+            );
+            let moved = a.top_level || a.parent.is_some();
+            if moved {
+                self.state
+                    .db
+                    .set_fleet_parent(&a.fleet, a.parent.as_deref())?;
+            }
+            if let Some(tags) = &a.tags {
+                self.state.db.set_fleet_tags(&a.fleet, tags)?;
+            }
+            let devices = if moved {
+                self.push_scope("fleet", &a.fleet).await
+            } else {
+                Vec::new()
+            };
+            Ok(rendered(json!({ "fleet": a.fleet, "devices": devices })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "update_device",
+        description = "Replace a device's own tags, each `key` or `key=value` like \
+                       `type=rock-5b`. It also has its fleets' tags, as `inherited_tags` in \
+                       `list_devices`.",
+        annotations(
+            title = "Update device",
+            read_only_hint = false,
+            destructive_hint = false
+        )
+    )]
+    async fn update_device(
+        &self,
+        Parameters(a): Parameters<UpdateDeviceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let args = json!({ "device": a.device, "tags": a.tags });
+        self.audited("update_device", args, async {
+            let d = self.state.db.resolve(&a.device)?;
+            self.state.db.set_device_tags(&d.id, &a.tags)?;
+            Ok(rendered(json!({ "device": d.name, "tags": a.tags })))
         })
         .await
     }
 
     #[tool(
         name = "list_devices",
-        description = "Every device: name, id, fleet, online now or not, last seen (unix \
-                       seconds), architecture, OS and agent version. Start here to find a \
+        description = "Every device: name, id, fleet, its tags and those it inherits from its \
+                       fleets, online now or not, last seen (unix seconds), architecture, OS and \
+                       agent version, and how its latest OS update went. Start here to find a \
                        device. Reads only.",
         annotations(title = "List devices", read_only_hint = true, open_world_hint = false)
     )]
@@ -601,6 +889,33 @@ impl Fleet {
                 .await
         })
         .await
+    }
+
+    #[tool(
+        name = "device_metrics",
+        description = "What a device is using: memory and CPU every few seconds for the last \
+                       hour, overall and per service; memory by program; each volume's size; \
+                       what Docker holds; every partition of the whole disk. Needs the device \
+                       online and an OS new enough to report it. Reads only.",
+        annotations(
+            title = "Device metrics",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn device_metrics(
+        &self,
+        Parameters(a): Parameters<DeviceMetricsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Polled every few seconds by an open page, so it stays out of the
+        // audit log, unlike a person asking something once.
+        let mut args = JsonObject::new();
+        if let Some(since) = a.since {
+            args.insert("since".into(), json!(since));
+        }
+        self.forward(&a.device, "device_metrics", args)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("{e:#}"), None))
     }
 
     #[tool(
@@ -701,6 +1016,90 @@ impl Fleet {
     }
 
     #[tool(
+        name = "release_details",
+        description = "What one app release is: its builds, services, images, ports, volumes, \
+                       health gate and the variables it takes. Reads only.",
+        annotations(
+            title = "Release details",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn release_details(
+        &self,
+        Parameters(a): Parameters<ReleaseDetailsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.audited(
+            "release_details",
+            json!({ "app": a.app, "release": a.release }),
+            async {
+                let root = self.state.releases_dir();
+                let (app, release) = (a.app.clone(), a.release);
+                let v = tokio::task::spawn_blocking(move || {
+                    crate::releases::details(&root, &app, release)
+                })
+                .await??;
+                Ok(rendered(v))
+            },
+        )
+        .await
+    }
+
+    #[tool(
+        name = "release_contents",
+        description = "What is actually in one build of a release: the compose file as \
+                       written, the normalized deployment.json, each image's config and \
+                       layers, and every file in the bundle. Reads only.",
+        annotations(
+            title = "Release contents",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn release_contents(
+        &self,
+        Parameters(a): Parameters<ReleaseContentsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let args = json!({ "app": a.app, "release": a.release, "arch": a.arch });
+        self.audited("release_contents", args, async {
+            let root = self.state.releases_dir();
+            let v = tokio::task::spawn_blocking(move || {
+                crate::releases::contents(&root, &a.app, a.release, a.arch.as_deref())
+            })
+            .await??;
+            Ok(rendered(v))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "os_version_details",
+        description = "What one OS version is on each architecture: when it was published, its \
+                       files and their hashes. Reads only.",
+        annotations(
+            title = "OS version details",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn os_version_details(
+        &self,
+        Parameters(a): Parameters<OsVersionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.audited(
+            "os_version_details",
+            json!({ "version": a.version }),
+            async {
+                Ok(rendered(crate::os::details(
+                    &self.state.os_dir,
+                    &a.version,
+                )?))
+            },
+        )
+        .await
+    }
+
+    #[tool(
         name = "deploy",
         description = "Deploy an app release to a whole fleet or one device. Call with dry_run \
                        first and show the user which devices it touches. Each device replaces \
@@ -771,9 +1170,11 @@ impl Fleet {
     #[tool(
         name = "list_variables",
         description = "App variables and secrets on the control plane, with the fleet or \
-                       device each applies to. Services receive only names their compose file \
-                       declares with a bare `- KEY`; `missing_env` in device_health shows what \
-                       a running release still lacks. Secret values are never shown. Reads only.",
+                       device each applies to and, if it is for one service, which. `schemas` \
+                       has each app's newest release's own description of its variables: who \
+                       takes them, defaults, which are required. Services receive only names \
+                       they declare; `missing_env` in device_health shows what a running \
+                       release still lacks. Secret values are never shown. Reads only.",
         annotations(
             title = "List variables",
             read_only_hint = true,
@@ -797,23 +1198,127 @@ impl Fleet {
                         _ => v.target.clone(),
                     };
                     json!({
-                        "app": v.app, "key": v.key, "scope": v.scope, "target": target,
-                        "secret": v.secret,
+                        "app": v.app, "service": v.service, "key": v.key, "scope": v.scope,
+                        "target": target, "secret": v.secret,
                         "value": (!v.secret).then(|| String::from_utf8_lossy(&v.value).into_owned()),
                         "updated_at": v.updated_at, "updated_by": v.updated_by,
                     })
                 })
                 .collect();
-            Ok(rendered(json!({ "variables": vars })))
+            let root = self.state.releases_dir();
+            let schemas: Vec<Value> =
+                tokio::task::spawn_blocking(move || crate::releases::newest_schemas(&root, None))
+                    .await?
+                    .into_iter()
+                    .map(|(app, release, variables)| {
+                        json!({
+                            "app": app,
+                            "release": release.to_string(),
+                            "variables": variables,
+                        })
+                    })
+                    .collect();
+            Ok(rendered(json!({ "variables": vars, "schemas": schemas })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "update_variables",
+        description = "Set and delete several of an app's variables on one fleet or device as \
+                       one change, so devices re-apply once. Same rules as `set_variable`.",
+        annotations(
+            title = "Update variables",
+            read_only_hint = false,
+            destructive_hint = true
+        )
+    )]
+    async fn update_variables(
+        &self,
+        Parameters(a): Parameters<UpdateVariablesArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Names only: values stay out of the audit log.
+        let args = json!({
+            "app": a.app, "fleet": a.fleet, "device": a.device,
+            "set": a.set.iter().map(|v| json!({ "key": v.key, "service": v.service, "secret": v.secret })).collect::<Vec<_>>(),
+            "delete": a.delete,
+        });
+        self.audited("update_variables", args, async {
+            let at = |key: &str, service: &Option<String>| VariableArgs {
+                app: a.app.clone(),
+                key: key.into(),
+                fleet: a.fleet.clone(),
+                device: a.device.clone(),
+                service: service.clone(),
+            };
+            // Everything is checked before anything changes.
+            for v in &a.set {
+                anyhow::ensure!(valid_key(&v.key), "{:?} is not a variable name", v.key);
+                Self::check_service(&at(&v.key, &v.service))?;
+            }
+            for v in &a.delete {
+                Self::check_service(&at(&v.key, &v.service))?;
+            }
+            let (scope, target) = self.scope(&at("", &None))?;
+            let mut warnings = Vec::new();
+            for v in &a.delete {
+                self.state.db.delete_variable(
+                    scope,
+                    &target,
+                    &a.app,
+                    v.service.as_deref(),
+                    &v.key,
+                )?;
+            }
+            for v in &a.set {
+                let value = if v.secret {
+                    self.state.secrets.seal(
+                        scope,
+                        &target,
+                        &a.app,
+                        v.service.as_deref(),
+                        &v.key,
+                        &v.value,
+                    )
+                } else {
+                    v.value.clone().into_bytes()
+                };
+                self.state.db.set_variable(&crate::db::Variable {
+                    scope: scope.into(),
+                    target: target.clone(),
+                    app: a.app.clone(),
+                    service: v.service.clone(),
+                    key: v.key.clone(),
+                    value,
+                    secret: v.secret,
+                    updated_at: crate::db::now(),
+                    updated_by: CALLER.try_with(|c| c.name.clone()).unwrap_or_default(),
+                })?;
+                if let Some(w) =
+                    undeclared_warning(&self.state.releases_dir(), &at(&v.key, &v.service))
+                {
+                    warnings.push(w);
+                }
+            }
+            Ok(rendered(json!({
+                "app": a.app,
+                "set": a.set.len(),
+                "deleted": a.delete.len(),
+                "warnings": warnings,
+                "devices": self.push_scope(scope, &target).await,
+            })))
         })
         .await
     }
 
     #[tool(
         name = "set_variable",
-        description = "Set an app variable for a fleet or one device; a device's value beats \
-                       its fleet's. Online devices re-apply at once, recreating only services \
-                       that declared the name; offline ones get it when they reconnect. A value \
+        description = "Set an app variable for a fleet or one device, and optionally one \
+                       service. Weakest first: the release's default, fleet, fleet and service, \
+                       device, device and service. Online devices re-apply at once, recreating \
+                       only services whose environment changed; offline ones get it when they \
+                       reconnect. If the change fails the health gate the device goes back to \
+                       the last values that passed. A value \
                        given here passes through this conversation, so for a real secret send \
                        the user to the web console instead.",
         annotations(
@@ -828,7 +1333,8 @@ impl Fleet {
     ) -> Result<CallToolResult, ErrorData> {
         // The value stays out of the audit log.
         let args = json!({
-            "app": a.at.app, "key": a.at.key, "fleet": a.at.fleet, "device": a.at.device, "secret": a.secret,
+            "app": a.at.app, "key": a.at.key, "fleet": a.at.fleet, "device": a.at.device,
+            "service": a.at.service, "secret": a.secret,
         });
         self.audited("set_variable", args, async {
             anyhow::ensure!(
@@ -836,11 +1342,13 @@ impl Fleet {
                 "{:?} is not a variable name",
                 a.at.key
             );
+            Self::check_service(&a.at)?;
             let (scope, target) = self.scope(&a.at)?;
+            let service = a.at.service.as_deref();
             let value = if a.secret {
                 self.state
                     .secrets
-                    .seal(scope, &target, &a.at.app, &a.at.key, &a.value)
+                    .seal(scope, &target, &a.at.app, service, &a.at.key, &a.value)
             } else {
                 a.value.clone().into_bytes()
             };
@@ -848,24 +1356,31 @@ impl Fleet {
                 scope: scope.into(),
                 target: target.clone(),
                 app: a.at.app.clone(),
+                service: a.at.service.clone(),
                 key: a.at.key.clone(),
                 value,
                 secret: a.secret,
                 updated_at: crate::db::now(),
                 updated_by: CALLER.try_with(|c| c.name.clone()).unwrap_or_default(),
             })?;
-            Ok(rendered(json!({
-                "app": a.at.app, "key": a.at.key, "secret": a.secret,
+            let warning = undeclared_warning(&self.state.releases_dir(), &a.at);
+            let mut result = json!({
+                "app": a.at.app, "service": a.at.service, "key": a.at.key, "secret": a.secret,
                 "devices": self.push_scope(scope, &target).await,
-            })))
+            });
+            if let Some(w) = warning {
+                result["warning"] = json!(w);
+            }
+            Ok(rendered(result))
         })
         .await
     }
 
     #[tool(
         name = "delete_variable",
-        description = "Remove an app variable from a fleet or device. Online devices re-apply \
-                       at once without it, or with the fleet's value if a device override went.",
+        description = "Remove an app variable from a fleet or device, or just its value for \
+                       one service. Online devices re-apply at once with whatever is then \
+                       strongest, down to the release's default.",
         annotations(
             title = "Delete variable",
             read_only_hint = false,
@@ -876,18 +1391,25 @@ impl Fleet {
         &self,
         Parameters(a): Parameters<VariableArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let args = json!({ "app": a.app, "key": a.key, "fleet": a.fleet, "device": a.device });
+        let args = json!({
+            "app": a.app, "key": a.key, "fleet": a.fleet, "device": a.device, "service": a.service,
+        });
         self.audited("delete_variable", args, async {
+            Self::check_service(&a)?;
             let (scope, target) = self.scope(&a)?;
             anyhow::ensure!(
-                self.state
-                    .db
-                    .delete_variable(scope, &target, &a.app, &a.key)?,
+                self.state.db.delete_variable(
+                    scope,
+                    &target,
+                    &a.app,
+                    a.service.as_deref(),
+                    &a.key
+                )?,
                 "{} is not set there",
                 a.key
             );
             Ok(rendered(json!({
-                "app": a.app, "key": a.key,
+                "app": a.app, "service": a.service, "key": a.key,
                 "devices": self.push_scope(scope, &target).await,
             })))
         })
@@ -973,8 +1495,8 @@ impl Fleet {
 
     #[tool(
         name = "list_provisioning_images",
-        description = "Provisioning images waiting to be used, and the architectures images \
-                       can be made for. An image disappears when its device enrolls. Reads only.",
+        description = "Provisioning images waiting to be used, and the device types images \
+                       can be made for, each `ready` if the server has a base image for it. An image disappears when its device enrolls. Reads only.",
         annotations(
             title = "List provisioning images",
             read_only_hint = true,
@@ -984,11 +1506,14 @@ impl Fleet {
     async fn list_provisioning_images(&self) -> Result<CallToolResult, ErrorData> {
         self.audited("list_provisioning_images", json!({}), async {
             let s = &self.state;
-            let bases: Vec<&str> = image::ARCHES
-                .iter()
-                .copied()
-                .filter(|a| image::base_image(&s.images_dir, a).is_ok())
-                .collect();
+            let device_types: Vec<Value> =
+                s.db.device_types()?
+                    .into_iter()
+                    .map(|t| {
+                        let ready = image::base_image(&s.images_dir, &t).is_ok();
+                        json!({ "id": t.id, "name": t.name, "arch": t.arch, "detail": t.detail, "ready": ready })
+                    })
+                    .collect();
             let mut images = Vec::new();
             if let Ok(dir) = std::fs::read_dir(s.out_dir()) {
                 for e in dir.flatten() {
@@ -1005,6 +1530,7 @@ impl Fleet {
                         };
                         images.push(json!({
                             "file": std::fs::read_to_string(&path).unwrap_or_default(),
+                            "fleet": std::fs::read_to_string(s.out_dir().join(format!("{id}.fleet"))).ok(),
                             "download": format!("{}/v1/images/{id}", s.public_url),
                             "size_mb": meta.len() / 1_048_576,
                             "created_at": meta.modified().ok()
@@ -1014,7 +1540,56 @@ impl Fleet {
                     }
                 }
             }
-            Ok(rendered(json!({ "bases": bases, "images": images })))
+            Ok(rendered(json!({ "device_types": device_types, "images": images })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "set_device_type",
+        description = "Add hardware the console offers images for, or change an entry. It \
+                       needs no new OS build if its architecture's base image already boots \
+                       it; otherwise upload its own with `via base-image --device-type`.",
+        annotations(
+            title = "Set device type",
+            read_only_hint = false,
+            destructive_hint = false
+        )
+    )]
+    async fn set_device_type(
+        &self,
+        Parameters(a): Parameters<DeviceTypeArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let args = json!({ "id": a.id, "arch": a.arch });
+        self.audited("set_device_type", args, async {
+            self.state.db.set_device_type(&crate::db::DeviceType {
+                id: a.id.clone(),
+                name: a.name,
+                arch: a.arch,
+                detail: a.detail,
+            })?;
+            Ok(rendered(json!({ "id": a.id })))
+        })
+        .await
+    }
+
+    #[tool(
+        name = "delete_device_type",
+        description = "Stop offering a device type. Devices already running it are unaffected, \
+                       and its base image file stays on the server.",
+        annotations(
+            title = "Delete device type",
+            read_only_hint = false,
+            destructive_hint = true
+        )
+    )]
+    async fn delete_device_type(
+        &self,
+        Parameters(a): Parameters<DeviceTypeId>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.audited("delete_device_type", json!({ "id": a.id }), async {
+            self.state.db.delete_device_type(&a.id)?;
+            Ok(rendered(json!({ "deleted": a.id })))
         })
         .await
     }
@@ -1024,8 +1599,8 @@ impl Fleet {
         description = "Make a viaos disk image that joins a fleet on first boot, for one \
                        device. Returns where to download it. The image carries a single-use \
                        enrollment token that is never shown here: write the image to exactly \
-                       one device. Make one image per device; for a Raspberry Pi and a PC, \
-                       call this twice with `aarch64` and `x86_64`. Takes up to a minute.",
+                       one device. Make one image per device, naming its `device_type` from \
+                       `list_provisioning_images`. Takes up to a minute.",
         annotations(
             title = "Create provisioning image",
             read_only_hint = false,
@@ -1039,7 +1614,7 @@ impl Fleet {
         // Keys are public, but the list is noise in an audit trail; the count
         // says what changed.
         let args = json!({
-            "fleet": a.fleet, "arch": a.arch, "hostname": a.hostname, "ssh_keys": a.ssh_keys.len(),
+            "fleet": a.fleet, "device_type": a.device_type, "arch": a.arch, "hostname": a.hostname, "ssh_keys": a.ssh_keys.len(),
         });
         self.audited("create_provisioning_image", args, async {
             let this = self.clone();
@@ -1099,4 +1674,22 @@ pub fn service(state: Arc<State>) -> StreamableHttpService<Fleet, NeverSessionMa
         Arc::new(NeverSessionManager::default()),
         config,
     )
+}
+
+/// The tags a device has from the fleet it is in and the fleets above that.
+fn inherited(fleets: &[crate::db::Fleet], fleet: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut seen = Vec::new();
+    let mut at = Some(fleet);
+    while let Some(name) = at.filter(|n| !seen.contains(n)) {
+        seen.push(name);
+        let found = fleets.iter().find(|f| f.name == name);
+        for t in found.into_iter().flat_map(|f| &f.tags) {
+            if !tags.contains(t) {
+                tags.push(t.clone());
+            }
+        }
+        at = found.and_then(|f| f.parent.as_deref());
+    }
+    tags
 }

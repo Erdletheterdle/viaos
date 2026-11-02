@@ -4,12 +4,8 @@
 #
 #   VIA_SERVER       https://via.example.com
 #   VIA_TOKEN        an admin token: `via-server token create ci`
-#   VIA_SIGNING_KEY  the contents of a key from `via keygen`
-#
-# and, to sign for Secure Boot, optionally:
-#
-#   VIA_SECURE_BOOT_KEYS  `tar -C <dir> -c . | base64 -w0` of the directory
-#                         from `via secure-boot keygen`
+#   VIA_SIGNING_KEY  the contents of ~/.config/via/signing.key
+#   VIA_SECURE_BOOT_KEYS  `tar -C ~/.config/via/secure-boot -c . | base64 -w0`
 name: release
 
 on:
@@ -48,11 +44,10 @@ jobs:
         run: |
           umask 077
           printf '%s\n' "$VIA_SIGNING_KEY_HEX" > "$RUNNER_TEMP/key"
-          if [ -n "$SECURE_BOOT_TAR" ]; then
-            mkdir "$RUNNER_TEMP/sb"
-            printf '%s' "$SECURE_BOOT_TAR" | base64 -d | tar -C "$RUNNER_TEMP/sb" -x
-            export VIA_SECURE_BOOT_KEYS="$RUNNER_TEMP/sb"
-          fi
+          # Not optional: a runner making its own keys would sign with ones no device has.
+          mkdir "$RUNNER_TEMP/sb"
+          printf '%s' "${SECURE_BOOT_TAR:?set the VIA_SECURE_BOOT_KEYS secret}" | base64 -d | tar -C "$RUNNER_TEMP/sb" -x
+          export VIA_SECURE_BOOT_KEYS="$RUNNER_TEMP/sb"
           via/bin/via os-release update --sign-key "$RUNNER_TEMP/key"
           via/bin/via base-image image/viaos_$(cat VERSION).raw --arch ${{ matrix.arch }}
           rm -rf "$RUNNER_TEMP/key" "$RUNNER_TEMP/sb"

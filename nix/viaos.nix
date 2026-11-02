@@ -268,7 +268,8 @@ in
 
     # ---- the agent ----
 
-    # `docker compose` comes with the docker package.
+    # The agent runs this docker's `compose`. A build of `via` pins the same one
+    # (see flake.nix), so a file reads the same on both.
     environment.systemPackages = [ agent ];
 
     systemd.services.via-agent = {
@@ -291,6 +292,7 @@ in
       };
       environment = {
         VIA_CONFIG = "/boot/viaos.toml";
+        VIA_DOCKER = "${config.virtualisation.docker.package}/bin/docker";
         VIA_SYSUPDATE = "${config.systemd.package}/lib/systemd/systemd-sysupdate";
       };
     };
@@ -330,7 +332,12 @@ in
 
     networking.useNetworkd = true;
     systemd.network.networks."10-wired" = {
-      matchConfig.Type = "ether";
+      # Real interfaces only. A veth is `ether` too, and networkd taking one
+      # keeps it off Docker's bridge: no published ports, no container network.
+      matchConfig = {
+        Type = "ether";
+        Kind = "!*";
+      };
       networkConfig.DHCP = "yes";
     };
 

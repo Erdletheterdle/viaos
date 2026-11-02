@@ -44,7 +44,10 @@ pub use manifest::{
     DEPLOYMENT_PATH, MANIFEST_PATH,
 };
 pub use oci::{IngestedImage, blob_path, ingest_docker_archive};
-pub use reader::{UnpackedBundle, peek_manifest, peek_signature};
+pub use reader::{
+    BundleContents, BundleFile, UnpackedBundle, peek_deployment, peek_manifest, peek_signature,
+    read_contents,
+};
 pub use signing::{
     ALGORITHM_ED25519, BundleSignature, KeyId, PublicKey, SIGNATURE_PATH, SigningKey, TrustPolicy,
     Verified,
@@ -59,6 +62,12 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("project file {path:?}: {reason}")]
+    ProjectFile { path: String, reason: String },
+
+    #[error("the bundle's compose file is not the one its manifest lists")]
+    ComposeNotListed,
 
     #[error("malformed archive: {0}")]
     Tar(#[source] std::io::Error),

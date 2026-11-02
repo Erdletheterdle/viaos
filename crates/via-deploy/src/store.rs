@@ -8,7 +8,7 @@
 //! ├── state.json           current / previous / candidate  (atomically replaced)
 //! ├── journal.jsonl        append-only record of every transition
 //! └── releases/
-//!     ├── 44/              manifest, deployment.json, blobs/
+//!     ├── 44/              manifest, deployment.json, applied-env.json, blobs/
 //!     └── 45/
 //! ```
 //!
@@ -19,6 +19,7 @@
 //! handful of fields and is re-derivable from the control plane, so a file a
 //! field technician can read with `cat` is worth more than a query engine.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,8 @@ use crate::Error;
 
 pub const STATE_FILE: &str = "state.json";
 pub const JOURNAL_FILE: &str = "journal.jsonl";
+/// In a release's directory: the values it last passed its gate with.
+pub const APPLIED_ENV_FILE: &str = "applied-env.json";
 pub const RELEASES_DIR: &str = "releases";
 
 /// Bumped if the on-disk state shape changes incompatibly.
@@ -131,6 +134,12 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Where an app's current compose file and project files are laid out.
+    /// Files a container wrote into a bind mount here outlive a release.
+    pub fn project_dir(&self, project: &str) -> PathBuf {
+        self.root.join("apps").join(project)
     }
 
     pub fn release_dir(&self, release: ReleaseId) -> PathBuf {
@@ -239,6 +248,33 @@ impl Store {
         self.release_dir(release).join("deployment.json").is_file()
     }
 
+    /// Remember the values a release just passed its gate with, readable by
+    /// root only, so a failed change can go back to them with no network.
+    pub fn save_applied_env(&self, release: ReleaseId, env: &AppliedEnv) -> Result<(), Error> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.release_dir(release).join(APPLIED_ENV_FILE);
+        let tmp = path.with_extension("tmp");
+        let write = || -> std::io::Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(&serde_json::to_vec(env)?)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        };
+        write().map_err(|e| Error::io(&path, e))
+    }
+
+    /// What a release last passed its gate with, if that is known. A release
+    /// deployed before this was recorded has nothing here.
+    pub fn load_applied_env(&self, release: ReleaseId) -> Option<AppliedEnv> {
+        let path = self.release_dir(release).join(APPLIED_ENV_FILE);
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
     /// Delete releases that are neither current, previous, nor candidate.
     ///
     /// Returns what was removed. Retention is deliberately dull: the two
@@ -293,6 +329,16 @@ impl Store {
     pub fn available_bytes(&self) -> Option<u64> {
         available_bytes(&self.root)
     }
+}
+
+/// Runtime values for one app: for every service that declares a name, then
+/// for one service, which wins.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedEnv {
+    #[serde(default)]
+    pub global: BTreeMap<String, String>,
+    #[serde(default)]
+    pub services: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 fn dir_size(dir: &Path) -> u64 {

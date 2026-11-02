@@ -34,6 +34,136 @@ pub fn peek_manifest(source: impl Read) -> Result<BundleManifest, Error> {
     Err(Error::MissingManifest)
 }
 
+/// The most any one text file or image config may unpack to when reading a
+/// bundle's contents. A real one is kilobytes; this bounds a hand-made one.
+const CONTENTS_TEXT_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// What is in a bundle, for showing to a person. See [`read_contents`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BundleContents {
+    pub manifest: BundleManifest,
+    pub compose: Option<String>,
+    pub deployment: String,
+    /// Every entry in the archive, in order.
+    pub files: Vec<BundleFile>,
+    /// The text of each image's OCI manifest and config blobs, by digest.
+    pub image_blobs: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct BundleFile {
+    pub path: String,
+    pub size: u64,
+}
+
+/// Read everything about a bundle except its image layers, whose bytes are
+/// only skipped over. This decompresses the whole stream, so a caller keeps the
+/// result. Like [`peek_deployment`] it checks no signature: it is only data.
+pub fn read_contents(source: impl Read) -> Result<BundleContents, Error> {
+    let decoder = zstd::Decoder::new(source).map_err(|e| Error::io(Path::new("<zstd>"), e))?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut manifest: Option<BundleManifest> = None;
+    let mut compose = None;
+    let mut deployment = None;
+    let mut files = Vec::new();
+    let mut image_blobs = std::collections::BTreeMap::new();
+    let mut wanted = std::collections::BTreeSet::new();
+    for entry in archive.entries().map_err(Error::tar)? {
+        let entry = entry.map_err(Error::tar)?;
+        let path = entry.path().map_err(Error::tar)?.into_owned();
+        let name = path.to_string_lossy().trim_start_matches("./").to_string();
+        let size = entry.size();
+        files.push(BundleFile {
+            path: name.clone(),
+            size,
+        });
+        let blob = name
+            .strip_prefix(BLOB_PREFIX)
+            .map(|b| b.replacen('-', ":", 1));
+        let keep = name == MANIFEST_PATH
+            || name == DEPLOYMENT_PATH
+            || name == crate::COMPOSE_PATH
+            || blob.as_ref().is_some_and(|b| wanted.contains(b));
+        if !keep {
+            continue;
+        }
+        let mut buf = Vec::new();
+        entry
+            .take(CONTENTS_TEXT_LIMIT)
+            .read_to_end(&mut buf)
+            .map_err(|e| Error::io(&path, e))?;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        if name == MANIFEST_PATH {
+            let m: BundleManifest = serde_json::from_slice(&buf).map_err(Error::json)?;
+            m.check_supported()?;
+            for image in &m.images {
+                wanted.insert(image.manifest_digest.to_string());
+                wanted.insert(image.config_digest.to_string());
+            }
+            manifest = Some(m);
+        } else if name == DEPLOYMENT_PATH {
+            deployment = Some(text);
+        } else if name == crate::COMPOSE_PATH {
+            compose = Some(text);
+        } else if let Some(b) = blob {
+            image_blobs.insert(b, text);
+        }
+    }
+    Ok(BundleContents {
+        manifest: manifest.ok_or(Error::MissingManifest)?,
+        compose,
+        deployment: deployment.ok_or(Error::MissingDeployment)?,
+        files,
+        image_blobs,
+    })
+}
+
+/// The most a deployment manifest may unpack to when only peeking at one.
+const PEEK_DEPLOYMENT_LIMIT: u64 = 16 * 1024 * 1024;
+
+/// Read a bundle's deployment manifest from the front of its stream, checked
+/// against the bundle's own manifest, without unpacking any blobs.
+///
+/// For a control plane that stores releases it never runs. Nothing here checks
+/// a signature or touches an image: the result is only data about the release.
+pub fn peek_deployment(source: impl Read) -> Result<Deployment, Error> {
+    let decoder = zstd::Decoder::new(source).map_err(|e| Error::io(Path::new("<zstd>"), e))?;
+    let mut archive = tar::Archive::new(decoder);
+    let mut manifest: Option<BundleManifest> = None;
+    for entry in archive.entries().map_err(Error::tar)? {
+        let entry = entry.map_err(Error::tar)?;
+        let path = entry.path().map_err(Error::tar)?.into_owned();
+        let name = path.to_string_lossy().trim_start_matches("./").to_string();
+        if name.starts_with(BLOB_PREFIX) {
+            break;
+        }
+        if name != MANIFEST_PATH && name != DEPLOYMENT_PATH {
+            continue;
+        }
+        let mut buf = Vec::new();
+        entry
+            .take(PEEK_DEPLOYMENT_LIMIT)
+            .read_to_end(&mut buf)
+            .map_err(|e| Error::io(&path, e))?;
+        if name == MANIFEST_PATH {
+            let m: BundleManifest = serde_json::from_slice(&buf).map_err(Error::json)?;
+            m.check_supported()?;
+            manifest = Some(m);
+            continue;
+        }
+        let manifest = manifest.ok_or(Error::MissingManifest)?;
+        let actual = Digest::sha256_of(&buf);
+        if actual != manifest.deployment_digest {
+            return Err(Error::DeploymentDigestMismatch {
+                expected: manifest.deployment_digest,
+                actual,
+            });
+        }
+        return serde_json::from_slice(&buf).map_err(Error::json);
+    }
+    Err(Error::MissingDeployment)
+}
+
 /// Read the manifest and its signature from the front of a bundle stream, and
 /// check them against a trust policy.
 ///
@@ -86,7 +216,7 @@ pub fn peek_signature(
 pub struct UnpackedBundle {
     pub manifest: BundleManifest,
     pub deployment: Deployment,
-    /// Original compose source, when the bundle carried one.
+    /// The compose file a device runs.
     pub compose_source: Option<String>,
     /// Flat content-addressed blob directory.
     pub blob_dir: PathBuf,
@@ -127,6 +257,7 @@ impl UnpackedBundle {
         let mut deployment_bytes: Option<Vec<u8>> = None;
         let mut compose_source: Option<String> = None;
         let mut seen: Vec<Digest> = Vec::new();
+        let mut project_files_seen = 0;
 
         for entry in archive.entries().map_err(Error::tar)? {
             let mut entry = entry.map_err(Error::tar)?;
@@ -173,6 +304,46 @@ impl UnpackedBundle {
                         .read_to_string(&mut buf)
                         .map_err(|e| Error::io(&raw, e))?;
                     compose_source = Some(buf);
+                }
+                other if other.starts_with(PROJECT_PREFIX) => {
+                    let path = &other[PROJECT_PREFIX.len()..];
+                    if entry.header().entry_type().is_dir() {
+                        continue;
+                    }
+                    let bad = |reason: &str| Error::ProjectFile {
+                        path: path.to_string(),
+                        reason: reason.to_string(),
+                    };
+                    // Another attacker-controlled path, and the manifest comes
+                    // first, so a file it doesn't list never lands.
+                    if !crate::manifest::is_safe_project_path(path) {
+                        return Err(bad("not a path inside the project"));
+                    }
+                    let listed = manifest
+                        .as_ref()
+                        .ok_or(Error::MissingManifest)?
+                        .project_files
+                        .iter()
+                        .find(|f| f.path == path)
+                        .cloned()
+                        .ok_or_else(|| bad("the manifest doesn't list it"))?;
+                    let dest_path = dest.join("project").join(path);
+                    if let Some(parent) = dest_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+                    }
+                    let mut file =
+                        std::fs::File::create(&dest_path).map_err(|e| Error::io(&dest_path, e))?;
+                    let actual = copy_and_digest(&mut entry, &mut file)?;
+                    file.flush().map_err(|e| Error::io(&dest_path, e))?;
+                    if actual != listed.digest {
+                        return Err(bad("its contents don't match the manifest"));
+                    }
+                    std::fs::set_permissions(
+                        &dest_path,
+                        std::os::unix::fs::PermissionsExt::from_mode(listed.mode & 0o777),
+                    )
+                    .map_err(|e| Error::io(&dest_path, e))?;
+                    project_files_seen += 1;
                 }
                 other => {
                     let Some(segment) = other.strip_prefix(BLOB_PREFIX) else {
@@ -222,14 +393,28 @@ impl UnpackedBundle {
                 actual,
             });
         }
-        if let (Some(expected), Some(src)) = (&manifest.compose_digest, &compose_source) {
-            let actual = Digest::sha256_of(src.as_bytes());
-            if &actual != expected {
-                return Err(Error::ComposeDigestMismatch {
-                    expected: expected.clone(),
-                    actual,
-                });
+        // What a device runs, so the signed manifest has to vouch for it.
+        match (&manifest.compose_digest, &compose_source) {
+            (Some(expected), Some(src)) => {
+                let actual = Digest::sha256_of(src.as_bytes());
+                if &actual != expected {
+                    return Err(Error::ComposeDigestMismatch {
+                        expected: expected.clone(),
+                        actual,
+                    });
+                }
             }
+            (None, None) => {}
+            _ => return Err(Error::ComposeNotListed),
+        }
+        if project_files_seen != manifest.project_files.len() {
+            return Err(Error::ProjectFile {
+                path: "*".into(),
+                reason: format!(
+                    "the manifest lists {} and the bundle holds {project_files_seen}",
+                    manifest.project_files.len()
+                ),
+            });
         }
 
         // Every blob the manifest promises must actually be here. A truncated
@@ -250,7 +435,9 @@ impl UnpackedBundle {
 
         let deployment: Deployment =
             serde_json::from_slice(&deployment_bytes).map_err(Error::json)?;
-        if deployment.schema_version != via_core::DEPLOYMENT_SCHEMA_VERSION {
+        if !(via_core::OLDEST_DEPLOYMENT_SCHEMA..=via_core::DEPLOYMENT_SCHEMA_VERSION)
+            .contains(&deployment.schema_version)
+        {
             return Err(Error::UnsupportedDeploymentSchema {
                 found: deployment.schema_version,
                 supported: via_core::DEPLOYMENT_SCHEMA_VERSION,

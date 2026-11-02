@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { tool, when } from "../lib";
-import { Failure, Headline, Pip } from "../ui";
+import { Checkbox, Failure, Headline, Pip } from "../ui";
 
 type Entry = { at: number; actor: string | null; tool: string; args: Record<string, unknown>; ok: boolean };
 
@@ -25,27 +25,20 @@ export function Audit() {
   const entries = (log.data ?? []).filter((e) => reads || !READS.test(e.tool));
   return (
     <>
-      <Headline aside={
-        <label className="flex cursor-pointer items-center gap-2 text-sm">
-          <input type="checkbox" checked={reads} onChange={(e) => setReads(e.target.checked)} className="size-4 accent-[var(--act)]" />
-          Include reads
-        </label>
-      }>
-        Who did what, <span className="marked">and whether it worked</span>.
-      </Headline>
+      <Headline aside={<Checkbox checked={reads} onChange={(e) => setReads(e.target.checked)}>Include reads</Checkbox>}>Audit</Headline>
       <Failure error={log.error} />
-      <div className="border-t-[1.5px] border-rule-strong">
+      <div className="border border-rule bg-sheet px-3 [&>*:last-child]:border-b-0">
         {log.data && entries.length === 0 && <p className="py-6 text-sm text-ink-2">Nothing has changed yet.</p>}
         {entries.map((e, i) => (
-          <div key={i} className="grid grid-cols-[1rem_10.5rem_8rem_minmax(0,1fr)] items-baseline gap-x-3 border-b border-rule py-2 text-sm max-md:grid-cols-[1rem_minmax(0,1fr)]">
+          <div key={i} className="grid grid-cols-[1rem_10.5rem_8rem_minmax(0,1fr)] items-center gap-x-3 row text-sm max-md:grid-cols-[1rem_minmax(0,1fr)]">
             <span className="self-center">
               <Pip state={e.ok ? "ok" : "bad"} />
             </span>
             <span className="font-mono text-xs text-ink-3 max-md:hidden">{when(e.at)}</span>
             <span className="truncate font-medium max-md:hidden">{e.actor || "–"}</span>
-            <span className="min-w-0">
+            <span className="min-w-0 truncate" title={detail(e.args)}>
               <span className="font-mono text-[0.82rem]">{e.tool}</span>
-              <span className="ml-3 font-mono text-xs break-words text-ink-3">{detail(e.args)}</span>
+              <span className="ml-3 font-mono text-xs text-ink-3">{detail(e.args)}</span>
             </span>
           </div>
         ))}

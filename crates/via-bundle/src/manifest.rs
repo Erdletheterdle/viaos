@@ -15,6 +15,8 @@ pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
 pub const MANIFEST_PATH: &str = "via-bundle.json";
 pub const DEPLOYMENT_PATH: &str = "deployment.json";
 pub const COMPOSE_PATH: &str = "compose.yaml";
+/// Where the files the compose file reads travel, under their project paths.
+pub const PROJECT_PREFIX: &str = "project/";
 pub const BLOB_PREFIX: &str = "blobs/";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -51,6 +53,30 @@ pub struct BundleManifest {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compose_digest: Option<Digest>,
+
+    /// Files the compose file reads: bind mount sources, `env_file`s, configs.
+    /// Listed here so the signature covers them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_files: Vec<ProjectFileEntry>,
+}
+
+/// One file a release carries beside its compose file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectFileEntry {
+    /// Relative to the project, with no `.` or `..`.
+    pub path: String,
+    pub digest: Digest,
+    pub size: u64,
+    pub mode: u32,
+}
+
+/// Whether a path from an archive stays inside the directory it lands in.
+pub(crate) fn is_safe_project_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 impl BundleManifest {
@@ -148,6 +174,7 @@ mod tests {
             ],
             deployment_digest: d(b"deployment"),
             compose_digest: None,
+            project_files: Vec::new(),
         }
     }
 

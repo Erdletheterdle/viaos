@@ -54,14 +54,27 @@ impl Secrets {
         })
     }
 
-    fn binding(scope: &str, target: &str, app: &str, key: &str) -> String {
-        format!("{scope}\0{target}\0{app}\0{key}")
+    /// What a sealed value is tied to. A row with no service keeps the form
+    /// from before services existed, so its ciphertext still opens.
+    fn binding(scope: &str, target: &str, app: &str, service: Option<&str>, key: &str) -> String {
+        match service {
+            None => format!("{scope}\0{target}\0{app}\0{key}"),
+            Some(service) => format!("{scope}\0{target}\0{app}\0{key}\0{service}"),
+        }
     }
 
     /// Nonce followed by ciphertext.
-    pub fn seal(&self, scope: &str, target: &str, app: &str, key: &str, value: &str) -> Vec<u8> {
+    pub fn seal(
+        &self,
+        scope: &str,
+        target: &str,
+        app: &str,
+        service: Option<&str>,
+        key: &str,
+        value: &str,
+    ) -> Vec<u8> {
         let nonce: [u8; NONCE] = rand::random();
-        let aad = Self::binding(scope, target, app, key);
+        let aad = Self::binding(scope, target, app, service, key);
         let sealed = self
             .cipher
             .encrypt(
@@ -78,7 +91,7 @@ impl Secrets {
     fn open_value(&self, v: &Variable) -> Result<String> {
         ensure!(v.value.len() > NONCE, "stored secret is too short");
         let (nonce, sealed) = v.value.split_at(NONCE);
-        let aad = Self::binding(&v.scope, &v.target, &v.app, &v.key);
+        let aad = Self::binding(&v.scope, &v.target, &v.app, v.service.as_deref(), &v.key);
         let plain = self
             .cipher
             .decrypt(
@@ -93,41 +106,78 @@ impl Secrets {
     }
 }
 
-/// What a device should hold, by app: its fleet's values, then its own.
+/// What a device should hold. `apps` applies to every service that declares a
+/// name; `services` sits on top of it for one service.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Resolved {
+    pub apps: BTreeMap<String, BTreeMap<String, String>>,
+    pub services: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+}
+
+/// Work out what a device holds, weakest first: fleet, fleet for one service,
+/// device, device for one service. A device's value beats a fleet's even when
+/// the fleet's is aimed at one service, so it clears those as it lands. Each
+/// service's value then only has to win over `apps`, however a release uses it.
 pub fn resolve(
     secrets: &Secrets,
     vars: &[Variable],
     device: &Device,
-) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
-    let mut apps: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    for scope in ["fleet", "device"] {
-        let target = if scope == "fleet" {
-            &device.fleet
-        } else {
-            &device.id
-        };
+    fleets: &[String],
+) -> Result<Resolved> {
+    let mut out = Resolved::default();
+    // Weakest first: the outermost fleet, on in to the device's own.
+    let mut layers: Vec<(&str, &String, bool)> = Vec::new();
+    for fleet in fleets {
+        layers.push(("fleet", fleet, false));
+        layers.push(("fleet", fleet, true));
+    }
+    layers.push(("device", &device.id, false));
+    layers.push(("device", &device.id, true));
+    for (scope, target, scoped) in layers {
         for v in vars
             .iter()
-            .filter(|v| v.scope == scope && &v.target == target)
+            .filter(|v| v.scope == scope && &v.target == target && v.service.is_some() == scoped)
         {
             let value = if v.secret {
                 secrets.open_value(v)?
             } else {
                 String::from_utf8_lossy(&v.value).into_owned()
             };
-            apps.entry(v.app.clone())
-                .or_default()
-                .insert(v.key.clone(), value);
+            match &v.service {
+                None => {
+                    if let Some(services) = out.services.get_mut(&v.app) {
+                        for values in services.values_mut() {
+                            values.remove(&v.key);
+                        }
+                        services.retain(|_, values| !values.is_empty());
+                    }
+                    out.apps
+                        .entry(v.app.clone())
+                        .or_default()
+                        .insert(v.key.clone(), value);
+                }
+                Some(service) => {
+                    out.services
+                        .entry(v.app.clone())
+                        .or_default()
+                        .entry(service.clone())
+                        .or_default()
+                        .insert(v.key.clone(), value);
+                }
+            }
         }
     }
-    Ok(apps)
+    out.services.retain(|_, services| !services.is_empty());
+    Ok(out)
 }
 
 /// Send a device everything it should hold.
 pub async fn push(state: &State, device: &Device) -> Result<Value> {
-    let apps = resolve(&state.secrets, &state.db.variables()?, device)?;
+    let fleets = state.db.fleet_lineage(&device.fleet)?;
+    let resolved = resolve(&state.secrets, &state.db.variables()?, device, &fleets)?;
     let mut args = JsonObject::new();
-    args.insert("apps".into(), json!(apps));
+    args.insert("apps".into(), json!(resolved.apps));
+    args.insert("services".into(), json!(resolved.services));
     let res = state.hub.call(&device.id, "sync_env", args).await?;
     ensure!(
         res.is_error != Some(true),
@@ -150,6 +200,7 @@ mod tests {
             scope: "fleet".into(),
             target: "lab".into(),
             app: "hello".into(),
+            service: None,
             key: key.into(),
             value,
             secret,
@@ -168,6 +219,7 @@ mod tests {
             agent_version: None,
             enrolled_at: 0,
             last_seen: None,
+            tags: Vec::new(),
         }
     }
 
@@ -175,7 +227,7 @@ mod tests {
     fn a_secret_opens_only_where_it_was_sealed() {
         let dir = tempfile::tempdir().unwrap();
         let s = Secrets::open(dir.path(), None).unwrap();
-        let sealed = s.seal("fleet", "lab", "hello", "TOKEN", "s3cret");
+        let sealed = s.seal("fleet", "lab", "hello", None, "TOKEN", "s3cret");
         assert!(!sealed.windows(6).any(|w| w == b"s3cret"));
         assert_eq!(
             s.open_value(&var("TOKEN", sealed.clone(), true)).unwrap(),
@@ -206,8 +258,130 @@ mod tests {
             other,
             var("REGION", b"us".to_vec(), false),
         ];
-        let env = resolve(&s, &vars, &device()).unwrap();
-        assert_eq!(env["hello"]["MODE"], "device");
-        assert_eq!(env["hello"]["REGION"], "us");
+        let env = resolve(&s, &vars, &device(), &["lab".to_string()]).unwrap();
+        assert_eq!(env.apps["hello"]["MODE"], "device");
+        assert_eq!(env.apps["hello"]["REGION"], "us");
+    }
+
+    #[test]
+    fn a_nearer_fleet_beats_one_further_out_and_a_device_beats_them_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Secrets::open(dir.path(), None).unwrap();
+        let at = |target: &str, value: &str| {
+            let mut v = var("MODE", value.as_bytes().to_vec(), false);
+            v.target = target.into();
+            v
+        };
+        let lineage = ["acme".to_string(), "lab".to_string()];
+        let mode = |vars: &[Variable]| {
+            resolve(&s, vars, &device(), &lineage).unwrap().apps["hello"]["MODE"].clone()
+        };
+        assert_eq!(mode(&[at("acme", "outer")]), "outer");
+        assert_eq!(mode(&[at("lab", "inner"), at("acme", "outer")]), "inner");
+        // A service-scoped value further out doesn't outrank a nearer fleet's.
+        let mut scoped = at("acme", "outer-web");
+        scoped.service = Some("web".into());
+        let r = resolve(&s, &[scoped, at("lab", "inner")], &device(), &lineage).unwrap();
+        assert_eq!(r.apps["hello"]["MODE"], "inner");
+        assert!(
+            r.services
+                .get("hello")
+                .is_none_or(|m| !m.contains_key("web"))
+        );
+        // A fleet elsewhere in the tree doesn't reach it.
+        assert!(
+            resolve(&s, &[at("sibling", "no")], &device(), &lineage)
+                .unwrap()
+                .apps
+                .is_empty()
+        );
+    }
+
+    /// A plain value at one layer.
+    fn layer(scope: &str, service: Option<&str>, value: &str) -> Variable {
+        let mut v = var("MODE", value.as_bytes().to_vec(), false);
+        v.scope = scope.into();
+        v.target = if scope == "fleet" { "lab" } else { "d1" }.into();
+        v.service = service.map(Into::into);
+        v
+    }
+
+    /// What `web` and `db` end up with, given the layers.
+    fn seen(vars: &[Variable]) -> (Option<String>, Option<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Secrets::open(dir.path(), None).unwrap();
+        let r = resolve(&s, vars, &device(), &["lab".to_string()]).unwrap();
+        let get = |service: &str| {
+            r.services
+                .get("hello")
+                .and_then(|m| m.get(service))
+                .and_then(|m| m.get("MODE"))
+                .or_else(|| r.apps.get("hello").and_then(|m| m.get("MODE")))
+                .cloned()
+        };
+        (get("web"), get("db"))
+    }
+
+    #[test]
+    fn layers_win_in_the_documented_order() {
+        let fleet = layer("fleet", None, "fleet");
+        let fleet_web = layer("fleet", Some("web"), "fleet-web");
+        let device_all = layer("device", None, "device");
+        let device_web = layer("device", Some("web"), "device-web");
+        let some = |s: &str| Some(s.to_string());
+
+        assert_eq!(
+            seen(std::slice::from_ref(&fleet)),
+            (some("fleet"), some("fleet"))
+        );
+        assert_eq!(
+            seen(&[fleet_web.clone(), fleet.clone()]),
+            (some("fleet-web"), some("fleet")),
+            "a value for one service leaves the others on the fleet's"
+        );
+        assert_eq!(
+            seen(&[fleet_web.clone(), device_all.clone(), fleet.clone()]),
+            (some("device"), some("device")),
+            "a device's value beats a fleet's, even one aimed at a service"
+        );
+        assert_eq!(
+            seen(&[device_web.clone(), device_all, fleet_web, fleet]),
+            (some("device-web"), some("device")),
+        );
+        assert_eq!(seen(&[device_web]), (some("device-web"), None));
+    }
+
+    #[test]
+    fn a_service_value_is_sealed_to_that_service() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Secrets::open(dir.path(), None).unwrap();
+        let sealed = s.seal("fleet", "lab", "hello", Some("web"), "TOKEN", "s3cret");
+        let mut v = var("TOKEN", sealed, true);
+        assert!(s.open_value(&v).is_err(), "not valid for every service");
+        v.service = Some("db".into());
+        assert!(s.open_value(&v).is_err(), "not valid for another service");
+        v.service = Some("web".into());
+        assert_eq!(s.open_value(&v).unwrap(), "s3cret");
+    }
+
+    #[test]
+    fn a_secret_sealed_before_services_existed_still_opens() {
+        // The binding from the first release of this table, spelled out: if
+        // this changes, every secret on every server stops opening.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Secrets::open(dir.path(), None).unwrap();
+        let nonce = [7u8; NONCE];
+        let sealed = s
+            .cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: b"s3cret",
+                    aad: b"fleet\0lab\0hello\0TOKEN",
+                },
+            )
+            .unwrap();
+        let v = var("TOKEN", [nonce.as_slice(), &sealed].concat(), true);
+        assert_eq!(s.open_value(&v).unwrap(), "s3cret");
     }
 }

@@ -1,7 +1,8 @@
 //! Building a release bundle from a compose file.
 //!
-//! Lifted from Via's CLI. A bundle is self-contained: the images travel in
-//! it, so a device needs no registry to deploy, only the bundle.
+//! `docker compose` reads the project, builds it and fetches its images. A
+//! bundle then carries what `docker compose up` needs on a device with no
+//! registry: the flattened file, the local files it reads, and the images.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,7 +10,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use via_bundle::{BundleWriter, SigningKey};
-use via_compose::{Loader, NormalizeOptions};
+use via_compose::Project;
 use via_core::{AppName, Platform, ReleaseId};
 
 pub struct BuildArgs {
@@ -44,7 +45,7 @@ pub struct Built {
 pub fn build(args: BuildArgs) -> Result<Built> {
     let compose_path = match args.file {
         Some(f) => f,
-        None => Loader::discover(".").context(
+        None => via_compose::discover(".").context(
             "no compose file found. Looked for compose.yaml, compose.yml, docker-compose.yaml, docker-compose.yml",
         )?,
     };
@@ -60,33 +61,32 @@ pub fn build(args: BuildArgs) -> Result<Built> {
 
     eprintln!("Building {app} release {release} for {platform}");
 
-    let loaded = Loader::new(&compose_path).load()?;
-    let opts = NormalizeOptions::new(app.to_string(), platform.clone())
-        .base_dir(loaded.base_dir.clone())
-        .build_tag(release.to_string())
-        .profiles(args.profile.clone());
-    let normalized = via_compose::normalize(&loaded.file, &opts)?;
+    let project = Project::open(
+        &compose_path,
+        app.to_string(),
+        platform.clone(),
+        args.profile.clone(),
+        &release.to_string(),
+    )?;
+    let (deployment, mut warnings) = project.deployment()?;
+    let (files, file_warnings) = project.files()?;
+    warnings.extend(file_warnings);
+    let compose = project.device_compose()?;
 
-    for w in &normalized.warnings {
+    for w in &warnings {
         eprintln!("  warning: {w}");
     }
-    if args.strict && !normalized.warnings.is_empty() {
-        bail!(
-            "{} warning(s) and --strict was given",
-            normalized.warnings.len()
-        );
+    if args.strict && !warnings.is_empty() {
+        bail!("{} warning(s) and --strict was given", warnings.len());
     }
 
-    if !args.no_build && !normalized.builds.is_empty() {
-        for spec in &normalized.builds {
-            eprintln!("  building {} from {}", spec.tag, spec.context.display());
-            docker_build(spec, &platform)?;
-        }
+    if !args.no_build {
+        project.build()?;
+        project.pull_missing()?;
     }
 
-    // Every image the deployment names, whether built here or pulled earlier.
-    let references: Vec<String> = normalized
-        .deployment
+    // Every image the release names, whether built here or pulled earlier.
+    let references: Vec<String> = deployment
         .required_images()
         .iter()
         .map(|i| i.reference.clone())
@@ -97,6 +97,9 @@ pub fn build(args: BuildArgs) -> Result<Built> {
     let mut writer = BundleWriter::new(app.clone(), release, platform.clone())?
         .compression(args.compression)
         .builder(concat!("via/", env!("CARGO_PKG_VERSION")));
+    for file in &files {
+        writer.add_project_file(&file.path, &file.source)?;
+    }
     if let Some(path) = &args.sign_key {
         let key = SigningKey::read_from(path)
             .with_context(|| format!("reading signing key {}", path.display()))?;
@@ -107,7 +110,7 @@ pub fn build(args: BuildArgs) -> Result<Built> {
     // One platform only. Saving a multi-platform image from Docker's
     // containerd store exports its whole index while holding content for
     // only some platforms, and the device's Docker then cannot resolve it.
-    let mut save = Command::new("docker")
+    let mut save = Command::new(via_core::docker_program())
         .arg("save")
         .arg("--platform")
         .arg(platform.to_string())
@@ -133,7 +136,7 @@ pub fn build(args: BuildArgs) -> Result<Built> {
 
     // Record content digests into the manifest so the release identifies its
     // images by content, not by a tag someone upstream could move.
-    let deployment = writer.digest_deployment(&normalized.deployment);
+    let deployment = writer.digest_deployment(&deployment);
 
     let output = args.output.unwrap_or_else(|| {
         PathBuf::from(
@@ -144,7 +147,7 @@ pub fn build(args: BuildArgs) -> Result<Built> {
     });
     let file =
         std::fs::File::create(&output).with_context(|| format!("creating {}", output.display()))?;
-    writer.finish(file, &deployment, Some(&loaded.source))?;
+    writer.finish(file, &deployment, Some(&compose))?;
 
     let size_bytes = std::fs::metadata(&output)?.len();
     // The artifact's identity: what a device verifies a transfer against.
@@ -157,52 +160,15 @@ pub fn build(args: BuildArgs) -> Result<Built> {
         sha256: sha256.to_string(),
         size_bytes,
         signed: args.sign_key.is_some(),
-        warnings: normalized.warnings.iter().map(|w| w.to_string()).collect(),
+        warnings: warnings.iter().map(|w| w.to_string()).collect(),
     })
-}
-
-/// Build one image.
-///
-/// The CLI shells out to `docker build` on purpose, unlike the agent
-/// . Building is a developer-machine operation where the
-/// Docker CLI is present and buildx handles cross-platform builds far better
-
-/// than anything worth reimplementing against the Engine API.
-fn docker_build(spec: &via_compose::BuildSpec, platform: &Platform) -> Result<()> {
-    let mut cmd = Command::new("docker");
-    cmd.arg("build")
-        .arg("--platform")
-        .arg(platform.to_string())
-        .arg("-t")
-        .arg(&spec.tag);
-    if let Some(dockerfile) = &spec.dockerfile {
-        cmd.arg("-f").arg(spec.context.join(dockerfile));
-    }
-    for (k, v) in &spec.args {
-        cmd.arg("--build-arg").arg(format!("{k}={v}"));
-    }
-    if let Some(target) = &spec.target {
-        cmd.arg("--target").arg(target);
-    }
-    for c in &spec.cache_from {
-        cmd.arg("--cache-from").arg(c);
-    }
-    // Loading a cross-platform build back into the local image store is what
-    // makes `docker save` able to see it afterwards.
-    cmd.arg("--load").arg(&spec.context);
-
-    let status = cmd.status().context("running `docker build`")?;
-    if !status.success() {
-        bail!("building {} failed", spec.tag);
-    }
-    Ok(())
 }
 
 /// Fail early, with a useful message, if an image the release needs is absent.
 fn ensure_images_present(references: &[String], no_build: bool) -> Result<()> {
     let mut missing = Vec::new();
     for r in references {
-        let out = Command::new("docker")
+        let out = Command::new(via_core::docker_program())
             .args(["image", "inspect", r])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -215,9 +181,9 @@ fn ensure_images_present(references: &[String], no_build: bool) -> Result<()> {
         return Ok(());
     }
     let hint = if no_build {
-        "\n  --no-build was given, so nothing was built. Remove it, or `docker pull` these first."
+        "\n  --no-build was given, so nothing was built or fetched. Remove it, or `docker pull` these first."
     } else {
-        "\n  Run `docker pull` for these, then build again."
+        ""
     };
     bail!("image(s) not present locally: {}{hint}", missing.join(", "));
 }

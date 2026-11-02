@@ -8,6 +8,8 @@
   description,
   # Programs the binary runs, put on its PATH.
   runtimeInputs ? [ ],
+  # The docker whose official `compose` plugin the binary runs.
+  docker ? null,
   # The built web console, compiled into via-server.
   web ? null,
 }:
@@ -40,7 +42,9 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = lib.optional (runtimeInputs != [ ]) makeBinaryWrapper;
   postInstall = lib.optionalString (runtimeInputs != [ ]) ''
-    wrapProgram $out/bin/${bin} --suffix PATH : ${lib.makeBinPath runtimeInputs}
+    wrapProgram $out/bin/${bin} --suffix PATH : ${lib.makeBinPath runtimeInputs} ${
+      lib.optionalString (docker != null) "--set-default VIA_DOCKER ${docker}/bin/docker"
+    }
   '';
 
   meta = {

@@ -15,13 +15,13 @@
 //!   recovery needs no network (spec sections 22, 25).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use via_bundle::{TrustPolicy, UnpackedBundle, Verified};
 use via_core::{Deployment, ReleaseId};
 use via_runtime::{ApplyContext, ApplyReport, GateReport, Runtime, wait_for_ready};
 
-use crate::store::{AgentState, JournalEntry, Store};
+use crate::store::{AgentState, AppliedEnv, JournalEntry, Store};
 use crate::{Clock, Error};
 
 /// Where a deploy got to. Reported to the operator and written to the journal.
@@ -74,6 +74,38 @@ pub struct Deployer<'a> {
     clock: &'a dyn Clock,
     trust: TrustPolicy,
     env: BTreeMap<String, BTreeMap<String, String>>,
+    service_env: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+}
+
+/// The context that gives a deployment its runtime values.
+///
+/// A value for one service reaches it only if it declared the name, the same
+/// rule as for app-wide values: a service never receives a name it did not
+/// list, however the value was aimed.
+pub fn runtime_context(
+    deployment: &Deployment,
+    env: &AppliedEnv,
+    release: Option<ReleaseId>,
+) -> ApplyContext {
+    let mut ctx = ApplyContext {
+        release,
+        ..Default::default()
+    }
+    .with_global(env.global.clone());
+    for (name, values) in &env.services {
+        let Some(service) = deployment.services.get(name) else {
+            continue;
+        };
+        let wanted: BTreeMap<String, String> = values
+            .iter()
+            .filter(|(k, _)| service.wants_runtime_key(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !wanted.is_empty() {
+            ctx.environment.insert(name.clone(), wanted);
+        }
+    }
+    ctx
 }
 
 impl<'a> Deployer<'a> {
@@ -84,6 +116,7 @@ impl<'a> Deployer<'a> {
             clock,
             trust: TrustPolicy::Insecure,
             env: BTreeMap::new(),
+            service_env: BTreeMap::new(),
         }
     }
 
@@ -95,13 +128,41 @@ impl<'a> Deployer<'a> {
         self
     }
 
+    /// Values for one service, by project then service, which beat
+    /// [`Self::with_env`] for that service. Whoever works these out has
+    /// already settled which layer wins: this layer is simply on top.
+    pub fn with_service_env(
+        mut self,
+        env: BTreeMap<String, BTreeMap<String, BTreeMap<String, String>>>,
+    ) -> Self {
+        self.service_env = env;
+        self
+    }
+
     fn context(&self, deployment: &Deployment, release: ReleaseId) -> ApplyContext {
-        ApplyContext::for_release(release).with_global(
-            self.env
+        let env = AppliedEnv {
+            global: self
+                .env
                 .get(&deployment.project)
                 .cloned()
                 .unwrap_or_default(),
-        )
+            services: self
+                .service_env
+                .get(&deployment.project)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        runtime_context(deployment, &env, Some(release))
+    }
+
+    /// The context for going back to a release: the values it last passed its
+    /// gate with, so a change that broke it does not come back with it. A
+    /// release with no record gets the values on hand.
+    fn known_good_context(&self, deployment: &Deployment, release: ReleaseId) -> ApplyContext {
+        match self.store.load_applied_env(release) {
+            Some(env) => runtime_context(deployment, &env, Some(release)),
+            None => self.context(deployment, release),
+        }
     }
 
     /// Require released bundles to be signed by a trusted key.
@@ -176,6 +237,11 @@ impl<'a> Deployer<'a> {
         )
         .map_err(|e| Error::io(&deployment_path, e))?;
 
+        if let Some(compose) = &unpacked.compose_source {
+            let path = dir.join(via_bundle::COMPOSE_PATH);
+            std::fs::write(&path, compose).map_err(|e| Error::io(&path, e))?;
+        }
+
         let manifest_path = dir.join(via_bundle::MANIFEST_PATH);
         std::fs::write(
             &manifest_path,
@@ -239,10 +305,13 @@ impl<'a> Deployer<'a> {
 
         let mut ctx = ctx.clone();
         ctx.release = Some(release);
-        ctx.global_environment
-            .extend(self.context(deployment, release).global_environment);
+        let runtime = self.context(deployment, release);
+        ctx.global_environment.extend(runtime.global_environment);
+        for (service, values) in runtime.environment {
+            ctx.environment.entry(service).or_default().extend(values);
+        }
 
-        let apply = match self.runtime.apply(deployment, &ctx).await {
+        let apply = match self.apply(release, deployment, ctx.clone()).await {
             Ok(r) => r,
             Err(e) => {
                 self.note("apply_failed", Some(release), Some(e.to_string()));
@@ -260,6 +329,16 @@ impl<'a> Deployer<'a> {
         let gate = wait_for_ready(self.runtime, deployment, &deployment.health_gate).await?;
 
         if gate.passed {
+            let good = AppliedEnv {
+                global: ctx.global_environment.clone(),
+                services: ctx.environment.clone(),
+            };
+            // Without this a later failure goes back to whatever values are on
+            // hand, which is worse but no reason to fail a healthy deploy.
+            if let Err(e) = self.store.save_applied_env(release, &good) {
+                self.note("applied_env_not_saved", Some(release), Some(e.to_string()));
+            }
+
             // Promote only now. Until this point `current` still names the
             // release that was actually working.
             if state.current != Some(release) {
@@ -365,9 +444,8 @@ impl<'a> Deployer<'a> {
 
         self.note("rollback_started", Some(target), None);
         let deployment = self.load_deployment(target)?;
-        let ctx = self.context(&deployment, target);
-        self.runtime
-            .apply(&deployment, &ctx)
+        let ctx = self.known_good_context(&deployment, target);
+        self.apply(target, &deployment, ctx)
             .await
             .map_err(|e| Error::RollbackFailed {
                 release: target,
@@ -525,9 +603,8 @@ impl<'a> Deployer<'a> {
         }
 
         let deployment = self.load_deployment(current)?;
-        let ctx = self.context(&deployment, current);
-        self.runtime
-            .apply(&deployment, &ctx)
+        let ctx = self.known_good_context(&deployment, current);
+        self.apply(current, &deployment, ctx)
             .await
             .map_err(|e| Error::ApplyFailed {
                 release: current,
@@ -536,6 +613,72 @@ impl<'a> Deployer<'a> {
             })?;
         self.note("recovered", Some(current), None);
         Ok(Some(current))
+    }
+
+    /// Bring the running release back up as it last worked, after a boot. A
+    /// container that crashed, was removed, or has no `restart:` comes back;
+    /// one that is fine is left alone. None if there is nothing to do, or the
+    /// release predates carrying a compose file.
+    pub async fn reconcile(&self) -> Result<Option<ReleaseId>, Error> {
+        let state = self.store.load_state()?;
+        let Some(current) = state.current.filter(|_| state.candidate.is_none()) else {
+            return Ok(None);
+        };
+        if !self
+            .store
+            .release_dir(current)
+            .join(via_bundle::COMPOSE_PATH)
+            .is_file()
+        {
+            return Ok(None);
+        }
+        let deployment = self.load_deployment(current)?;
+        let ctx = self.known_good_context(&deployment, current);
+        self.apply(current, &deployment, ctx)
+            .await
+            .map_err(|e| Error::ApplyFailed {
+                release: current,
+                reason: e.to_string(),
+                rolled_back_to: None,
+            })?;
+        Ok(Some(current))
+    }
+
+    /// Lay out a release's files where Compose reads them, then apply it.
+    async fn apply(
+        &self,
+        release: ReleaseId,
+        deployment: &Deployment,
+        mut ctx: ApplyContext,
+    ) -> Result<ApplyReport, via_runtime::Error> {
+        ctx.project_dir =
+            self.lay_out(release, deployment)
+                .map_err(|e| via_runtime::Error::Invalid {
+                    reason: e.to_string(),
+                })?;
+        self.runtime.apply(deployment, &ctx).await
+    }
+
+    /// Copy a release's compose file and project files into the app's project
+    /// directory, over what is there: anything else in it was written by a
+    /// container, into a bind mount, and is that container's to keep. None if
+    /// the release has no compose file.
+    fn lay_out(
+        &self,
+        release: ReleaseId,
+        deployment: &Deployment,
+    ) -> Result<Option<PathBuf>, Error> {
+        let source = self.store.release_dir(release);
+        let compose = source.join(via_bundle::COMPOSE_PATH);
+        if !compose.is_file() {
+            return Ok(None);
+        }
+        let dir = self.store.project_dir(&deployment.project);
+        std::fs::create_dir_all(&dir).map_err(|e| Error::io(&dir, e))?;
+        copy_tree(&source.join("project"), &dir)?;
+        let target = dir.join(via_bundle::COMPOSE_PATH);
+        std::fs::copy(&compose, &target).map_err(|e| Error::io(&target, e))?;
+        Ok(Some(dir))
     }
 
     /// Roll back to a specific stored release on request (spec section 25).
@@ -547,6 +690,25 @@ impl<'a> Deployer<'a> {
         let ctx = self.context(&deployment, target);
         self.activate(target, &deployment, &ctx).await
     }
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<(), Error> {
+    let entries = match std::fs::read_dir(from) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::io(from, e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::io(from, e))?;
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            std::fs::create_dir_all(&target).map_err(|e| Error::io(&target, e))?;
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target).map_err(|e| Error::io(&target, e))?;
+        }
+    }
+    Ok(())
 }
 
 /// Serializable form of [`Verified`], so how a release was authenticated

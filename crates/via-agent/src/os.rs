@@ -196,20 +196,44 @@ impl Updater {
         // Not on PATH on NixOS; the unit says where it is.
         let sysupdate =
             std::env::var("VIA_SYSUPDATE").unwrap_or_else(|_| "systemd-sysupdate".into());
-        let out = tokio::process::Command::new(sysupdate)
-            .args(["update", version])
-            .output()
-            .await
-            .context("running systemd-sysupdate")?;
-        if !out.status.success() {
-            bail!(
-                "systemd-sysupdate failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        install(&sysupdate, version).await?;
         let _ = tokio::fs::remove_dir_all(&dir).await;
         Ok(())
     }
+}
+
+/// What sysupdate says when an earlier install of this version died partway,
+/// from a disk error or a power cut. It won't touch it until it's cleared.
+const PARTIAL_INSTALL: &str = "Vacuum it to try installing again";
+
+/// Install `version`. Left alone, one interrupted install would refuse every
+/// retry for good on a device nobody can reach. Vacuuming removes only partial
+/// and surplus instances, never the running one.
+async fn install(sysupdate: &str, version: &str) -> Result<()> {
+    let run = |args: Vec<&str>| {
+        let mut command = tokio::process::Command::new(sysupdate);
+        command.args(args);
+        async move { command.output().await.context("running systemd-sysupdate") }
+    };
+    let mut out = run(vec!["update", version]).await?;
+    if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains(PARTIAL_INSTALL) {
+        tracing::warn!(version, "clearing an interrupted install of this version");
+        let vacuum = run(vec!["vacuum"]).await?;
+        if !vacuum.status.success() {
+            bail!(
+                "systemd-sysupdate vacuum failed: {}",
+                String::from_utf8_lossy(&vacuum.stderr).trim()
+            );
+        }
+        out = run(vec!["update", version]).await?;
+    }
+    if !out.status.success() {
+        bail!(
+            "systemd-sysupdate failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Whether the firmware is enforcing Secure Boot. The EFI variable is four
@@ -315,5 +339,80 @@ impl Fetch {
         }
         out.sync_all().await?;
         Ok(hex::encode(hash.finalize()))
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    /// A stand-in sysupdate that logs its arguments. `update` runs `on_update`.
+    fn sysupdate(dir: &Path, on_update: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("sysupdate");
+        let log = dir.join("log");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> {}\nif [ \"$1\" = update ]; then\n{on_update}\nfi\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// [`super::install`], allowing for the kernel refusing to run a script
+    /// that a test on another thread forked with open for writing. That fails
+    /// before the script does anything, so trying again changes nothing it logs.
+    async fn install(script: &str, version: &str) -> Result<()> {
+        for _ in 0..50 {
+            match super::install(script, version).await {
+                Err(e) if format!("{e:#}").contains("Text file busy") => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                other => return other,
+            }
+        }
+        super::install(script, version).await
+    }
+
+    fn log(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("log")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_install_is_cleared_and_tried_again() {
+        let d = tempfile::tempdir().unwrap();
+        // The message a real device gave after a disk error during an install.
+        let script = sysupdate(
+            d.path(),
+            &format!(
+                "if ! grep -q vacuum {log}; then\n\
+                 echo \"Selected update '2' is already acquired and partially installed. \
+                 Vacuum it to try installing again.\" >&2\nexit 1\nfi",
+                log = d.path().join("log").display()
+            ),
+        );
+        install(&script, "2").await.unwrap();
+        assert_eq!(log(d.path()), "update 2\nvacuum\nupdate 2\n");
+    }
+
+    #[tokio::test]
+    async fn any_other_failure_is_reported_and_nothing_is_vacuumed() {
+        let d = tempfile::tempdir().unwrap();
+        let script = sysupdate(d.path(), "echo 'no space' >&2\nexit 1");
+        let err = install(&script, "2").await.unwrap_err().to_string();
+        assert!(err.contains("no space"), "{err}");
+        assert_eq!(log(d.path()), "update 2\n");
+    }
+
+    #[tokio::test]
+    async fn a_clean_install_runs_once() {
+        let d = tempfile::tempdir().unwrap();
+        let script = sysupdate(d.path(), "exit 0");
+        install(&script, "2").await.unwrap();
+        assert_eq!(log(d.path()), "update 2\n");
     }
 }

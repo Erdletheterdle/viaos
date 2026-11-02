@@ -1,7 +1,7 @@
 //! `via-server` -- the viaos control plane.
 //!
 //! Devices connect out to it over one WebSocket each; people and Claude reach
-//! it over MCP. There is no web UI: Claude is the UI.
+//! it over MCP, or through the web console this binary also serves.
 //!
 //! Routes:
 //!
@@ -10,7 +10,8 @@
 //! - `GET  /v1/images/{id}`   download a provisioning image
 //! - `GET  /v1/os/{arch}/{version}/{file}`  OS update files, for devices
 //! - `PUT  /v1/os/{arch}/{version}/{file}`  upload OS update files (admin)
-//! - `PUT  /v1/base/{arch}`   upload the base image provisioning starts from (admin)
+//! - `PUT  /v1/base/{name}`   upload the base image provisioning starts from, for a
+//!   device type or a whole architecture (admin)
 //! - `PUT  /v1/releases/{app}/{release}/{arch}`  upload a bundle (admin)
 //! - `GET  /v1/releases/{app}/{release}/{arch}`  fetch a bundle (devices)
 //! - `GET  /v1/devices/{device}/tunnel/{port}`  a TCP stream to a port on a
@@ -21,10 +22,12 @@
 //! Viewers get the read-only tools; admins get everything.
 
 mod db;
+mod github;
 mod hub;
 mod image;
 mod mcp;
 mod os;
+mod os_track;
 mod releases;
 mod secrets;
 mod web;
@@ -73,6 +76,31 @@ enum Command {
     /// Manage the API tokens people and Claude use.
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Manage the hardware the console offers images for.
+    #[command(subcommand, name = "device-type")]
+    DeviceType(DeviceTypeCommand),
+}
+
+#[derive(clap::Subcommand)]
+enum DeviceTypeCommand {
+    /// Add a device type, or change one. It uses `viaos-<id>.raw` if that was
+    /// uploaded, and otherwise the base image for its architecture.
+    Set {
+        /// e.g. `rock-5b`
+        id: String,
+        /// What people see, e.g. `Rock 5B`.
+        #[arg(long)]
+        name: String,
+        /// As `uname -m` spells it.
+        #[arg(long)]
+        arch: String,
+        #[arg(long, default_value = "")]
+        detail: String,
+    },
+    List,
+    Remove {
+        id: String,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -117,6 +145,22 @@ struct Serve {
     /// `secret.key` in the data directory, made on first start.
     #[arg(long, env = "VIA_SECRET_KEY", hide_env_values = true)]
     secret_key: Option<String>,
+    /// Let people sign in to the console with GitHub: the OAuth app's client
+    /// ID. Needs the secret and the organisation too.
+    #[arg(long, env = "VIA_GITHUB_CLIENT_ID")]
+    github_client_id: Option<String>,
+    #[arg(long, env = "VIA_GITHUB_CLIENT_SECRET", hide_env_values = true)]
+    github_client_secret: Option<String>,
+    /// Only members of this organisation can sign in. Its owners are admins;
+    /// other members are viewers.
+    #[arg(long, env = "VIA_GITHUB_ORG")]
+    github_org: Option<String>,
+    /// Slug of a team in the organisation whose members are also admins.
+    #[arg(long, env = "VIA_GITHUB_ADMIN_TEAM")]
+    github_admin_team: Option<String>,
+    /// A GitHub Enterprise Server's address.
+    #[arg(long, env = "VIA_GITHUB_URL", default_value = "https://github.com")]
+    github_url: String,
 }
 
 pub struct State {
@@ -131,6 +175,7 @@ pub struct State {
     pub trusted_keys: Vec<String>,
     admin_token_hash: Option<String>,
     pub secrets: secrets::Secrets,
+    pub github: Option<github::Config>,
 }
 
 impl State {
@@ -168,6 +213,27 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::DeviceType(t) => {
+            let db = Db::open(&cli.data_dir.join("via.db"))?;
+            match t {
+                DeviceTypeCommand::Set {
+                    id,
+                    name,
+                    arch,
+                    detail,
+                } => db.set_device_type(&db::DeviceType {
+                    id,
+                    name,
+                    arch,
+                    detail,
+                })?,
+                DeviceTypeCommand::List => {
+                    println!("{}", serde_json::to_string_pretty(&db.device_types()?)?)
+                }
+                DeviceTypeCommand::Remove { id } => db.delete_device_type(&id)?,
+            }
+            Ok(())
+        }
     }
 }
 
@@ -194,6 +260,23 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
     } else {
         anyhow::bail!("VIA_PUBLIC_URL must start with http:// or https://");
     };
+    let github = match (
+        cli.github_client_id,
+        cli.github_client_secret,
+        cli.github_org,
+    ) {
+        (None, None, None) => None,
+        (Some(client_id), Some(client_secret), Some(org)) => Some(github::Config {
+            client_id,
+            client_secret,
+            org,
+            admin_team: cli.github_admin_team,
+            url: cli.github_url.trim_end_matches('/').to_string(),
+        }),
+        _ => anyhow::bail!(
+            "GitHub sign-in needs VIA_GITHUB_CLIENT_ID, VIA_GITHUB_CLIENT_SECRET and VIA_GITHUB_ORG together"
+        ),
+    };
     let db = Db::open(&data_dir.join("via.db"))?;
     let secrets = secrets::Secrets::open(&data_dir, cli.secret_key.as_deref())?;
     if cli.admin_token.is_none() && db.api_tokens()?.is_empty() {
@@ -210,8 +293,17 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
         trusted_keys: cli.trusted_keys,
         admin_token_hash: cli.admin_token.as_deref().map(db::hash),
         secrets,
+        github,
     });
+    tokio::spawn(os_track::run(state.clone()));
+    let app = router(state.clone());
 
+    let listener = tokio::net::TcpListener::bind(cli.listen).await?;
+    tracing::info!("listening on {} as {}", cli.listen, state.public_url);
+    axum::serve(listener, app).await.context("server stopped")
+}
+
+fn router(state: Arc<State>) -> Router {
     // MCP checks roles per tool; everything else here is admin-only.
     let people = Router::new()
         .nest_service("/mcp", mcp::service(state.clone()))
@@ -239,7 +331,7 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
             state.clone(),
             require_caller,
         ));
-    let app = Router::new()
+    Router::new()
         .route("/v1/enroll", post(enroll))
         .route("/v1/connect", get(connect))
         .route("/v1/images/{id}", get(download))
@@ -247,14 +339,34 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
         .route("/v1/releases/{app}/{release}/{arch}", get(release_bundle))
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/session", post(sign_in).delete(sign_out))
+        .route("/v1/auth", get(github::options))
+        .route("/v1/auth/github", get(github::start))
+        .route("/v1/auth/github/callback", get(github::callback))
         .fallback(web::serve)
         .with_state(state.clone())
         .merge(people)
-        .merge(admin);
+        .merge(admin)
+}
 
-    let listener = tokio::net::TcpListener::bind(cli.listen).await?;
-    tracing::info!("listening on {} as {}", cli.listen, state.public_url);
-    axum::serve(listener, app).await.context("server stopped")
+#[cfg(test)]
+fn test_state(
+    dir: &std::path::Path,
+    public_url: &str,
+    github: Option<github::Config>,
+) -> Arc<State> {
+    Arc::new(State {
+        db: Db::open(&dir.join("via.db")).unwrap(),
+        hub: Hub::default(),
+        images_dir: dir.join("base"),
+        os_dir: dir.join("os"),
+        data_dir: dir.to_path_buf(),
+        public_url: public_url.into(),
+        device_url: public_url.replacen("http", "ws", 1),
+        trusted_keys: Vec::new(),
+        admin_token_hash: None,
+        secrets: secrets::Secrets::open(dir, None).unwrap(),
+        github,
+    })
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -281,6 +393,8 @@ async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next:
             name: "admin".into(),
             role: db::Role::Admin,
         })
+    } else if by_cookie && token.starts_with(db::SESSION_PREFIX) {
+        s.db.session_caller(token).ok().flatten()
     } else {
         s.db.api_caller(token).ok().flatten()
     };
@@ -293,7 +407,7 @@ async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next:
     }
 }
 
-const SESSION_COOKIE: &str = "via_session";
+pub const SESSION_COOKIE: &str = "via_session";
 
 fn session_cookie(headers: &HeaderMap) -> Option<&str> {
     headers
@@ -352,7 +466,12 @@ async fn sign_in(
     ([(header::SET_COOKIE, cookie)], Json(caller)).into_response()
 }
 
-async fn sign_out() -> Response {
+async fn sign_out(AxState(s): AxState<Arc<State>>, headers: HeaderMap) -> Response {
+    if let Some(session) = session_cookie(&headers).filter(|_| same_origin(&headers)) {
+        if let Err(e) = s.db.delete_session(session) {
+            tracing::error!("ending a session: {e:#}");
+        }
+    }
     let cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
     ([(header::SET_COOKIE, cookie)], StatusCode::NO_CONTENT).into_response()
 }
@@ -377,6 +496,7 @@ async fn enroll(AxState(s): AxState<Arc<State>>, Json(e): Json<db::Enrollment>) 
             if let Some(id) = image {
                 let _ = std::fs::remove_file(s.out_dir().join(format!("{id}.raw.zst")));
                 let _ = std::fs::remove_file(s.out_dir().join(format!("{id}.name")));
+                let _ = std::fs::remove_file(s.out_dir().join(format!("{id}.fleet")));
             }
             Json(json!({ "device": device, "credential": credential })).into_response()
         }
@@ -494,6 +614,16 @@ async fn upload_release(
         let digest = save_body(&path.with_extension("upload"), body).await?;
         tokio::fs::write(path.with_extension("sha256"), &digest).await?;
         tokio::fs::rename(path.with_extension("upload"), &path).await?;
+        // A bundle this cannot read is the device's to refuse, as it always
+        // was; `list_variables` just has nothing to say about it.
+        let (root, name) = (s.releases_dir(), app.clone());
+        let recorded = tokio::task::spawn_blocking(move || {
+            releases::record_schema(&root, &name, release, &path)
+        })
+        .await?;
+        if let Err(e) = recorded {
+            tracing::warn!(%app, release, %arch, "reading its variables failed: {e:#}");
+        }
         Ok(json!({ "app": app, "release": release, "arch": arch, "sha256": digest }))
     }
     .await;
@@ -520,6 +650,10 @@ async fn upload_os_file(
         if file == "manifest.json" {
             let staged = dir.join("manifest.json.upload");
             save_body(&staged, body).await?;
+            if let Err(e) = os::check_signature(&dir, &staged, &s.trusted_keys) {
+                let _ = tokio::fs::remove_file(&staged).await;
+                return Err(e);
+            }
             if let Err(e) = os::check_complete(&dir, &staged, &arch, &version) {
                 let _ = tokio::fs::remove_file(&staged).await;
                 return Err(e);
@@ -552,9 +686,11 @@ async fn upload_base(
     body: Body,
 ) -> Response {
     let result = async {
+        // Named for a device type, or an architecture to share among its types.
+        let known = s.db.device_types()?;
         anyhow::ensure!(
-            matches!(arch.as_str(), "x86_64" | "aarch64"),
-            "arch is x86_64 or aarch64"
+            known.iter().any(|t| t.id == arch || t.arch == arch),
+            "{arch:?} is not a device type or the architecture of one"
         );
         let compressed = s.images_dir.join(format!("viaos-{arch}.raw.zst"));
         let digest = save_body(&compressed, body).await?;

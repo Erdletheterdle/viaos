@@ -1,26 +1,20 @@
 //! Container runtime abstraction for the Via agent.
 //!
-//! The agent applies a [`via_core::Deployment`] through the [`Runtime`] trait
-//! (spec section 59). Docker is the only implementation today; containerd or
-//! Podman would slot in behind the same trait without touching the agent.
-//!
-//! This crate deliberately does not depend on `via-compose`: the runtime
-//! contract is the normalized deployment manifest, and Compose is an authoring
-//! format that never reaches a device.
+//! The agent applies a release through the [`Runtime`] trait (spec section 59).
+//! The Docker implementation hands the release's compose file to the official
+//! `docker compose`, so a file behaves on a device as it does anywhere else.
 //!
 //! # Reconciliation
 //!
-//! [`Runtime::apply`] is idempotent. Every container carries a hash of the
-//! configuration it was created from, so applying the same deployment twice
-//! leaves a healthy stack untouched, and applying a changed one replaces only
-//! the services that actually changed. That is what makes it safe to run on a
-//! timer, after a reboot, or after a partial failure, which the spec's
-//! straight-line deploy pipeline had no answer for.
+//! [`Runtime::apply`] is `docker compose up`, which is idempotent: it leaves a
+//! container alone unless its configuration changed, and replaces only those
+//! that did and what depends on them. That is what makes it safe to run after a
+//! reboot, or after a partial failure.
 
+mod compose;
 mod docker;
 mod gate;
 mod logs;
-mod plan;
 mod types;
 
 use std::path::Path;
@@ -29,15 +23,12 @@ use async_trait::async_trait;
 use thiserror::Error as ThisError;
 use via_core::Deployment;
 
-pub use docker::DockerRuntime;
+pub use compose::{OVERRIDE_FILE, override_document, process_env};
+pub use docker::{DiskUsage, DockerRuntime, ServiceStats, VolumeUsage};
 pub use gate::{GateReport, Verdict, evaluate, wait_for_ready};
-pub use plan::{
-    LABEL_CONFIG_HASH, LABEL_PROJECT, LABEL_RELEASE, LABEL_SERVICE, config_hash, container_name,
-};
 pub use types::{
     ApplyContext, ApplyReport, ContainerStatus, Exec, ExecChunk, ExecOptions, HealthStatus,
-    LogLine, LogOptions, LogSource, Logs, Naming, RuntimeInfo, ServiceState, needs_default_network,
-    resolved_networks,
+    LogLine, LogOptions, LogSource, Logs, RuntimeInfo, ServiceState,
 };
 
 /// What the agent needs from a container engine.
@@ -54,7 +45,7 @@ pub trait Runtime: Send + Sync {
 
     async fn image_present(&self, reference: &str) -> Result<bool, Error>;
 
-    /// Converge the engine onto `deployment`. Idempotent.
+    /// Bring up the release laid out at `ctx.project_dir`. Idempotent.
     async fn apply(
         &self,
         deployment: &Deployment,
@@ -105,20 +96,13 @@ pub enum Error {
     )]
     ImageNotLoaded { reference: String },
 
-    #[error("external network {name:?} does not exist on this device and Via will not create it")]
-    MissingExternalNetwork { name: String },
+    #[error("docker compose: {reason}")]
+    Compose { reason: String },
 
-    #[error("external volume {name:?} does not exist on this device and Via will not create it")]
-    MissingExternalVolume { name: String },
-
-    #[error("timed out waiting for {service:?} to satisfy condition {condition}")]
-    DependencyTimeout { service: String, condition: String },
-
-    #[error("dependency {service:?} failed: {reason}")]
-    DependencyFailed { service: String, reason: String },
-
-    #[error("{path}")]
-    DependencyCycle { path: String },
+    #[error(
+        "this release has no compose file. Deploy a new release built with this version of via"
+    )]
+    NoComposeFile,
 
     #[error("{service:?} is not a service of the release this device is running")]
     NoSuchService { service: String },

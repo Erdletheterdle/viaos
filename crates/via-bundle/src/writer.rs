@@ -33,6 +33,7 @@ pub struct BundleWriter {
     _owned_staging: Option<tempfile::TempDir>,
     images: Vec<BundleImage>,
     blobs: Vec<BlobEntry>,
+    project_files: Vec<(ProjectFileEntry, PathBuf)>,
     created_at: Option<String>,
     builder: Option<String>,
     compression: i32,
@@ -52,6 +53,7 @@ impl BundleWriter {
             _owned_staging: Some(dir),
             images: Vec::new(),
             blobs: Vec::new(),
+            project_files: Vec::new(),
             created_at: None,
             builder: None,
             compression: DEFAULT_COMPRESSION,
@@ -79,11 +81,34 @@ impl BundleWriter {
             _owned_staging: None,
             images: Vec::new(),
             blobs: Vec::new(),
+            project_files: Vec::new(),
             created_at: None,
             builder: None,
             compression: DEFAULT_COMPRESSION,
             signing_key: None,
         })
+    }
+
+    /// Carry a file the compose file reads, at its path in the project.
+    pub fn add_project_file(&mut self, path: &str, source: &Path) -> Result<(), Error> {
+        if !crate::manifest::is_safe_project_path(path) {
+            return Err(Error::ProjectFile {
+                path: path.to_string(),
+                reason: "not a path inside the project".into(),
+            });
+        }
+        let bytes = std::fs::read(source).map_err(|e| Error::io(source, e))?;
+        let meta = std::fs::metadata(source).map_err(|e| Error::io(source, e))?;
+        self.project_files.push((
+            ProjectFileEntry {
+                path: path.to_string(),
+                digest: Digest::sha256_of(&bytes),
+                size: bytes.len() as u64,
+                mode: std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777,
+            },
+            source.to_path_buf(),
+        ));
+        Ok(())
     }
 
     /// RFC 3339 build timestamp. Passed in rather than read from a clock so
@@ -199,6 +224,7 @@ impl BundleWriter {
             blobs: self.blobs.clone(),
             deployment_digest,
             compose_digest,
+            project_files: self.project_files.iter().map(|(e, _)| e.clone()).collect(),
         };
         let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(Error::json)?;
 
@@ -215,6 +241,16 @@ impl BundleWriter {
         append_bytes(&mut tar, DEPLOYMENT_PATH, &deployment_bytes)?;
         if let Some(src) = compose_source {
             append_bytes(&mut tar, COMPOSE_PATH, src.as_bytes())?;
+        }
+        for (entry, source) in &self.project_files {
+            let bytes = std::fs::read(source).map_err(|e| Error::io(source, e))?;
+            if Digest::sha256_of(&bytes) != entry.digest {
+                return Err(Error::ProjectFile {
+                    path: entry.path.clone(),
+                    reason: "changed while the release was being built".into(),
+                });
+            }
+            append_bytes(&mut tar, &format!("{PROJECT_PREFIX}{}", entry.path), &bytes)?;
         }
 
         for blob in &self.blobs {

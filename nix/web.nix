@@ -42,7 +42,7 @@ let
     dontFixup = true;
     outputHashMode = "recursive";
     outputHashAlgo = "sha256";
-    outputHash = "sha256-VeVZlJ3/GAPpK8H2CyAkRWmE9WcgddHAlc/rEMZEjRY=";
+    outputHash = "sha256-52uXn+CwsRqlq7WvKGjL9y+vOr2Vckv367cqo78L7iw=";
   };
 in
 stdenv.mkDerivation {
@@ -64,6 +64,7 @@ stdenv.mkDerivation {
     chmod -R u+w node_modules
     autoPatchelf node_modules
     bun --bun node_modules/typescript/bin/tsc --noEmit
+    bun test test
     bun --bun node_modules/vite/bin/vite.js build
   '';
   installPhase = ''

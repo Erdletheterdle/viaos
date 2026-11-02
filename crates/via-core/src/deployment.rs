@@ -1,12 +1,8 @@
 //! The normalized deployment manifest (spec section 16).
 //!
-//! This is the runtime contract between a bundle and an agent. Compose is an
-//! authoring format that is translated into this during `via build`, so the
-//! agent never needs a Compose parser and Compose stays swappable
-//! (spec section 15).
-//!
-//! Everything here is already resolved: no variable interpolation, no
-//! `extends`, no profiles, no relative paths that depend on the build host.
+//! What a release is, in a form people and the health gate can read. It comes
+//! from `docker compose config` during `via build`. What a device runs is the
+//! compose file itself, under the official `docker compose`.
 
 use std::collections::BTreeMap;
 
@@ -16,14 +12,19 @@ use crate::{Digest, Platform, ServiceName};
 
 /// Bumped when the manifest shape changes incompatibly. An agent refuses a
 /// manifest whose version it does not understand rather than guessing.
-pub const DEPLOYMENT_SCHEMA_VERSION: u32 = 1;
+pub const DEPLOYMENT_SCHEMA_VERSION: u32 = 2;
+
+/// The oldest shape still read. Version 1 releases have a compose file too; an
+/// agent too old to run one refuses version 2 rather than starting containers
+/// from a manifest that no longer lists their commands.
+pub const OLDEST_DEPLOYMENT_SCHEMA: u32 = 1;
 
 /// A fully resolved application definition for one platform.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Deployment {
     pub schema_version: u32,
 
-    /// Stable project identity. Docker object names are derived from this, so
+    /// The Compose project name. Docker object names are derived from this, so
     /// it must not change between releases or every volume would orphan
     /// (spec section 19).
     pub project: String,
@@ -43,6 +44,40 @@ pub struct Deployment {
     /// When a deploy of this release counts as successful (spec section 22).
     #[serde(default)]
     pub health_gate: HealthGate,
+
+    /// What the compose file's top-level `x-via` says about this release's
+    /// variables. Lives here rather than on [`Service`] so rewording a
+    /// description never changes a container's config hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variables: Vec<VariableSpec>,
+}
+
+/// One variable a release describes: for people setting it, and for deciding
+/// whether a device is missing it.
+///
+/// A default is not carried from here to a container. The normalizer writes it
+/// into the environment of each service that declares the name, so it reaches
+/// the device inside the release and applies with no network.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VariableSpec {
+    pub key: String,
+    /// The services that receive it, sorted.
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub default: Option<String>,
+    /// Asks whoever sets it to mark it secret. A release holds no secrets, so
+    /// this never comes with a default.
+    #[serde(default)]
+    pub secret: bool,
+    #[serde(default = "required_by_default")]
+    pub required: bool,
+}
+
+fn required_by_default() -> bool {
+    true
 }
 
 impl Deployment {
@@ -55,7 +90,57 @@ impl Deployment {
             networks: BTreeMap::new(),
             volumes: BTreeMap::new(),
             health_gate: HealthGate::default(),
+            variables: Vec::new(),
         }
+    }
+
+    /// Every variable this release takes: what it describes, plus any bare
+    /// `- KEY` it does not, which counts as required. Sorted by name.
+    pub fn variable_schema(&self) -> Vec<VariableSpec> {
+        let mut schema: BTreeMap<String, VariableSpec> = self
+            .variables
+            .iter()
+            .map(|v| (v.key.clone(), v.clone()))
+            .collect();
+        for (name, service) in &self.services {
+            for key in &service.runtime_env {
+                let spec = schema.entry(key.clone()).or_insert_with(|| VariableSpec {
+                    key: key.clone(),
+                    services: Vec::new(),
+                    description: None,
+                    default: None,
+                    secret: false,
+                    required: true,
+                });
+                if !spec.services.contains(name) {
+                    spec.services.push(name.clone());
+                }
+            }
+        }
+        schema
+            .into_values()
+            .map(|mut v| {
+                v.services.sort();
+                // Whatever built this bundle, a secret's value is not shown.
+                if v.secret {
+                    v.default = None;
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// The name Docker knows a declared volume by.
+    pub fn volume_name(&self, declared: &str) -> String {
+        self.volumes
+            .get(declared)
+            .and_then(|v| v.name.clone())
+            .unwrap_or_else(|| format!("{}_{declared}", self.project))
+    }
+
+    /// Whether the release says it can run without this name.
+    pub fn variable_is_optional(&self, key: &str) -> bool {
+        self.variables.iter().any(|v| v.key == key && !v.required)
     }
 
     /// Every distinct image required to run this deployment. This is the set a
@@ -69,104 +154,25 @@ impl Deployment {
         }
         seen
     }
-
-    /// Services in dependency order, or the cycle that prevents an order.
-    ///
-    /// Deterministic: ties are broken by name so two builds of the same input
-    /// produce the same plan.
-    pub fn start_order(&self) -> Result<Vec<&str>, DependencyCycle> {
-        let mut visited: BTreeMap<&str, Mark> = BTreeMap::new();
-        let mut order = Vec::new();
-        let mut stack = Vec::new();
-        for name in self.services.keys() {
-            visit(self, name.as_str(), &mut visited, &mut order, &mut stack)?;
-        }
-        Ok(order)
-    }
 }
-
-#[derive(Clone, Copy, PartialEq)]
-enum Mark {
-    InProgress,
-    Done,
-}
-
-fn visit<'a>(
-    dep: &'a Deployment,
-    name: &'a str,
-    visited: &mut BTreeMap<&'a str, Mark>,
-    order: &mut Vec<&'a str>,
-    stack: &mut Vec<&'a str>,
-) -> Result<(), DependencyCycle> {
-    match visited.get(name) {
-        Some(Mark::Done) => return Ok(()),
-        Some(Mark::InProgress) => {
-            let start = stack.iter().position(|s| *s == name).unwrap_or(0);
-            let mut path: Vec<String> = stack[start..].iter().map(|s| s.to_string()).collect();
-            path.push(name.to_string());
-            return Err(DependencyCycle { path });
-        }
-        None => {}
-    }
-    // A dependency on a service that does not exist is caught during
-    // validation, not here; ignore it so we still report real cycles.
-    let Some(svc) = dep.services.get(name) else {
-        return Ok(());
-    };
-
-    visited.insert(name, Mark::InProgress);
-    stack.push(name);
-    for d in &svc.depends_on {
-        if let Some((key, _)) = dep.services.get_key_value(&d.service) {
-            visit(dep, key.as_str(), visited, order, stack)?;
-        }
-    }
-    stack.pop();
-    visited.insert(name, Mark::Done);
-    if let Some((key, _)) = dep.services.get_key_value(name) {
-        order.push(key.as_str());
-    }
-    Ok(())
-}
-
-/// A `depends_on` cycle, reported with the full path so the message is useful.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DependencyCycle {
-    pub path: Vec<String>,
-}
-
-impl std::fmt::Display for DependencyCycle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "dependency cycle: {}", self.path.join(" -> "))
-    }
-}
-
-impl std::error::Error for DependencyCycle {}
 
 /// One container definition.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Service {
     pub name: String,
     pub image: ImageRef,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entrypoint: Option<Vec<String>>,
+    /// How many containers Compose runs for it.
+    #[serde(default = "one")]
+    pub replicas: u32,
 
-    /// Baked-in environment. Runtime variables and secrets are layered on top
-    /// of this by the agent and are deliberately not stored here
-    /// (spec sections 35, 40).
+    /// Values the release itself sets, for showing. Runtime variables and
+    /// secrets are never stored here (spec sections 35, 40).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
 
     /// Environment keys this service declares but does not define -- Compose's
-    /// bare `- KEY` form.
-    ///
-    /// These are the service's runtime inputs: the names it expects the device
-    /// to supply. Recording them rather than resolving them at build time is
-    /// what lets the agent inject a variable or secret into exactly the
-    /// services that asked for it, instead of into everything (spec section 40).
+    /// bare `- KEY` form. These are the names it expects the device to supply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_env: Vec<String>,
 
@@ -188,54 +194,15 @@ pub struct Service {
     #[serde(default)]
     pub readiness: Readiness,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub devices: Vec<DeviceMapping>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cap_add: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cap_drop: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub privileged: bool,
 
-    /// `host`, `none`, `container:<name>`, or a named network. When set, the
-    /// `networks` list is ignored, matching Docker's own behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_mode: Option<String>,
+}
 
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub labels: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_dir: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub init: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipc: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shm_size_bytes: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop_grace_period_secs: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stop_signal: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub tty: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub stdin_open: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub read_only: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extra_hosts: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dns: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub group_add: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub sysctls: BTreeMap<String, String>,
+fn one() -> u32 {
+    1
 }
 
 impl Service {
@@ -243,7 +210,18 @@ impl Service {
         Self {
             name: name.into(),
             image,
-            ..Default::default()
+            replicas: 1,
+            environment: BTreeMap::new(),
+            runtime_env: Vec::new(),
+            mounts: Vec::new(),
+            ports: Vec::new(),
+            networks: Vec::new(),
+            depends_on: Vec::new(),
+            healthcheck: None,
+            restart: RestartPolicy::default(),
+            readiness: Readiness::default(),
+            privileged: false,
+            network_mode: None,
         }
     }
 
@@ -335,39 +313,6 @@ impl Mount {
             | Mount::Tmpfs { target, .. } => target,
         }
     }
-}
-
-/// A host device passed into a container, e.g. a camera, serial/PLC adapter,
-/// or accelerator. Central to Via's target environment, where the whole point
-/// of the device is usually the hardware attached to it (spec section 53).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DeviceMapping {
-    /// Path on the host, e.g. `/dev/ttyUSB0`.
-    pub host_path: String,
-    /// Path inside the container. Defaults to the host path when unset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container_path: Option<String>,
-    /// cgroup permissions: any combination of `r`, `w`, `m`.
-    #[serde(default = "default_device_permissions")]
-    pub permissions: String,
-}
-
-impl DeviceMapping {
-    pub fn new(host_path: impl Into<String>) -> Self {
-        Self {
-            host_path: host_path.into(),
-            container_path: None,
-            permissions: default_device_permissions(),
-        }
-    }
-
-    pub fn effective_container_path(&self) -> &str {
-        self.container_path.as_deref().unwrap_or(&self.host_path)
-    }
-}
-
-fn default_device_permissions() -> String {
-    "rwm".to_string()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,6 +414,8 @@ pub enum Readiness {
     /// did not immediately crash". The default for services without one.
     #[default]
     Running,
+    /// No `restart:` and no healthcheck, so it may be a task: up, or exited 0.
+    RunningOrFinished,
     /// A migration or init job: must exit 0.
     Completed,
     /// Excluded from the gate entirely. For known-flaky sidecars an operator
@@ -520,6 +467,9 @@ pub struct Network {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Volume {
+    /// The name Docker knows it by, which a file can set itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -552,35 +502,6 @@ mod tests {
             d.services.insert(s.name.clone(), s);
         }
         d
-    }
-
-    #[test]
-    fn start_order_respects_dependencies() {
-        let d = deployment(vec![
-            svc("app", &["db"]),
-            svc("db", &[]),
-            svc("proxy", &["app"]),
-        ]);
-        let order = d.start_order().unwrap();
-        let pos = |n: &str| order.iter().position(|s| *s == n).unwrap();
-        assert!(pos("db") < pos("app"));
-        assert!(pos("app") < pos("proxy"));
-    }
-
-    #[test]
-    fn start_order_reports_the_cycle_path() {
-        let d = deployment(vec![svc("a", &["b"]), svc("b", &["a"])]);
-        let err = d.start_order().unwrap_err();
-        assert!(
-            err.path.len() >= 2,
-            "cycle path should name the participants: {err}"
-        );
-    }
-
-    #[test]
-    fn missing_dependency_does_not_masquerade_as_a_cycle() {
-        let d = deployment(vec![svc("app", &["nope"])]);
-        assert!(d.start_order().is_ok());
     }
 
     #[test]

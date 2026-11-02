@@ -10,6 +10,7 @@
 
 mod build;
 mod flash;
+mod keys;
 mod remote;
 mod secureboot;
 
@@ -55,7 +56,8 @@ enum Command {
         /// Use images already present locally instead of `docker build`.
         #[arg(long)]
         no_build: bool,
-        /// Sign the release with this key (from `via keygen`).
+        /// The signing key. Defaults to `~/.config/via/signing.key`, made if
+        /// it doesn't exist.
         #[arg(long, env = "VIA_SIGNING_KEY")]
         sign_key: Option<PathBuf>,
     },
@@ -67,10 +69,12 @@ enum Command {
     /// Sign and upload an OS update: the output of `nix build .#updates.<arch>`.
     OsRelease {
         dir: PathBuf,
+        /// The signing key. Defaults to `~/.config/via/signing.key`, made if
+        /// it doesn't exist.
         #[arg(long, env = "VIA_SIGNING_KEY")]
         sign_key: Option<PathBuf>,
-        /// Sign the UKI for Secure Boot with the keys in this directory
-        /// (from `via secure-boot keygen`).
+        /// The Secure Boot keys. Defaults to `~/.config/via/secure-boot`, made
+        /// if they don't exist.
         #[arg(long, env = "VIA_SECURE_BOOT_KEYS")]
         secure_boot: Option<PathBuf>,
     },
@@ -78,10 +82,12 @@ enum Command {
     /// provisioning images are made from.
     BaseImage {
         raw: PathBuf,
-        #[arg(long)]
+        /// A device type on the server, or an architecture to share the image
+        /// among all its device types.
+        #[arg(long = "device-type", visible_alias = "arch")]
         arch: String,
-        /// Sign its EFI binaries with, and have devices enroll, the Secure
-        /// Boot keys in this directory (from `via secure-boot keygen`).
+        /// The Secure Boot keys it's signed with and devices enroll. Defaults
+        /// to `~/.config/via/secure-boot`, made if they don't exist.
         #[arg(long, env = "VIA_SECURE_BOOT_KEYS")]
         secure_boot: Option<PathBuf>,
     },
@@ -334,7 +340,14 @@ async fn main() -> Result<()> {
             sign_key,
         } => {
             let r = tokio::task::spawn_blocking(move || {
-                release(file, app, number, arch, no_build, sign_key)
+                release(
+                    file,
+                    app,
+                    number,
+                    arch,
+                    no_build,
+                    Some(keys::signing_key(sign_key)?),
+                )
             })
             .await??;
             print_json(&r)?;
@@ -346,14 +359,13 @@ async fn main() -> Result<()> {
             secure_boot,
         } => {
             let remote = remote::Remote::from_env()?;
-            let r = tokio::task::spawn_blocking(move || match secure_boot {
-                Some(keys) => {
-                    let signed = secureboot::sign_update(&keys, &dir)?;
-                    let r = remote::os_release(&remote, &signed, sign_key.as_deref());
-                    let _ = std::fs::remove_dir_all(&signed);
-                    r
-                }
-                None => remote::os_release(&remote, &dir, sign_key.as_deref()),
+            let r = tokio::task::spawn_blocking(move || {
+                let sign_key = keys::signing_key(sign_key)?;
+                let boot_keys = keys::secure_boot_keys(secure_boot)?;
+                let signed = secureboot::sign_update(&boot_keys, &dir)?;
+                let r = remote::os_release(&remote, &signed, &sign_key);
+                let _ = std::fs::remove_dir_all(&signed);
+                r
             })
             .await??;
             print_json(&r)?;
@@ -365,7 +377,8 @@ async fn main() -> Result<()> {
         } => {
             let remote = remote::Remote::from_env()?;
             let r = tokio::task::spawn_blocking(move || {
-                remote::base_image(&remote, &raw, &arch, secure_boot.as_deref())
+                let boot_keys = keys::secure_boot_keys(secure_boot)?;
+                remote::base_image(&remote, &raw, &arch, &boot_keys)
             })
             .await??;
             print_json(&r)?;

@@ -47,6 +47,8 @@
           inherit via-console via-server;
           # Secure Boot signing shells out to sbsign, openssl and efitools.
           via = (via "via-cli" "via" "viaos operator tools: flash, release, ssh").override {
+            # The official compose, from the same nixpkgs as the OS's.
+            docker = pkgs.docker-client;
             runtimeInputs = with pkgs; [
               sbsigntool
               openssl

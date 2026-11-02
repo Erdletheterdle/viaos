@@ -9,7 +9,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use via_core::{Deployment, ImageRef, Platform, Readiness, ReleaseId, Service};
+use via_core::{
+    Dependency, DependencyCondition, Deployment, ImageRef, Platform, Readiness, ReleaseId, Service,
+};
 use via_deploy::{AgentState, Deployer, Error, FixedClock, Store};
 use via_runtime::{
     ApplyContext, ApplyReport, ContainerStatus, HealthStatus, Runtime, RuntimeInfo, ServiceState,
@@ -35,6 +37,20 @@ struct FakeRuntime {
     images: Mutex<Vec<String>>,
     /// Runtime variables each apply was given.
     envs: Mutex<Vec<BTreeMap<String, String>>>,
+    /// Containers as the real engine would hold them: replaced when the config
+    /// hash differs, otherwise left alone. Lives here so a test can watch
+    /// container identity, which is what a restart really is.
+    containers: Mutex<BTreeMap<String, Container>>,
+    next_container: Mutex<u64>,
+    /// A service given this name and value never becomes ready.
+    breaks_on: Mutex<Option<(String, String)>>,
+}
+
+#[derive(Clone, Debug)]
+struct Container {
+    id: u64,
+    hash: String,
+    env: BTreeMap<String, String>,
 }
 
 impl FakeRuntime {
@@ -44,7 +60,21 @@ impl FakeRuntime {
             applied: Mutex::new(Vec::new()),
             images: Mutex::new(Vec::new()),
             envs: Mutex::new(Vec::new()),
+            containers: Mutex::new(BTreeMap::new()),
+            next_container: Mutex::new(0),
+            breaks_on: Mutex::new(None),
         }
+    }
+
+    fn containers(&self) -> BTreeMap<String, Container> {
+        self.containers.lock().unwrap().clone()
+    }
+
+    fn ids(&self) -> BTreeMap<String, u64> {
+        self.containers()
+            .into_iter()
+            .map(|(name, c)| (name, c.id))
+            .collect()
     }
 
     fn set(&self, release: u64, behavior: Behavior) {
@@ -114,10 +144,42 @@ impl Runtime for FakeRuntime {
             });
         }
         self.applied.lock().unwrap().push(release);
-        Ok(ApplyReport {
-            created: deployment.services.keys().cloned().collect(),
-            ..Default::default()
-        })
+        let mut report = ApplyReport::default();
+        let mut containers = self.containers.lock().unwrap();
+        for (name, service) in &deployment.services {
+            let hash = format!(
+                "{}{:?}",
+                serde_json::to_string(service).unwrap(),
+                ctx.effective_env(service)
+            );
+            let existing = containers.get(name);
+            if existing.is_some_and(|c| c.hash == hash) {
+                report.unchanged.push(name.clone());
+                continue;
+            }
+            let (list, id) = (
+                if existing.is_some() {
+                    &mut report.replaced
+                } else {
+                    &mut report.created
+                },
+                {
+                    let mut next = self.next_container.lock().unwrap();
+                    *next += 1;
+                    *next
+                },
+            );
+            list.push(name.clone());
+            containers.insert(
+                name.clone(),
+                Container {
+                    id,
+                    hash,
+                    env: ctx.effective_env(service),
+                },
+            );
+        }
+        Ok(report)
     }
 
     async fn service_states(
@@ -129,10 +191,22 @@ impl Runtime for FakeRuntime {
         // observable.
         let running = self.current().unwrap_or(0);
         let behavior = self.behavior_for(running);
+        let containers = self.containers();
+        let breaks_on = self.breaks_on.lock().unwrap().clone();
         Ok(deployment
             .services
             .keys()
             .map(|name| {
+                let broken = breaks_on.as_ref().is_some_and(|(k, v)| {
+                    containers
+                        .get(name)
+                        .is_some_and(|c| c.env.get(k) == Some(v))
+                });
+                let behavior = if broken {
+                    Behavior::NeverReady
+                } else {
+                    behavior
+                };
                 let (status, health) = match behavior {
                     Behavior::Healthy => (ContainerStatus::Running, HealthStatus::Healthy),
                     Behavior::NeverReady => (ContainerStatus::Running, HealthStatus::Starting),
@@ -528,6 +602,316 @@ async fn the_journal_records_the_whole_story() {
             "missing {expected:?} in {events:?}"
         );
     }
+}
+
+type Values = BTreeMap<String, String>;
+
+fn values(pairs: &[(&str, &str)]) -> Values {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// `web`, which reads API_KEY and LOG_LEVEL; `worker`, which reads LOG_LEVEL
+/// and depends on `web`; and `db`, which `web` depends on and reads neither.
+fn stack(release: u64) -> Deployment {
+    let mut d = Deployment::new("demo-stack", Platform::new("linux", "arm64"));
+    let image = ImageRef::new(format!("app:{release}"));
+    let needs = |service: &str| Dependency {
+        service: service.into(),
+        condition: DependencyCondition::Healthy,
+    };
+
+    let mut db = Service::new("db", image.clone());
+    db.readiness = Readiness::Healthy;
+    d.services.insert("db".into(), db);
+
+    let mut web = Service::new("web", image.clone());
+    web.readiness = Readiness::Healthy;
+    web.runtime_env = vec!["API_KEY".into(), "LOG_LEVEL".into()];
+    web.depends_on = vec![needs("db")];
+    d.services.insert("web".into(), web);
+
+    let mut worker = Service::new("worker", image);
+    worker.readiness = Readiness::Healthy;
+    worker.runtime_env = vec!["LOG_LEVEL".into()];
+    worker.depends_on = vec![needs("web")];
+    d.services.insert("worker".into(), worker);
+
+    d.health_gate.timeout_secs = 1;
+    d.health_gate.stable_secs = 0;
+    d
+}
+
+fn stage_stack(h: &Harness, release: u64) {
+    let dir = h.store.release_dir(ReleaseId(release));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("deployment.json"),
+        serde_json::to_vec_pretty(&stack(release)).unwrap(),
+    )
+    .unwrap();
+    h.runtime
+        .images
+        .lock()
+        .unwrap()
+        .push(format!("app:{release}"));
+}
+
+impl Harness {
+    /// Apply release 44 of the stack with these values, as a re-apply would:
+    /// app-wide, then for one service.
+    async fn apply_stack(
+        &self,
+        global: Values,
+        services: BTreeMap<String, Values>,
+    ) -> via_deploy::DeployOutcome {
+        self.deployer()
+            .with_env(BTreeMap::from([("demo-stack".to_string(), global)]))
+            .with_service_env(BTreeMap::from([("demo-stack".to_string(), services)]))
+            .activate(ReleaseId(44), &stack(44), &ApplyContext::default())
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_changed_value_recreates_only_the_services_it_reaches() {
+    let h = Harness::new();
+    stage_stack(&h, 44);
+    let global = values(&[("API_KEY", "old"), ("LOG_LEVEL", "info")]);
+    h.apply_stack(global, BTreeMap::new()).await;
+    let before = h.runtime.ids();
+    assert_eq!(before.len(), 3);
+
+    // API_KEY is only read by `web`. `worker` depends on `web`, and `web`
+    // depends on `db`: neither direction is a reason to restart.
+    let outcome = h
+        .apply_stack(
+            values(&[("API_KEY", "new"), ("LOG_LEVEL", "info")]),
+            BTreeMap::new(),
+        )
+        .await;
+    assert!(outcome.succeeded());
+    assert_eq!(outcome.apply.replaced, ["web"]);
+    assert_eq!(outcome.apply.unchanged, ["db", "worker"]);
+
+    let after = h.runtime.ids();
+    assert_ne!(before["web"], after["web"]);
+    assert_eq!(before["db"], after["db"]);
+    assert_eq!(before["worker"], after["worker"]);
+    assert_eq!(h.runtime.containers()["web"].env["API_KEY"], "new");
+}
+
+#[tokio::test]
+async fn a_name_two_services_read_can_differ_and_change_for_one() {
+    let h = Harness::new();
+    stage_stack(&h, 44);
+    let global = values(&[("API_KEY", "k"), ("LOG_LEVEL", "info")]);
+    h.apply_stack(global.clone(), BTreeMap::new()).await;
+    let before = h.runtime.ids();
+
+    let web_debug = BTreeMap::from([("web".to_string(), values(&[("LOG_LEVEL", "debug")]))]);
+    let outcome = h.apply_stack(global.clone(), web_debug.clone()).await;
+    assert_eq!(outcome.apply.replaced, ["web"]);
+
+    let containers = h.runtime.containers();
+    assert_eq!(containers["web"].env["LOG_LEVEL"], "debug");
+    assert_eq!(containers["worker"].env["LOG_LEVEL"], "info");
+    assert_eq!(before["worker"], containers["worker"].id);
+
+    // Same again: nothing at all happens.
+    let outcome = h.apply_stack(global, web_debug).await;
+    assert!(!outcome.apply.changed(), "{:?}", outcome.apply);
+}
+
+#[tokio::test]
+async fn moving_a_value_between_layers_without_changing_it_restarts_nothing() {
+    let h = Harness::new();
+    stage_stack(&h, 44);
+    h.apply_stack(
+        values(&[("API_KEY", "k"), ("LOG_LEVEL", "info")]),
+        BTreeMap::new(),
+    )
+    .await;
+    let before = h.runtime.ids();
+
+    let outcome = h
+        .apply_stack(
+            values(&[("LOG_LEVEL", "info")]),
+            BTreeMap::from([("web".to_string(), values(&[("API_KEY", "k")]))]),
+        )
+        .await;
+    assert!(!outcome.apply.changed(), "{:?}", outcome.apply);
+    assert_eq!(before, h.runtime.ids());
+}
+
+#[tokio::test]
+async fn a_value_for_a_service_that_did_not_declare_it_goes_nowhere() {
+    let h = Harness::new();
+    stage_stack(&h, 44);
+    h.apply_stack(values(&[("API_KEY", "k")]), BTreeMap::new())
+        .await;
+    let before = h.runtime.ids();
+
+    let outcome = h
+        .apply_stack(
+            values(&[("API_KEY", "k")]),
+            BTreeMap::from([
+                ("db".to_string(), values(&[("API_KEY", "for-db")])),
+                ("gone".to_string(), values(&[("API_KEY", "for-nobody")])),
+            ]),
+        )
+        .await;
+    assert!(!outcome.apply.changed(), "{:?}", outcome.apply);
+    assert_eq!(before, h.runtime.ids());
+    assert!(!h.runtime.containers()["db"].env.contains_key("API_KEY"));
+}
+
+#[tokio::test]
+async fn values_that_fail_the_gate_are_undone_and_nothing_else_moves() {
+    let h = Harness::new();
+    stage_stack(&h, 44);
+    let good = values(&[("API_KEY", "good"), ("LOG_LEVEL", "info")]);
+    h.apply_stack(good.clone(), BTreeMap::new()).await;
+    let before = h.runtime.ids();
+
+    *h.runtime.breaks_on.lock().unwrap() = Some(("API_KEY".into(), "bad".into()));
+    let outcome = h
+        .apply_stack(
+            values(&[("API_KEY", "bad"), ("LOG_LEVEL", "info")]),
+            BTreeMap::new(),
+        )
+        .await;
+
+    assert!(!outcome.succeeded());
+    assert_eq!(
+        outcome.rolled_back_to,
+        Some(ReleaseId(44)),
+        "the release was fine, so it is the one gone back to"
+    );
+    let containers = h.runtime.containers();
+    assert_eq!(containers["web"].env["API_KEY"], "good");
+    assert_ne!(
+        before["web"], containers["web"].id,
+        "web was replaced twice"
+    );
+    assert_eq!(before["db"], containers["db"].id);
+    assert_eq!(before["worker"], containers["worker"].id);
+
+    let state = h.store.load_state().unwrap();
+    assert_eq!(state.current, Some(ReleaseId(44)));
+    assert_eq!(state.candidate, None);
+    assert!(h.store.has_release(ReleaseId(44)), "must not be pruned");
+
+    // Fixing the value goes through as normal.
+    *h.runtime.breaks_on.lock().unwrap() = None;
+    let outcome = h
+        .apply_stack(
+            values(&[("API_KEY", "fixed"), ("LOG_LEVEL", "info")]),
+            BTreeMap::new(),
+        )
+        .await;
+    assert!(outcome.succeeded());
+    assert_eq!(h.runtime.containers()["web"].env["API_KEY"], "fixed");
+}
+
+#[tokio::test]
+async fn a_failed_release_goes_back_with_the_values_the_old_one_ran_with() {
+    let h = Harness::new();
+    stage_stack(&h, 44);
+    stage_stack(&h, 45);
+    h.runtime.set(45, Behavior::NeverReady);
+    let per_service = BTreeMap::from([("web".to_string(), values(&[("LOG_LEVEL", "debug")]))]);
+    h.apply_stack(values(&[("API_KEY", "old")]), per_service.clone())
+        .await;
+
+    // The values changed along with the release, and neither gets to stay.
+    let outcome = h
+        .deployer()
+        .with_env(BTreeMap::from([(
+            "demo-stack".to_string(),
+            values(&[("API_KEY", "new")]),
+        )]))
+        .activate(ReleaseId(45), &stack(45), &ApplyContext::default())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.rolled_back_to, Some(ReleaseId(44)));
+    let containers = h.runtime.containers();
+    assert_eq!(containers["web"].env["API_KEY"], "old");
+    assert_eq!(containers["web"].env["LOG_LEVEL"], "debug");
+}
+
+#[tokio::test]
+async fn recovery_restores_known_good_values_with_no_network() {
+    let h = Harness::new();
+    stage_stack(&h, 44);
+    h.apply_stack(values(&[("API_KEY", "good")]), BTreeMap::new())
+        .await;
+
+    let mut state = h.store.load_state().unwrap();
+    state.candidate = Some(ReleaseId(44));
+    h.store.save_state(&state).unwrap();
+
+    // Power came back, and the values on hand are the ones being tried when
+    // it went: recovery does not trust them.
+    let restored = h
+        .deployer()
+        .with_env(BTreeMap::from([(
+            "demo-stack".to_string(),
+            values(&[("API_KEY", "untried")]),
+        )]))
+        .recover()
+        .await
+        .unwrap();
+    assert_eq!(restored, Some(ReleaseId(44)));
+    assert_eq!(h.runtime.containers()["web"].env["API_KEY"], "good");
+}
+
+#[tokio::test]
+async fn a_release_with_no_record_of_its_values_goes_back_with_what_is_on_hand() {
+    // A device that deployed before these were recorded.
+    let h = Harness::new();
+    stage_stack(&h, 44);
+    let vars = values(&[("API_KEY", "k")]);
+    h.apply_stack(vars.clone(), BTreeMap::new()).await;
+    std::fs::remove_file(
+        h.store
+            .release_dir(ReleaseId(44))
+            .join(via_deploy::APPLIED_ENV_FILE),
+    )
+    .unwrap();
+
+    let mut state = h.store.load_state().unwrap();
+    state.candidate = Some(ReleaseId(44));
+    h.store.save_state(&state).unwrap();
+    h.deployer()
+        .with_env(BTreeMap::from([("demo-stack".to_string(), vars)]))
+        .recover()
+        .await
+        .unwrap();
+    assert_eq!(h.runtime.containers()["web"].env["API_KEY"], "k");
+}
+
+#[tokio::test]
+async fn known_good_values_are_readable_by_root_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let h = Harness::new();
+    stage_stack(&h, 44);
+    h.apply_stack(values(&[("API_KEY", "k")]), BTreeMap::new())
+        .await;
+    let path = h
+        .store
+        .release_dir(ReleaseId(44))
+        .join(via_deploy::APPLIED_ENV_FILE);
+    let mode = std::fs::metadata(path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert_eq!(
+        h.store.load_applied_env(ReleaseId(44)).unwrap().global["API_KEY"],
+        "k"
+    );
 }
 
 #[test]

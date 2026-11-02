@@ -9,6 +9,7 @@ mod deploy;
 mod env;
 mod host;
 mod link;
+mod metrics;
 mod os;
 mod ready;
 mod shell;
@@ -71,8 +72,15 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run => {
             cfg.apply(&cli.data_dir);
-            deploy::recover(&cli.data_dir).await;
+            if deploy::recover(&cli.data_dir).await {
+                device.retry_env();
+            }
+            // Not waited for: reaching the control plane is what marks a new OS
+            // good, and a slow app shouldn't hold that up.
+            let data_dir = cli.data_dir.clone();
+            tokio::spawn(async move { deploy::reconcile(&data_dir).await });
             tracing::info!(hostname = ?cfg.hostname, control = cfg.control.is_some(), "configured");
+            device.start_metrics(cli.data_dir.clone());
             match cfg.control {
                 Some(control) => link::run(control, cli.data_dir, device).await,
                 // No control plane: the device runs its containers and
