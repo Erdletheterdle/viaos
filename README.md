@@ -2,8 +2,9 @@
 
 An open, immutable Linux for edge devices: NixOS-built, upstream Docker, A/B
 OS updates with automatic rollback, and an optional control plane that
-devices dial out to, so they can sit behind NAT. There is no web UI. Claude
-is the UI, through MCP.
+devices dial out to, so they can sit behind NAT. Claude runs it through MCP;
+a web console, built into the server, covers enrolling, logs, shells,
+secrets and administration through the same tools.
 
 ```text
  Claude ──MCP──▶ via-server ◀──WebSocket (outbound)── via-agent ── dockerd
@@ -39,6 +40,8 @@ Then ask:
 - "Update all of fleet `line` to version 2."
 - "What's using the disk on line-07?" (`exec`)
 
+Or open the server's address in a browser and sign in with the token.
+
 `via ssh line-07` opens a shell on a device wherever it is, through its own
 outbound connection.
 
@@ -56,6 +59,7 @@ A device without a control plane is still fully manageable:
 | `nix/rpi.nix` | Raspberry Pi 4 / 400 / CM4 boot chain (firmware → U-Boot → systemd-boot) |
 | `crates/via-agent` | Device daemon: applies `viaos.toml`, holds the control-plane link, serves device MCP |
 | `crates/via-server` | Control plane: registry, enrollment, provisioning images, OS updates, fleet MCP |
+| `web/` | The web console: Bun, React, Tailwind. `nix/web.nix` builds it into `via-server` |
 | `crates/via-link` | Byte streams multiplexed over the device's one WebSocket |
 | `crates/via-cli` | `via` on the operator's machine: flash SD cards, release apps and OS versions (signed, and for Secure Boot), `ssh` and `forward` into devices |
 | `crates/via-image` | The boot partition of a raw image, opened in place |

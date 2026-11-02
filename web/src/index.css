@@ -1,0 +1,153 @@
+@import "tailwindcss";
+@import "@fontsource-variable/bricolage-grotesque";
+@import "@fontsource-variable/instrument-sans";
+@import "@fontsource-variable/jetbrains-mono";
+
+/* viaos console. A logbook kept next to the machines: bone paper and ink by
+   day, carbon and hi-vis yellow at night. Rules rather than boxes, square
+   corners, and numbers set to line up. Every colour is a token here. */
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+:root {
+  --paper: oklch(0.955 0.014 90);
+  --sheet: oklch(0.982 0.008 90);
+  --ink: oklch(0.2 0.018 80);
+  --ink-2: oklch(0.43 0.018 80);
+  --ink-3: oklch(0.58 0.016 80);
+  --rule: oklch(0.86 0.014 85);
+  --rule-strong: oklch(0.2 0.018 80);
+
+  /* What you can act on. Ink by day; the marker only highlights. */
+  --act: oklch(0.2 0.018 80);
+  --act-ink: oklch(0.975 0.01 90);
+  --marker: oklch(0.91 0.19 108);
+  --marker-ink: oklch(0.2 0.018 80);
+
+  /* Status carries meaning and is never decoration. */
+  --ok: oklch(0.52 0.14 150);
+  --warn: oklch(0.62 0.15 70);
+  --bad: oklch(0.56 0.21 30);
+  --off: oklch(0.68 0.012 80);
+
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --paper: oklch(0.175 0.008 80);
+  --sheet: oklch(0.205 0.009 80);
+  --ink: oklch(0.93 0.012 90);
+  --ink-2: oklch(0.72 0.014 85);
+  --ink-3: oklch(0.56 0.013 85);
+  --rule: oklch(0.3 0.01 80);
+  --rule-strong: oklch(0.93 0.012 90);
+
+  --act: oklch(0.91 0.19 108);
+  --act-ink: oklch(0.18 0.02 100);
+  --marker: oklch(0.91 0.19 108);
+  --marker-ink: oklch(0.18 0.02 100);
+
+  --ok: oklch(0.76 0.17 150);
+  --warn: oklch(0.8 0.15 75);
+  --bad: oklch(0.7 0.2 32);
+  --off: oklch(0.5 0.012 80);
+
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-sheet: var(--sheet);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-rule: var(--rule);
+  --color-rule-strong: var(--rule-strong);
+  --color-act: var(--act);
+  --color-act-ink: var(--act-ink);
+  --color-marker: var(--marker);
+  --color-marker-ink: var(--marker-ink);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-off: var(--off);
+  --font-display: "Bricolage Grotesque Variable", ui-sans-serif, sans-serif;
+  --font-sans: "Instrument Sans Variable", ui-sans-serif, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+}
+
+html {
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+
+body {
+  min-height: 100dvh;
+}
+
+::selection {
+  background: var(--marker);
+  color: var(--marker-ink);
+}
+
+/* In a layer, so a field's own focus style can replace it. */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--act);
+    outline-offset: 2px;
+  }
+}
+
+/* Small capitals in the mono face: column heads and field labels. */
+.label {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+/* A stroke of highlighter behind the words. */
+.marked {
+  background: linear-gradient(transparent 12%, var(--marker) 12%, var(--marker) 92%, transparent 92%);
+  color: var(--marker-ink);
+  padding-inline: 0.18em;
+  box-decoration-break: clone;
+}
+
+/* Terminals and logs stay dark in either theme: light on black is what they
+   are in every other tool an operator has open. */
+.tty {
+  background: #0f0e0c;
+  color: #e3e0d8;
+  --tty-dim: oklch(0.58 0.01 85);
+}
+
+dialog::backdrop {
+  background: oklch(0.15 0.01 80 / 0.55);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .rise {
+    animation: rise 0.28s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+  }
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+  }
+  .live {
+    animation: pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    50% {
+      opacity: 0.45;
+    }
+  }
+}

@@ -58,7 +58,7 @@ in
     environmentFile = mkOption {
       type = types.nullOr types.path;
       default = null;
-      description = "Extra environment, e.g. VIA_ADMIN_TOKEN=..., kept out of the store.";
+      description = "Extra environment, e.g. VIA_ADMIN_TOKEN=... or VIA_SECRET_KEY=..., kept out of the store.";
     };
   };
 
@@ -107,6 +107,7 @@ in
     services.caddy = lib.mkIf (cfg.domain != null) {
       enable = true;
       virtualHosts.${cfg.domain}.extraConfig = ''
+        encode zstd gzip
         reverse_proxy ${cfg.listen}
       '';
     };

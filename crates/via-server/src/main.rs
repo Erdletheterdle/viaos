@@ -26,6 +26,8 @@ mod image;
 mod mcp;
 mod os;
 mod releases;
+mod secrets;
+mod web;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -111,6 +113,10 @@ struct Serve {
     /// image. Comma-separated.
     #[arg(long, env = "VIA_TRUSTED_KEYS", value_delimiter = ',')]
     trusted_keys: Vec<String>,
+    /// Key that encrypts secrets at rest, 64 hex digits. Defaults to
+    /// `secret.key` in the data directory, made on first start.
+    #[arg(long, env = "VIA_SECRET_KEY", hide_env_values = true)]
+    secret_key: Option<String>,
 }
 
 pub struct State {
@@ -124,6 +130,7 @@ pub struct State {
     pub device_url: String,
     pub trusted_keys: Vec<String>,
     admin_token_hash: Option<String>,
+    pub secrets: secrets::Secrets,
 }
 
 impl State {
@@ -188,6 +195,7 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
         anyhow::bail!("VIA_PUBLIC_URL must start with http:// or https://");
     };
     let db = Db::open(&data_dir.join("via.db"))?;
+    let secrets = secrets::Secrets::open(&data_dir, cli.secret_key.as_deref())?;
     if cli.admin_token.is_none() && db.api_tokens()?.is_empty() {
         tracing::warn!("no API tokens yet: create one with `via-server token create <name>`");
     }
@@ -201,11 +209,13 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
         device_url,
         trusted_keys: cli.trusted_keys,
         admin_token_hash: cli.admin_token.as_deref().map(db::hash),
+        secrets,
     });
 
     // MCP checks roles per tool; everything else here is admin-only.
     let people = Router::new()
         .nest_service("/mcp", mcp::service(state.clone()))
+        .route("/v1/session", get(whoami))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -222,6 +232,7 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
         )
         .route("/v1/base/{arch}", axum::routing::put(upload_base))
         .route("/v1/devices/{device}/tunnel/{port}", get(tunnel))
+        .route("/v1/devices/{device}/shell", get(shell))
         .with_state(state.clone())
         .layer(middleware::from_fn(require_admin))
         .layer(middleware::from_fn_with_state(
@@ -235,6 +246,8 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
         .route("/v1/os/{arch}/{version}/{file}", get(os_file))
         .route("/v1/releases/{app}/{release}/{arch}", get(release_bundle))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/v1/session", post(sign_in).delete(sign_out))
+        .fallback(web::serve)
         .with_state(state.clone())
         .merge(people)
         .merge(admin);
@@ -254,9 +267,15 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 
 /// Authenticate an API token and attach the [`db::Caller`] to the request.
 async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next: Next) -> Response {
-    let Some(token) = bearer(req.headers()) else {
+    let by_cookie = bearer(req.headers()).is_none();
+    let Some(token) = bearer(req.headers()).or_else(|| session_cookie(req.headers())) else {
         return (StatusCode::UNAUTHORIZED, "API token required").into_response();
     };
+    // A browser sends its cookie wherever a page asks it to, so a cookie only
+    // counts from our own pages.
+    if by_cookie && !same_origin(req.headers()) {
+        return (StatusCode::FORBIDDEN, "cross-origin request").into_response();
+    }
     let caller = if s.admin_token_hash.as_deref() == Some(db::hash(token).as_str()) {
         Some(db::Caller {
             name: "admin".into(),
@@ -272,6 +291,74 @@ async fn require_caller(AxState(s): AxState<Arc<State>>, mut req: Request, next:
         }
         None => (StatusCode::UNAUTHORIZED, "unknown API token").into_response(),
     }
+}
+
+const SESSION_COOKIE: &str = "via_session";
+
+fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|c| c.trim().strip_prefix("via_session="))
+}
+
+/// Requests with no Origin are not from a page's script: navigation, curl.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()) else {
+        return true;
+    };
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
+    origin.split_once("://").map(|(_, h)| h) == host
+}
+
+#[derive(Deserialize)]
+struct SignIn {
+    token: String,
+}
+
+/// Exchange an API token for a cookie scripts cannot read. The cookie holds
+/// the token, so revoking the token ends the session.
+async fn sign_in(
+    AxState(s): AxState<Arc<State>>,
+    headers: HeaderMap,
+    Json(body): Json<SignIn>,
+) -> Response {
+    let token = body.token.trim();
+    let caller = if s.admin_token_hash.as_deref() == Some(db::hash(token).as_str()) {
+        Some(db::Caller {
+            name: "admin".into(),
+            role: db::Role::Admin,
+        })
+    } else {
+        s.db.api_caller(token).ok().flatten()
+    };
+    let Some(caller) = caller else {
+        return (StatusCode::UNAUTHORIZED, "unknown token").into_response();
+    };
+    if !same_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin request").into_response();
+    }
+    s.db.audit(&caller.name, "sign_in", &json!({}), true);
+    let secure = if s.public_url.starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000{secure}"
+    );
+    ([(header::SET_COOKIE, cookie)], Json(caller)).into_response()
+}
+
+async fn sign_out() -> Response {
+    let cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
+    ([(header::SET_COOKIE, cookie)], StatusCode::NO_CONTENT).into_response()
+}
+
+async fn whoami(Extension(caller): Extension<db::Caller>) -> Json<db::Caller> {
+    Json(caller)
 }
 
 async fn require_admin(req: Request, next: Next) -> Response {
@@ -319,7 +406,20 @@ async fn connect(
         tracing::warn!("recording last-seen failed: {e}");
     }
     ws.on_upgrade(move |socket| async move {
+        // A device that was offline catches up on what changed.
+        let sync = {
+            let (s, device) = (s.clone(), device.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if let Ok(Some(d)) = s.db.device(&device)
+                    && let Err(e) = secrets::push(&s, &d).await
+                {
+                    tracing::warn!(device = %d.name, "sending variables failed: {e:#}");
+                }
+            })
+        };
         s.hub.attach(device.clone(), socket).await;
+        sync.abort();
         let _ = s.db.seen(&device, None, None);
     })
 }
@@ -495,6 +595,104 @@ async fn tunnel(
     match opened {
         Ok(stream) => ws.on_upgrade(move |socket| bridge(socket, stream)),
         Err(e) => (StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ShellQuery {
+    container: Option<String>,
+}
+
+/// A terminal for a person in a browser. Audited like the tunnel; what is
+/// typed in it is not recorded.
+async fn shell(
+    AxState(s): AxState<Arc<State>>,
+    Extension(caller): Extension<db::Caller>,
+    Path(device): Path<String>,
+    Query(q): Query<ShellQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let service = match &q.container {
+        Some(c) => format!("shell:{c}"),
+        None => "shell".to_string(),
+    };
+    let opened =
+        s.db.resolve(&device)
+            .and_then(|d| s.hub.open(&d.id, &service));
+    s.db.audit(
+        &caller.name,
+        "shell",
+        &json!({ "device": device, "container": q.container }),
+        opened.is_ok(),
+    );
+    match opened {
+        Ok(stream) => ws.on_upgrade(move |socket| terminal(socket, stream)),
+        Err(e) => (StatusCode::NOT_FOUND, format!("{e:#}")).into_response(),
+    }
+}
+
+/// Binary frames are keystrokes and text frames are `{"cols":n,"rows":n}`;
+/// both go on framed as crates/via-agent/src/shell.rs reads them.
+async fn terminal(socket: axum::extract::ws::WebSocket, stream: tokio::io::DuplexStream) {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Deserialize)]
+    struct Size {
+        cols: u16,
+        rows: u16,
+    }
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (mut r, mut w) = tokio::io::split(stream);
+    let up = async {
+        while let Some(Ok(m)) = ws_rx.next().await {
+            let sent = match m {
+                Message::Binary(b) => {
+                    let mut ok = true;
+                    for chunk in b.chunks(u16::MAX as usize) {
+                        let mut frame = vec![0];
+                        frame.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+                        frame.extend_from_slice(chunk);
+                        ok = w.write_all(&frame).await.is_ok();
+                    }
+                    ok
+                }
+                Message::Text(t) => match serde_json::from_str::<Size>(&t) {
+                    Ok(sz) => {
+                        let mut frame = vec![1];
+                        frame.extend_from_slice(&sz.cols.to_be_bytes());
+                        frame.extend_from_slice(&sz.rows.to_be_bytes());
+                        w.write_all(&frame).await.is_ok()
+                    }
+                    Err(_) => true,
+                },
+                Message::Close(_) => false,
+                _ => true,
+            };
+            if !sent {
+                break;
+            }
+        }
+        let _ = w.shutdown().await;
+    };
+    let down = async {
+        let mut buf = vec![0u8; 32 * 1024];
+        while let Ok(n) = r.read(&mut buf).await {
+            if n == 0
+                || ws_tx
+                    .send(Message::Binary(buf[..n].to_vec().into()))
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+        }
+        let _ = ws_tx.send(Message::Close(None)).await;
+    };
+    tokio::select! {
+        () = up => {}
+        () = down => {}
     }
 }
 

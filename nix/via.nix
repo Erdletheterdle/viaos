@@ -8,6 +8,8 @@
   description,
   # Programs the binary runs, put on its PATH.
   runtimeInputs ? [ ],
+  # The built web console, compiled into via-server.
+  web ? null,
 }:
 
 rustPlatform.buildRustPackage {
@@ -33,6 +35,8 @@ rustPlatform.buildRustPackage {
   # `cargo test --workspace` runs in CI, against Docker; a package build
   # only needs to compile.
   doCheck = false;
+
+  env = lib.optionalAttrs (web != null) { VIA_WEB_DIST = web; };
 
   nativeBuildInputs = lib.optional (runtimeInputs != [ ]) makeBinaryWrapper;
   postInstall = lib.optionalString (runtimeInputs != [ ]) ''

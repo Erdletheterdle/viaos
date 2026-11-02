@@ -188,6 +188,15 @@ async fn session(identity: &Identity, device: &Device) -> Result<()> {
                         }
                         Err(_) => tracing::warn!("refusing stream for bad port {tcp:?}"),
                     },
+                    // A terminal on the device, or in one of its containers.
+                    shell if shell == "shell" || shell.starts_with("shell:") => {
+                        let container = shell.strip_prefix("shell:").map(str::to_string);
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::shell::serve(container, stream).await {
+                                tracing::warn!("shell ended: {e:#}");
+                            }
+                        });
+                    }
                     // Dropping the stream closes it: unknown services are
                     // refused, not left hanging.
                     other => tracing::warn!("refusing stream for unknown service {other:?}"),

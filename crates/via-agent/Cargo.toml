@@ -28,3 +28,6 @@ via-core.workspace = true
 via-deploy.workspace = true
 via-link.workspace = true
 via-runtime.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -33,6 +33,8 @@ struct FakeRuntime {
     /// Release last applied, so a test can assert what is running.
     applied: Mutex<Vec<u64>>,
     images: Mutex<Vec<String>>,
+    /// Runtime variables each apply was given.
+    envs: Mutex<Vec<BTreeMap<String, String>>>,
 }
 
 impl FakeRuntime {
@@ -41,6 +43,7 @@ impl FakeRuntime {
             behavior: Mutex::new(BTreeMap::new()),
             applied: Mutex::new(Vec::new()),
             images: Mutex::new(Vec::new()),
+            envs: Mutex::new(Vec::new()),
         }
     }
 
@@ -98,8 +101,12 @@ impl Runtime for FakeRuntime {
     async fn apply(
         &self,
         deployment: &Deployment,
-        _ctx: &ApplyContext,
+        ctx: &ApplyContext,
     ) -> Result<ApplyReport, via_runtime::Error> {
+        self.envs
+            .lock()
+            .unwrap()
+            .push(ctx.global_environment.clone());
         let release = Self::release_of(deployment);
         if self.behavior_for(release) == Behavior::ApplyErrors {
             return Err(via_runtime::Error::ImageNotLoaded {
@@ -333,6 +340,32 @@ async fn a_crashing_release_fails_fast_rather_than_burning_the_timeout() {
         "an exited container is terminal; waiting out the gate helps nobody"
     );
     assert_eq!(outcome.rolled_back_to, Some(ReleaseId(44)));
+}
+
+#[tokio::test]
+async fn a_rollback_keeps_the_devices_secrets() {
+    let h = Harness::new();
+    stage(&h.store, &h.runtime, 44);
+    stage(&h.store, &h.runtime, 45);
+    h.runtime.set(45, Behavior::NeverReady);
+    let project = deployment(44).project;
+    let vars = BTreeMap::from([("TOKEN".to_string(), "s3cret".to_string())]);
+    let d = h
+        .deployer()
+        .with_env(BTreeMap::from([(project, vars.clone())]));
+
+    d.activate(ReleaseId(44), &deployment(44), &ApplyContext::default())
+        .await
+        .unwrap();
+    let outcome = d
+        .activate(ReleaseId(45), &deployment(45), &ApplyContext::default())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.rolled_back_to, Some(ReleaseId(44)));
+    let envs = h.runtime.envs.lock().unwrap();
+    assert_eq!(envs.len(), 3, "44, 45, then 44 again");
+    assert!(envs.iter().all(|e| *e == vars), "{envs:?}");
 }
 
 #[tokio::test]

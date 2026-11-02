@@ -14,6 +14,7 @@
 //! * A failed deploy leaves the previous release locally available, so
 //!   recovery needs no network (spec sections 22, 25).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use via_bundle::{TrustPolicy, UnpackedBundle, Verified};
@@ -72,6 +73,7 @@ pub struct Deployer<'a> {
     runtime: &'a dyn Runtime,
     clock: &'a dyn Clock,
     trust: TrustPolicy,
+    env: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl<'a> Deployer<'a> {
@@ -81,7 +83,25 @@ impl<'a> Deployer<'a> {
             runtime,
             clock,
             trust: TrustPolicy::Insecure,
+            env: BTreeMap::new(),
         }
+    }
+
+    /// Runtime variables and secrets, by project. Every apply uses them,
+    /// rollback and recovery included: a release restored without its
+    /// secrets would not be the release that worked.
+    pub fn with_env(mut self, env: BTreeMap<String, BTreeMap<String, String>>) -> Self {
+        self.env = env;
+        self
+    }
+
+    fn context(&self, deployment: &Deployment, release: ReleaseId) -> ApplyContext {
+        ApplyContext::for_release(release).with_global(
+            self.env
+                .get(&deployment.project)
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 
     /// Require released bundles to be signed by a trusted key.
@@ -219,6 +239,8 @@ impl<'a> Deployer<'a> {
 
         let mut ctx = ctx.clone();
         ctx.release = Some(release);
+        ctx.global_environment
+            .extend(self.context(deployment, release).global_environment);
 
         let apply = match self.runtime.apply(deployment, &ctx).await {
             Ok(r) => r,
@@ -343,7 +365,7 @@ impl<'a> Deployer<'a> {
 
         self.note("rollback_started", Some(target), None);
         let deployment = self.load_deployment(target)?;
-        let ctx = ApplyContext::for_release(target);
+        let ctx = self.context(&deployment, target);
         self.runtime
             .apply(&deployment, &ctx)
             .await
@@ -503,7 +525,7 @@ impl<'a> Deployer<'a> {
         }
 
         let deployment = self.load_deployment(current)?;
-        let ctx = ApplyContext::for_release(current);
+        let ctx = self.context(&deployment, current);
         self.runtime
             .apply(&deployment, &ctx)
             .await
@@ -522,8 +544,8 @@ impl<'a> Deployer<'a> {
             return Err(Error::RollbackUnavailable { release: target });
         }
         let deployment = self.load_deployment(target)?;
-        self.activate(target, &deployment, &ApplyContext::for_release(target))
-            .await
+        let ctx = self.context(&deployment, target);
+        self.activate(target, &deployment, &ctx).await
     }
 }
 

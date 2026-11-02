@@ -5,6 +5,7 @@
 //! is rolled back to the previous one on the device itself, with no network.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
@@ -40,6 +41,8 @@ pub struct Job {
 #[derive(Clone, Default)]
 pub struct Deploys {
     status: Arc<Mutex<Option<DeployStatus>>>,
+    /// Variables changed during a deploy: apply them when it finishes.
+    reapply_after: Arc<AtomicBool>,
 }
 
 impl Deploys {
@@ -73,27 +76,71 @@ impl Deploys {
         self.set(&job.app, job.release, "downloading");
         let this = self.clone();
         tokio::spawn(async move {
-            let (app, release) = (job.app.clone(), job.release);
             let result = this.run(&data_dir, job).await;
-            match result {
-                Ok(rolled_back_to) => this.finish(|s| match rolled_back_to {
-                    Some(prev) => {
-                        s.state = "rolled_back".into();
-                        s.rolled_back_to = Some(prev);
-                        s.error = Some("the release failed its health gate".into());
-                    }
-                    None => s.state = "running".into(),
-                }),
-                Err(e) => {
-                    tracing::error!(%app, release, "deploy failed: {e:#}");
-                    this.finish(|s| {
-                        s.state = "failed".into();
-                        s.error = Some(format!("{e:#}"));
-                    });
-                }
-            }
+            this.finish_run(result, data_dir);
         });
         Ok(())
+    }
+
+    fn finish_run(&self, result: Result<Option<String>>, data_dir: PathBuf) {
+        match result {
+            Ok(rolled_back_to) => self.finish(|s| match rolled_back_to {
+                Some(prev) => {
+                    s.state = "rolled_back".into();
+                    s.rolled_back_to = Some(prev);
+                    s.error = Some("the release failed its health gate".into());
+                }
+                None => s.state = "running".into(),
+            }),
+            Err(e) => {
+                tracing::error!("deploy failed: {e:#}");
+                self.finish(|s| {
+                    s.state = "failed".into();
+                    s.error = Some(format!("{e:#}"));
+                });
+            }
+        }
+        if self.reapply_after.swap(false, Ordering::SeqCst) {
+            if let Err(e) = self.reapply(data_dir) {
+                tracing::error!("re-applying changed variables failed: {e:#}");
+            }
+        }
+    }
+
+    /// Re-apply the running release with the variables now on disk. Only
+    /// services that declared a changed name are recreated. Returns the app
+    /// and release, or None if nothing is running yet, or if a deploy is under
+    /// way and the re-apply will follow it.
+    pub fn reapply(&self, data_dir: PathBuf) -> Result<Option<(String, u64)>> {
+        if let Some(s) = self.status() {
+            if matches!(s.state.as_str(), "downloading" | "deploying") {
+                self.reapply_after.store(true, Ordering::SeqCst);
+                return Ok(None);
+            }
+        }
+        let store = Store::open(&data_dir)?;
+        let Some(current) = store.load_state()?.current else {
+            return Ok(None);
+        };
+        let runtime = DockerRuntime::connect()?;
+        let deployment = Deployer::new(&store, &runtime, &SystemClock).load_deployment(current)?;
+        let (app, release) = (deployment.project.clone(), current.0);
+        self.set(&app, release, "deploying");
+        let this = self.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let store = Store::open(&data_dir)?;
+                let runtime = DockerRuntime::connect()?;
+                let outcome = Deployer::new(&store, &runtime, &SystemClock)
+                    .with_env(crate::env::load(&data_dir))
+                    .activate(current, &deployment, &ApplyContext::default())
+                    .await?;
+                Ok::<_, anyhow::Error>(outcome.rolled_back_to.map(|r| r.to_string()))
+            }
+            .await;
+            this.finish_run(result, data_dir);
+        });
+        Ok(Some((app, release)))
     }
 
     /// Returns the release rolled back to, if the new one failed its gate.
@@ -122,6 +169,7 @@ impl Deploys {
         let runtime = DockerRuntime::connect()?;
         let outcome = Deployer::new(&store, &runtime, &SystemClock)
             .trusting(trust)
+            .with_env(crate::env::load(data_dir))
             .deploy(&bundle, &ApplyContext::default())
             .await;
         let _ = tokio::fs::remove_file(&bundle).await;
@@ -138,6 +186,7 @@ pub async fn recover(data_dir: &Path) {
         let runtime = DockerRuntime::connect()?;
         Ok::<_, anyhow::Error>(
             Deployer::new(&store, &runtime, &SystemClock)
+                .with_env(crate::env::load(data_dir))
                 .recover()
                 .await?,
         )

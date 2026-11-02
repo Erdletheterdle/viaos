@@ -1,7 +1,7 @@
 # MCP surface
 
-viaos has no UI to start. Claude is the UI. Every operation is a typed
-function first; MCP tools, the CLI, and any later UI call the same functions.
+Claude is the first way in. Every operation is a typed function first; MCP
+tools, the CLI, and the web console (which calls these same tools) sit on top.
 
 ## Target prompts
 
@@ -19,8 +19,8 @@ These are the acceptance tests. A tool exists because one of these needs it.
 
 | Server | Where | Tools |
 | --- | --- | --- |
-| device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `exec`, `os_update`, `deploy` |
-| fleet | `via-server` at `/mcp` (HTTP, API token) | `list_fleets`, `create_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `deploy`, `create_provisioning_image` |
+| device | `via-agent mcp` on the device (stdio) | `device_health`, `logs`, `journal`, `exec`, `os_update`, `deploy`, `sync_env` |
+| fleet | `via-server` at `/mcp` (HTTP, API token) | `list_fleets`, `create_fleet`, `list_devices`, `device_health`, `logs`, `journal`, `exec`, `list_os_versions`, `update_os`, `list_releases`, `deploy`, `create_provisioning_image`, `list_provisioning_images`, `list_variables`, `set_variable`, `delete_variable`, `audit_log`, `list_tokens`, `create_token`, `revoke_token` |
 | local | `via mcp` on the operator's machine (stdio, root) | `list_disks`, `flash_image`, `flash_status`, `release_app` |
 
 The fleet server forwards device tools over each device's outbound
@@ -34,9 +34,10 @@ through the control plane as over `ssh device via-agent mcp`.
 2. Long work returns at once and reports progress where the caller already
    looks: an OS update under `os.update` in `device_health`, a flash in
    `flash_status`.
-3. No tool returns a secret. Enrollment tokens are written straight into an
-   image or onto a device; the tool returns a path or a device id, never the
-   token.
+3. No tool returns a secret, with one exception: `create_token` returns the
+   new token, once, because that is its job. Enrollment tokens are written
+   straight into an image or onto a device; the tool returns a path or a
+   device id, never the token. Secret variables are write-only.
 4. Every fleet call is written to the audit log with the token's name, its
    arguments and whether it succeeded.
 5. A `viewer` token may call only the read-only tools; the rest answer with

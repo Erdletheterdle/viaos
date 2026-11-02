@@ -37,11 +37,14 @@
           via =
             crate: bin: description:
             pkgs.callPackage ./nix/via.nix { inherit crate bin description; };
-          via-server = via "via-server" "via-server" "viaos control plane";
+          via-console = pkgs.callPackage ./nix/web.nix { };
+          via-server = (via "via-server" "via-server" "viaos control plane").override {
+            web = via-console;
+          };
         in
         {
           via-agent = via "via-agent" "via-agent" "viaos device agent";
-          inherit via-server;
+          inherit via-console via-server;
           # Secure Boot signing shells out to sbsign, openssl and efitools.
           via = (via "via-cli" "via" "viaos operator tools: flash, release, ssh").override {
             runtimeInputs = with pkgs; [

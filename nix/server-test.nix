@@ -62,6 +62,31 @@ pkgs.testers.runNixOSTest {
         "-H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='"
     )
     assert code == "401", code
+
+    # The console is compiled in, and a token buys a cookie that works in its
+    # place and carries the viewer's limits with it.
+    page = machine.succeed(f"{https}/some/deep/link")
+    assert '<div id="root">' in page, page
+    headers = machine.succeed(
+        f"curl -si --cacert {ca} https://via.test/v1/session -H 'Content-Type: application/json' "
+        f"-d '{{\"token\": \"{viewer}\"}}'"
+    )
+    assert "HttpOnly" in headers and "SameSite=Strict" in headers and "Secure" in headers, headers
+    cookie = f"-H 'Cookie: via_session={viewer}'"
+    who = json.loads(machine.succeed(f"{https}/v1/session {cookie}"))
+    assert who == {"name": "bo", "role": "viewer"}, who
+    machine.fail(f"{https}/v1/session {cookie} -H 'Origin: https://evil.example'")
+
+    # Secrets: write-only, and encrypted at rest.
+    r = call(admin, "set_variable", {"app": "hello", "key": "API_KEY", "value": "hunter2hunter2", "secret": True, "fleet": "line"})
+    assert not r.get("isError"), r
+    r = call(viewer, "set_variable", {"app": "hello", "key": "X", "value": "y", "fleet": "line"})
+    assert r.get("isError"), r
+    r = call(viewer, "list_variables", {})
+    assert r["structuredContent"]["variables"][0]["value"] is None, r
+    machine.fail("grep -rq hunter2hunter2 /var/lib/via-server")
+    machine.succeed("test $(stat -c %a /var/lib/via-server/secret.key) = 600")
+
     machine.succeed("head -c 300M /dev/urandom > /tmp/big")
     machine.succeed(f"{https}/v1/os/x86_64/9/viaos_9.efi -X PUT -H 'Authorization: Bearer {admin}' -T /tmp/big")
     machine.succeed("cmp /tmp/big /var/lib/via-server/os/x86_64/9/viaos_9.efi || cmp /tmp/big $(find /var/lib/via-server -name viaos_9.efi | head -1)")

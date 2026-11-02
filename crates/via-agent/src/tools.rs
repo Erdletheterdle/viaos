@@ -73,6 +73,13 @@ pub struct DeployArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SyncEnvArgs {
+    /// Every variable and secret this device should have, by app. Replaces
+    /// what it holds, so a name left out is removed.
+    pub apps: crate::env::Env,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct ExecArgs {
     /// Shell command, run as root with `sh -c`.
     pub command: String,
@@ -121,7 +128,9 @@ impl Device {
             Err(e) => json!({ "error": e.to_string() }),
         };
         let (release, services) = match (self.store(), &runtime) {
-            (Ok(store), Ok(rt)) => release_and_services(&store, rt).await,
+            (Ok(store), Ok(rt)) => {
+                release_and_services(&store, rt, &crate::env::load(&self.data_dir)).await
+            }
             (Err(e), _) => (json!({ "error": e.to_string() }), Value::Null),
             (_, Err(_)) => (Value::Null, Value::Null),
         };
@@ -181,6 +190,37 @@ impl Device {
         }))
     }
 
+    /// Store the variables the control plane resolved for this device. If
+    /// the running app's changed, re-apply it. The result names keys and
+    /// never values.
+    pub fn sync_env(&self, a: SyncEnvArgs) -> anyhow::Result<Value> {
+        let before = crate::env::load(&self.data_dir);
+        crate::env::save(&self.data_dir, &a.apps)?;
+        let current = self
+            .store()?
+            .load_state()?
+            .current
+            .and_then(|r| {
+                let rt = DockerRuntime::connect().ok()?;
+                let store = self.store().ok()?;
+                Deployer::new(&store, &rt, &SystemClock)
+                    .load_deployment(r)
+                    .ok()
+            })
+            .map(|d| d.project);
+        let changed = current
+            .as_ref()
+            .is_some_and(|app| before.get(app) != a.apps.get(app));
+        let reapplied = if changed {
+            self.deploys.reapply(self.data_dir.clone())?
+        } else {
+            None
+        };
+        Ok(
+            json!({ "stored": true, "reapplied": reapplied.map(|(app, r)| json!({ "app": app, "release": r })) }),
+        )
+    }
+
     pub fn deploy(&self, a: DeployArgs) -> anyhow::Result<Value> {
         let bearer = crate::link::credential(&self.data_dir);
         let job = crate::deploy::Job {
@@ -238,12 +278,16 @@ impl Device {
     }
 }
 
-async fn release_and_services(store: &Store, rt: &DockerRuntime) -> (Value, Value) {
+async fn release_and_services(
+    store: &Store,
+    rt: &DockerRuntime,
+    env: &crate::env::Env,
+) -> (Value, Value) {
     let state = match store.load_state() {
         Ok(s) => s,
         Err(e) => return (json!({ "error": e.to_string() }), Value::Null),
     };
-    let release = json!({
+    let mut release = json!({
         "current": state.current.map(|r| r.to_string()),
         "previous": state.previous.map(|r| r.to_string()),
         "desired": state.desired.map(|r| r.to_string()),
@@ -254,19 +298,24 @@ async fn release_and_services(store: &Store, rt: &DockerRuntime) -> (Value, Valu
         return (release, json!([]));
     };
     let services = match Deployer::new(store, rt, &SystemClock).load_deployment(current) {
-        Ok(d) => match rt.service_states(&d).await {
-            Ok(states) => json!(
-                states
-                    .iter()
-                    .map(|s| json!({
-                        "service": s.service,
-                        "status": format!("{:?}", s.status),
-                        "health": format!("{:?}", s.health),
-                    }))
-                    .collect::<Vec<_>>()
-            ),
-            Err(e) => json!({ "error": e.to_string() }),
-        },
+        Ok(d) => {
+            release["app"] = json!(d.project);
+            release["missing_env"] = json!(crate::env::missing(&d, env));
+            match rt.service_states(&d).await {
+                Ok(states) => json!(
+                    states
+                        .iter()
+                        .map(|s| json!({
+                            "service": s.service,
+                            "container": d.services.get(&s.service).map(|svc| via_runtime::container_name(&d, svc)),
+                            "status": format!("{:?}", s.status),
+                            "health": format!("{:?}", s.health),
+                        }))
+                        .collect::<Vec<_>>()
+                ),
+                Err(e) => json!({ "error": e.to_string() }),
+            }
+        }
         Err(e) => json!({ "error": e.to_string() }),
     };
     (release, services)
@@ -394,6 +443,24 @@ impl Device {
         Parameters(args): Parameters<ExecArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         reported(self.exec(args).await)
+    }
+
+    #[tool(
+        name = "sync_env",
+        description = "Replace this device's app variables and secrets, and re-apply the \
+                       running app if its changed. The control plane calls this; values \
+                       given here are stored on the device, readable only by root.",
+        annotations(
+            title = "Sync variables",
+            read_only_hint = false,
+            destructive_hint = true
+        )
+    )]
+    async fn sync_env_tool(
+        &self,
+        Parameters(args): Parameters<SyncEnvArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        reported(self.sync_env(args))
     }
 
     #[tool(

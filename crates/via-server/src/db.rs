@@ -45,6 +45,19 @@ CREATE TABLE IF NOT EXISTS audit (
     args   TEXT NOT NULL,
     ok     INTEGER NOT NULL
 );
+-- Variables and secrets for apps. `scope` is 'fleet' (target: its name) or
+-- 'device' (target: its id). A secret's value is ciphertext; see secrets.rs.
+CREATE TABLE IF NOT EXISTS variables (
+    scope TEXT NOT NULL,
+    target TEXT NOT NULL,
+    app TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value BLOB NOT NULL,
+    secret INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    updated_by TEXT NOT NULL,
+    PRIMARY KEY (scope, target, app, key)
+);
 CREATE TABLE IF NOT EXISTS api_tokens (
     name        TEXT PRIMARY KEY,
     role        TEXT NOT NULL,
@@ -82,7 +95,7 @@ impl Role {
 }
 
 /// Whoever an API request authenticated as.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Caller {
     pub name: String,
     pub role: Role,
@@ -390,6 +403,89 @@ impl Db {
         ) {
             tracing::error!("audit write failed: {e}");
         }
+    }
+}
+
+/// One stored variable. A secret's `value` is ciphertext.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Variable {
+    pub scope: String,
+    pub target: String,
+    pub app: String,
+    pub key: String,
+    pub value: Vec<u8>,
+    pub secret: bool,
+    pub updated_at: i64,
+    pub updated_by: String,
+}
+
+impl Db {
+    pub fn set_variable(&self, v: &Variable) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO variables (scope, target, app, key, value, secret, updated_at, updated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (scope, target, app, key) DO UPDATE SET
+               value = ?5, secret = ?6, updated_at = ?7, updated_by = ?8",
+            params![
+                v.scope,
+                v.target,
+                v.app,
+                v.key,
+                v.value,
+                v.secret,
+                v.updated_at,
+                v.updated_by
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Whether anything was there to delete.
+    pub fn delete_variable(&self, scope: &str, target: &str, app: &str, key: &str) -> Result<bool> {
+        let n = self.conn.lock().unwrap().execute(
+            "DELETE FROM variables WHERE scope = ?1 AND target = ?2 AND app = ?3 AND key = ?4",
+            params![scope, target, app, key],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn variables(&self) -> Result<Vec<Variable>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT scope, target, app, key, value, secret, updated_at, updated_by
+             FROM variables ORDER BY app, key, scope, target",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Variable {
+                scope: r.get(0)?,
+                target: r.get(1)?,
+                app: r.get(2)?,
+                key: r.get(3)?,
+                value: r.get(4)?,
+                secret: r.get(5)?,
+                updated_at: r.get(6)?,
+                updated_by: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The newest audit entries, newest first.
+    pub fn audit_log(&self, limit: u32) -> Result<Vec<serde_json::Value>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt =
+            c.prepare("SELECT at, actor, tool, args, ok FROM audit ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map([limit], |r| {
+            let args: String = r.get(3)?;
+            Ok(serde_json::json!({
+                "at": r.get::<_, i64>(0)?,
+                "actor": r.get::<_, Option<String>>(1)?,
+                "tool": r.get::<_, String>(2)?,
+                "args": serde_json::from_str::<serde_json::Value>(&args).unwrap_or_default(),
+                "ok": r.get::<_, bool>(4)?,
+            }))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
 

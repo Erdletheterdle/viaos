@@ -116,6 +116,49 @@ claude mcp add --transport http via https://via.example.com/mcp \
 claude mcp add via-local -- sudo -E via mcp    # flashing, releases
 ```
 
+## Variables and secrets
+
+A release holds no secrets. In the compose file, a bare name says a service
+needs a value the release does not carry:
+
+```yaml
+services:
+  web:
+    environment:
+      - API_KEY          # supplied per fleet or device
+      - LOG_LEVEL=info   # baked into the release
+```
+
+Set values on the console's Variables page (or with `set_variable`), for a
+whole fleet or one device; a device's value beats its fleet's. Online devices
+re-apply at once, and only services that listed the name are recreated.
+Offline devices catch up when they reconnect. A service never receives a name
+it did not list, and a device page warns when a running release is missing one.
+
+Mark a value secret and it is encrypted on the server and never shown again.
+The key is `secret.key` in the data directory, or `VIA_SECRET_KEY`: back it up
+separately from the database, because without it the secrets are gone, and
+with it a stolen backup is readable. Devices receive plaintext over their TLS
+connection and keep it readable by root only in `/var/lib/via/env.json`, so a
+release restarts, rolls back and recovers with no network. Don't give Claude a
+real secret: it would pass through the conversation. Use the console.
+
+## The web console
+
+It is the server's own address, with nothing more to install. Sign in with an
+API token; viewers can look but not change anything, and only admins get
+terminals. It calls the same tools Claude does, so the audit log covers both.
+
+To work on it:
+
+```bash
+cd web && bun install
+VIA_SERVER=http://localhost:8471 bun run dev
+```
+
+`bun run build` and a rebuild of `via-server` embed it. After changing
+`web/bun.lock`, update the hash in `nix/web.nix`.
+
 ## Reaching a device
 
 Devices are behind NAT, so everything goes over their own connection:
@@ -126,4 +169,5 @@ via ssh line-07 journalctl -b     # a command
 via forward line-07 8080 9000     # localhost:9000 on your machine -> device port 8080
 ```
 
-Claude uses `exec` for the same thing.
+Claude uses `exec` for the same thing, and the console has a terminal for the
+device and for each of its containers.

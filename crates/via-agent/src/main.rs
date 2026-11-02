@@ -6,10 +6,12 @@
 
 mod config;
 mod deploy;
+mod env;
 mod host;
 mod link;
 mod os;
 mod ready;
+mod shell;
 mod tools;
 
 use std::path::PathBuf;
