@@ -251,6 +251,9 @@ moves it, tags it, or deletes it once it's empty.
 
 Only active members of the organisation get in. Its owners are admins, and so is
 anyone on the team named by `VIA_GITHUB_ADMIN_TEAM`; other members are viewers.
+To let in only some members, set `VIA_GITHUB_TEAM` (module: `github.team`) to a
+team's slug: its members get in as viewers, admins still get in, and everyone
+else in the organisation is refused. Members of the team's child teams count.
 A session lasts 12 hours, so someone removed from the organisation loses access
 within that time. For GitHub Enterprise Server, set `VIA_GITHUB_URL`.
 

@@ -10,6 +10,8 @@ function refusal(code: string | null, org?: string) {
       return null;
     case "not_member":
       return `That GitHub account isn't a member of ${org ?? "the organisation"}.`;
+    case "not_on_team":
+      return "That GitHub account isn't on the team allowed to sign in. An organisation owner can add it.";
     case "restricted":
       return `${org ?? "The organisation"} hasn't approved this app yet. An owner can approve it in the organisation's third-party access settings.`;
     case "denied":

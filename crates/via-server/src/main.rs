@@ -158,6 +158,10 @@ struct Serve {
     /// Slug of a team in the organisation whose members are also admins.
     #[arg(long, env = "VIA_GITHUB_ADMIN_TEAM")]
     github_admin_team: Option<String>,
+    /// Slug of a team in the organisation: only its members (and admins) may
+    /// sign in. Unset, every member may, as a viewer.
+    #[arg(long, env = "VIA_GITHUB_TEAM")]
+    github_team: Option<String>,
     /// A GitHub Enterprise Server's address.
     #[arg(long, env = "VIA_GITHUB_URL", default_value = "https://github.com")]
     github_url: String,
@@ -271,6 +275,7 @@ async fn serve(cli: Serve, data_dir: PathBuf) -> Result<()> {
             client_secret,
             org,
             admin_team: cli.github_admin_team,
+            team: cli.github_team,
             url: cli.github_url.trim_end_matches('/').to_string(),
         }),
         _ => anyhow::bail!(

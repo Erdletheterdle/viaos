@@ -2,7 +2,7 @@
 //!
 //! Membership decides who gets in and the role: organisation owners are
 //! admins, and so is anyone on the configured admin team; other members are
-//! viewers. GitHub's access token is used for those checks and then dropped.
+//! viewers. With a team configured, only its members get in as viewers. GitHub's access token is used for those checks and then dropped.
 //! Access lasts as long as the session, so someone removed from the
 //! organisation loses it within [`SESSION_SECS`].
 
@@ -27,6 +27,9 @@ pub struct Config {
     pub client_secret: String,
     pub org: String,
     pub admin_team: Option<String>,
+    /// Slug of the team whose members may sign in as viewers. Unset, any
+    /// member of the organisation may.
+    pub team: Option<String>,
     /// `https://github.com`, or a GitHub Enterprise Server address.
     pub url: String,
 }
@@ -46,6 +49,7 @@ impl Config {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refused {
     NotMember,
+    NotOnTeam,
     Restricted,
 }
 
@@ -53,6 +57,7 @@ impl Refused {
     fn code(&self) -> &'static str {
         match self {
             Refused::NotMember => "not_member",
+            Refused::NotOnTeam => "not_on_team",
             Refused::Restricted => "restricted",
         }
     }
@@ -265,21 +270,32 @@ async fn identify(
     if membership.state != "active" {
         return Ok((login, Err(Refused::NotMember)));
     }
+    // Anything but a clear yes is a no.
+    let on_team = |team: String| {
+        let get = &get;
+        let url = format!("{api}/orgs/{}/teams/{team}/memberships/{login}", g.org);
+        async move {
+            let res = get(url).await?;
+            if !res.status().is_success() {
+                return Ok::<_, anyhow::Error>(false);
+            }
+            let m: Membership = res.json().await?;
+            Ok(m.state == "active")
+        }
+    };
     let mut admin = membership.role.as_deref() == Some("admin");
     if let (false, Some(team)) = (admin, &g.admin_team) {
-        let res = get(format!(
-            "{api}/orgs/{}/teams/{team}/memberships/{login}",
-            g.org
-        ))
-        .await?;
-        // Anything but a clear yes leaves them a viewer.
-        if res.status().is_success() {
-            let m: Membership = res.json().await?;
-            admin = m.state == "active";
+        admin = on_team(team.clone()).await?;
+    }
+    if admin {
+        return Ok((login, Ok(Role::Admin)));
+    }
+    if let Some(team) = &g.team {
+        if !on_team(team.clone()).await? {
+            return Ok((login, Err(Refused::NotOnTeam)));
         }
     }
-    let role = if admin { Role::Admin } else { Role::Viewer };
-    Ok((login, Ok(role)))
+    Ok((login, Ok(Role::Viewer)))
 }
 
 #[cfg(test)]
@@ -298,7 +314,8 @@ mod tests {
     struct Fake {
         /// login -> org role ("admin", "member", or "pending")
         members: HashMap<String, String>,
-        team: Vec<String>,
+        /// team slug -> its active members
+        teams: HashMap<String, Vec<String>>,
         restricted: bool,
         /// What the token exchange was sent.
         exchanged: Mutex<Vec<Value>>,
@@ -365,7 +382,7 @@ mod tests {
                     move |Path((_, team, login)): Path<(String, String, String)>| {
                         let d = d.clone();
                         async move {
-                            if team == "ops" && d.team.contains(&login) {
+                            if d.teams.get(&team).is_some_and(|m| m.contains(&login)) {
                                 Json(json!({ "state": "active" })).into_response()
                             } else {
                                 StatusCode::NOT_FOUND.into_response()
@@ -391,6 +408,10 @@ mod tests {
     }
 
     async fn rig(gh: Fake) -> Rig {
+        rig_with(gh, None).await
+    }
+
+    async fn rig_with(gh: Fake, team: Option<&str>) -> Rig {
         let gh = Arc::new(gh);
         let github = serve(fake(gh.clone())).await;
         let dir = tempfile::tempdir().unwrap();
@@ -404,6 +425,7 @@ mod tests {
                 client_secret: "shh".into(),
                 org: "beigesys".into(),
                 admin_team: Some("ops".into()),
+                team: team.map(Into::into),
                 url: github,
             }),
         );
@@ -519,9 +541,13 @@ mod tests {
                 ("owner".into(), "admin".into()),
                 ("opsy".into(), "member".into()),
                 ("plain".into(), "member".into()),
+                ("liner".into(), "member".into()),
                 ("invited".into(), "pending".into()),
             ]),
-            team: vec!["opsy".into()],
+            teams: HashMap::from([
+                ("ops".into(), vec!["opsy".into()]),
+                ("line".into(), vec!["liner".into(), "invited".into()]),
+            ]),
             ..Fake::default()
         }
     }
@@ -554,6 +580,32 @@ mod tests {
     async fn outsiders_get_no_session() {
         let r = rig(org()).await;
         for (login, code) in [("stranger", "not_member"), ("invited", "not_member")] {
+            let res = r.sign_in(login).await;
+            assert_eq!(location(&res), format!("/?auth={code}"), "{login}");
+            assert!(
+                !set_cookies(&res)
+                    .iter()
+                    .any(|c| c.starts_with("via_session"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_team_limits_who_gets_in() {
+        let r = rig_with(org(), Some("line")).await;
+        assert_eq!(
+            r.role_of("liner").await,
+            ("github/liner".into(), "viewer".into())
+        );
+        // Admins get in without being on the team.
+        assert_eq!(r.role_of("owner").await.1, "admin");
+        assert_eq!(r.role_of("opsy").await.1, "admin");
+        // Other members don't, and the team doesn't let outsiders in.
+        for (login, code) in [
+            ("plain", "not_on_team"),
+            ("invited", "not_member"),
+            ("stranger", "not_member"),
+        ] {
             let res = r.sign_in(login).await;
             assert_eq!(location(&res), format!("/?auth={code}"), "{login}");
             assert!(
